@@ -10,6 +10,17 @@ import re
 from urllib.parse import unquote, urlsplit
 
 
+FAIL_CLOSED_COMMUNITY_COLUMNS = frozenset(
+    {
+        ("user_profile", "community_city_name"),
+        ("user_profile", "community_city_code"),
+        ("user_profile", "community_city_updated_at"),
+        ("community_post", "visibility"),
+        ("community_post", "declaration"),
+    }
+)
+
+
 def _validate_database_name(database: str) -> str:
     """只允许配置中的安全数据库标识符，避免拼接 SQL 时产生注入风险。"""
     if not re.fullmatch(r"[A-Za-z0-9_]{1,64}", database):
@@ -118,16 +129,19 @@ class DatabaseManager:
         try:
             cursor.execute(f"SHOW COLUMNS FROM {table_name}")
             existing_columns = {row['Field'] for row in cursor.fetchall()}
-
-            for column_name, column_def in required_columns.items():
-                if column_name not in existing_columns:
-                    try:
-                        cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_def}")
-                        logger.info(f"✅ 已添加字段 {table_name}.{column_name}")
-                    except Exception as e:
-                        logger.warning(f"⚠️ 添加字段 {table_name}.{column_name} 失败: {e}")
         except Exception as e:
             logger.debug(f"表 {table_name} 可能不存在，将在创建表时处理: {e}")
+            return
+
+        for column_name, column_def in required_columns.items():
+            if column_name not in existing_columns:
+                try:
+                    cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_def}")
+                    logger.info(f"✅ 已添加字段 {table_name}.{column_name}")
+                except Exception as e:
+                    logger.warning(f"⚠️ 添加字段 {table_name}.{column_name} 失败: {e}")
+                    if (table_name.strip("`"), column_name) in FAIL_CLOSED_COMMUNITY_COLUMNS:
+                        raise
 
     def _ensure_required_columns(self, cursor):
         """补齐已存在旧表缺少的用户与认证模块字段。"""
@@ -182,6 +196,10 @@ class DatabaseManager:
                 'residence_province_code': "`residence_province_code` varchar(32) DEFAULT NULL",
                 'residence_city_code': "`residence_city_code` varchar(32) DEFAULT NULL",
                 'residence_district_code': "`residence_district_code` varchar(32) DEFAULT NULL",
+                # 社区同城浏览偏好（独立于资料现居，避免污染 discovery same_city）
+                'community_city_name': "`community_city_name` varchar(64) DEFAULT NULL COMMENT '同城浏览城市名'",
+                'community_city_code': "`community_city_code` varchar(32) DEFAULT NULL COMMENT '同城浏览市一级码'",
+                'community_city_updated_at': "`community_city_updated_at` datetime DEFAULT NULL COMMENT '同城偏好上次变更时间'",
                 'location_source': "`location_source` varchar(32) DEFAULT NULL",
                 'location_updated_at': "`location_updated_at` datetime DEFAULT NULL",
                 'location_precision': "`location_precision` decimal(10,2) DEFAULT NULL",
@@ -204,6 +222,10 @@ class DatabaseManager:
                 'show_profile': "`show_profile` tinyint NOT NULL DEFAULT '1' COMMENT '是否展示个人资料'",
                 'show_likes': "`show_likes` tinyint NOT NULL DEFAULT '1' COMMENT '是否展示喜欢列表'",
                 'show_posts': "`show_posts` tinyint NOT NULL DEFAULT '1' COMMENT '是否展示个人动态'",
+            },
+            'community_post': {
+                'visibility': "`visibility` tinyint NOT NULL DEFAULT '0' COMMENT '0公开 1仅好友 2仅自己'",
+                'declaration': "`declaration` varchar(32) NOT NULL DEFAULT '' COMMENT '内容声明'",
             },
             'user_login_log': {
                 'login_status': "`login_status` tinyint NOT NULL DEFAULT '1' COMMENT '1成功 2失败'",
@@ -250,6 +272,47 @@ class DatabaseManager:
             self._ensure_table_columns(cursor, f'`{table_name}`', columns)
         self._ensure_matchmaker_application_index(cursor)
         self._ensure_payment_order_idempotency_index(cursor)
+        self._ensure_idempotency_contract(cursor)
+
+    def _ensure_idempotency_contract(self, cursor):
+        """Upgrade the durable idempotency table without relying on server-local time."""
+        try:
+            cursor.execute("SHOW FULL COLUMNS FROM `api_idempotency_record`")
+            columns = {row['Field']: row for row in cursor.fetchall()}
+
+            key_column = columns.get('idempotency_key')
+            if key_column and str(key_column.get('Collation') or '').lower() != 'utf8mb4_bin':
+                cursor.execute("""
+                    ALTER TABLE `api_idempotency_record`
+                    MODIFY COLUMN `idempotency_key` varchar(128)
+                    CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL
+                    COMMENT '客户端幂等键'
+                """)
+
+            timestamp_columns = ('created_at', 'updated_at')
+            needs_timestamp_upgrade = any(
+                column_name in columns
+                and (
+                    str(columns[column_name].get('Type') or '').lower() != 'datetime(6)'
+                    or columns[column_name].get('Default') is not None
+                    or bool(columns[column_name].get('Extra'))
+                )
+                for column_name in timestamp_columns
+            )
+            if needs_timestamp_upgrade:
+                cursor.execute("""
+                    UPDATE `api_idempotency_record`
+                    SET `created_at` = UTC_TIMESTAMP(6), `updated_at` = UTC_TIMESTAMP(6)
+                    WHERE `state` = 'reserved'
+                """)
+                for column_name in timestamp_columns:
+                    cursor.execute(f"""
+                        ALTER TABLE `api_idempotency_record`
+                        MODIFY COLUMN `{column_name}` datetime(6) NOT NULL
+                    """)
+        except pymysql.MySQLError as exc:
+            logger.warning(f"api_idempotency_record 契约迁移失败: {exc}")
+            raise
 
     def _ensure_payment_order_idempotency_index(self, cursor):
         """Prevent duplicate paid-service orders when clients retry concurrently."""
@@ -1218,6 +1281,8 @@ class DatabaseManager:
                     `images` json DEFAULT NULL COMMENT '图片URL列表',
                     `video` varchar(255) DEFAULT NULL COMMENT '视频URL',
                     `location` varchar(128) DEFAULT NULL COMMENT '位置信息',
+                    `visibility` tinyint NOT NULL DEFAULT '0' COMMENT '0公开 1仅好友 2仅自己',
+                    `declaration` varchar(32) NOT NULL DEFAULT '' COMMENT '内容声明',
                     `view_count` int DEFAULT '0' COMMENT '浏览次数',
                     `like_count` int DEFAULT '0' COMMENT '点赞数',
                     `comment_count` int DEFAULT '0' COMMENT '评论数',
@@ -1326,7 +1391,28 @@ class DatabaseManager:
             """,
 
             # ============================================
-            # 28. 红娘服务订单
+            # 28. API 幂等记录
+            # ============================================
+            'api_idempotency_record': """
+                CREATE TABLE IF NOT EXISTS `api_idempotency_record` (
+                    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+                    `user_id` bigint unsigned NOT NULL,
+                    `operation` varchar(64) NOT NULL COMMENT '受保护的创建操作',
+                    `idempotency_key` varchar(128) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL COMMENT '客户端幂等键',
+                    `payload_hash` char(64) NOT NULL COMMENT '规范化请求载荷SHA-256',
+                    `state` varchar(16) NOT NULL DEFAULT 'reserved' COMMENT 'reserved/completed',
+                    `owner_token` char(36) NOT NULL COMMENT '当前预留所有者',
+                    `response_json` json DEFAULT NULL COMMENT '完成响应快照',
+                    `created_at` datetime(6) NOT NULL,
+                    `updated_at` datetime(6) NOT NULL,
+                    PRIMARY KEY (`id`),
+                    UNIQUE KEY `uk_api_idempotency_scope` (`user_id`,`operation`,`idempotency_key`),
+                    KEY `idx_api_idempotency_state_updated` (`state`,`updated_at`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='API幂等预留与响应快照'
+            """,
+
+            # ============================================
+            # 29. 红娘服务订单
             # ============================================
             'matchmaker_service': """
                 CREATE TABLE IF NOT EXISTS `matchmaker_service` (

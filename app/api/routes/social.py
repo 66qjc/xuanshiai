@@ -1,9 +1,14 @@
 """Relationships, chat, notifications and safety routes."""
 
-from fastapi import APIRouter, Body, Depends, Path, Query
+from fastapi import APIRouter, Body, Depends, HTTPException, Path, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.dependencies import CurrentUser, get_current_user, get_verified_user
+from app.api.dependencies import (
+    CurrentUser,
+    get_current_user,
+    get_realname_verified_user,
+    get_verified_user,
+)
 from app.db.session import get_db
 from app.schemas.social import (
     BlockRequest,
@@ -42,22 +47,22 @@ router = APIRouter(dependencies=[Depends(get_verified_user)])
 
 
 @router.put("/users/{target_id}/like", response_model=RelationResponse, summary="喜欢用户")
-async def like(target_id: int = Path(..., ge=1), current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> RelationResponse:
+async def like(target_id: int = Path(..., ge=1), current: CurrentUser = Depends(get_realname_verified_user), db: AsyncSession = Depends(get_db)) -> RelationResponse:
     return await set_like(db, current.id, target_id, True)
 
 
 @router.delete("/users/{target_id}/like", response_model=RelationResponse, summary="取消喜欢")
-async def unlike(target_id: int = Path(..., ge=1), current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> RelationResponse:
+async def unlike(target_id: int = Path(..., ge=1), current: CurrentUser = Depends(get_realname_verified_user), db: AsyncSession = Depends(get_db)) -> RelationResponse:
     return await set_like(db, current.id, target_id, False)
 
 
 @router.put("/users/{target_id}/follow", response_model=RelationResponse, summary="关注用户")
-async def follow(target_id: int = Path(..., ge=1), current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> RelationResponse:
+async def follow(target_id: int = Path(..., ge=1), current: CurrentUser = Depends(get_realname_verified_user), db: AsyncSession = Depends(get_db)) -> RelationResponse:
     return await set_follow(db, current.id, target_id, True)
 
 
 @router.delete("/users/{target_id}/follow", response_model=RelationResponse, summary="取消关注")
-async def unfollow(target_id: int = Path(..., ge=1), current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> RelationResponse:
+async def unfollow(target_id: int = Path(..., ge=1), current: CurrentUser = Depends(get_realname_verified_user), db: AsyncSession = Depends(get_db)) -> RelationResponse:
     return await set_follow(db, current.id, target_id, False)
 
 
@@ -66,9 +71,9 @@ async def my_likes(page: int = Query(1, ge=1, le=1000), page_size: int = Query(2
     return await list_relation(db, current.id, "like", False, page, page_size)
 
 
-@router.get("/relations/liked-by", response_model=RelationPage, summary="查看喜欢我的人")
+@router.get("/relations/liked-by", response_model=RelationPage, summary="查看喜欢我的人", deprecated=True)
 async def liked_by(page: int = Query(1, ge=1, le=1000), page_size: int = Query(20, ge=1, le=50), current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> RelationPage:
-    return await list_relation(db, current.id, "like", True, page, page_size)
+    raise HTTPException(status_code=410, detail="鍠滄鍒楄〃浠呮湰浜哄彲瑙?")
 
 
 @router.get("/relations/following", response_model=RelationPage, summary="查看我的关注")

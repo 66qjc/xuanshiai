@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, date, datetime, timedelta
+import logging
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
@@ -35,6 +36,8 @@ from app.schemas.discovery import (
     VisitorPage,
 )
 from app.services.profile import _calculate_age, _json_dict, _json_list, get_profile
+
+logger = logging.getLogger(__name__)
 
 
 CARD_SELECT = """
@@ -87,6 +90,7 @@ async def _viewer_context(db: AsyncSession, user_id: int) -> dict[str, Any]:
                       pref.preferred_city_codes
                FROM users u LEFT JOIN user_profile p ON p.user_id = u.id
                LEFT JOIN user_profile_completion c ON c.user_id = u.id
+               LEFT JOIN user_auth ua ON ua.user_id = u.id
                LEFT JOIN user_partner_preference pref ON pref.user_id = u.id
                WHERE u.id = :user_id"""),
         {"user_id": user_id},
@@ -396,7 +400,10 @@ async def save_filter(db: AsyncSession, user_id: int, filters: DiscoveryFilters)
 
 
 async def _quota_key(prefix: str, user_id: int) -> str:
-    return f"discovery:{prefix}:{user_id}:{date.today().isoformat()}"
+    # UTC 日键，与 community quotas / redis consume_daily 重置对齐
+    from app.core.redis import daily_quota_key
+
+    return daily_quota_key(f"discovery:{prefix}", user_id)
 
 
 async def _consume_browse(user_id: int, match_score: float, is_vip: bool) -> int | None:
@@ -641,6 +648,13 @@ async def _consume_apply_quota(viewer_id: int, vip: bool) -> None:
         raise HTTPException(429, detail="今日认识申请次数已用完")
 
 
+async def _refund_quota_after_database_failure(key: str) -> None:
+    try:
+        await refund_daily(key)
+    except Exception:
+        logger.exception("Failed to refund daily quota after database failure")
+
+
 async def create_application(db: AsyncSession, viewer_id: int, target_id: int, request: ApplicationCreateRequest) -> ApplicationResponse:
     await _lock_user_pair(db, viewer_id, target_id)
     await _ensure_target(db, viewer_id, target_id)
@@ -664,8 +678,11 @@ async def create_application(db: AsyncSession, viewer_id: int, target_id: int, r
         await _notify(db, target_id, "match_application", "收到新的认识申请", request.message or "有人申请认识你", viewer_id, result.lastrowid)
         await db.commit()
     except Exception:
-        await db.rollback()
-        await refund_daily(quota_key)
+        try:
+            await db.rollback()
+        except Exception:
+            logger.exception("Failed to roll back application create transaction")
+        await _refund_quota_after_database_failure(quota_key)
         raise
     created = await db.execute(text("SELECT id, from_user_id, to_user_id, message, status, expire_at, created_at FROM match_apply WHERE id = :id"), {"id": result.lastrowid})
     return ApplicationResponse(**created.mappings().one())
@@ -754,8 +771,11 @@ async def create_superlike(db: AsyncSession, viewer_id: int, target_id: int, ide
         await _notify(db, target_id, "superlike", "收到爆灯", "有人对你发出了爆灯信号", viewer_id)
         await db.commit()
     except Exception:
-        await db.rollback()
-        await refund_daily(key)
+        try:
+            await db.rollback()
+        except Exception:
+            logger.exception("Failed to roll back superlike create transaction")
+        await _refund_quota_after_database_failure(key)
         raise
     used = int(await redis_client.get(key) or 0)
     return SuperLikeResponse(target_user_id=target_id, remaining_today=max(0, limit - used), created_at=created_at)

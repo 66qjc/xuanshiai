@@ -72,30 +72,33 @@ async def _notify(db: AsyncSession, user_id: int, notification_type: str, title:
 
 
 async def set_like(db: AsyncSession, user_id: int, target_id: int, enabled: bool) -> RelationResponse:
+    """用户级喜欢：私有列表，不因互喜欢建 match/会话。聊天仅经申请同意。"""
     await _ensure_target(db, user_id, target_id)
-    matched = False
     if enabled:
-        old = await db.execute(text("SELECT 1 FROM user_favorite WHERE user_id = :user_id AND target_user_id = :target_id AND type = 1"), {"user_id": user_id, "target_id": target_id})
-        await db.execute(text("INSERT IGNORE INTO user_favorite (user_id, target_user_id, type) VALUES (:user_id, :target_id, 1)"), {"user_id": user_id, "target_id": target_id})
-        reciprocal = await db.execute(text("SELECT 1 FROM user_favorite WHERE user_id = :target_id AND target_user_id = :user_id AND type = 1"), {"user_id": user_id, "target_id": target_id})
-        matched = bool(reciprocal.scalar())
-        if matched:
-            for left, right in ((user_id, target_id), (target_id, user_id)):
-                await db.execute(text("""INSERT INTO user_match (user_id, target_user_id, status)
-                    VALUES (:left, :right, 1)
-                    ON DUPLICATE KEY UPDATE status = 1, updated_at = UTC_TIMESTAMP()"""), {"left": left, "right": right})
-            first, second = sorted((user_id, target_id))
-            await db.execute(text("INSERT IGNORE INTO chat_session (user1_id, user2_id) VALUES (:first, :second)"), {"first": first, "second": second})
-            if not old.first():
-                await _notify(db, target_id, "match", "你们互相喜欢了", "恭喜匹配成功，可以开始聊天了", user_id)
-                await _notify(db, user_id, "match", "你们互相喜欢了", "恭喜匹配成功，可以开始聊天了", target_id)
-        elif not old.first():
-            await _notify(db, target_id, "like", "有人喜欢了你", "有人对你表达了喜欢", user_id)
+        await db.execute(
+            text(
+                "INSERT IGNORE INTO user_favorite (user_id, target_user_id, type) "
+                "VALUES (:user_id, :target_id, 1)"
+            ),
+            {"user_id": user_id, "target_id": target_id},
+        )
+        # 定版：喜欢不通知对方、不自动匹配、不建 chat_session
     else:
-        await db.execute(text("DELETE FROM user_favorite WHERE user_id = :user_id AND target_user_id = :target_id AND type = 1"), {"user_id": user_id, "target_id": target_id})
-        await db.execute(text("UPDATE user_match SET status = 3, updated_at = UTC_TIMESTAMP() WHERE (user_id = :user_id AND target_user_id = :target_id) OR (user_id = :target_id AND target_user_id = :user_id)"), {"user_id": user_id, "target_id": target_id})
+        await db.execute(
+            text(
+                "DELETE FROM user_favorite WHERE user_id = :user_id "
+                "AND target_user_id = :target_id AND type = 1"
+            ),
+            {"user_id": user_id, "target_id": target_id},
+        )
     await db.commit()
-    return RelationResponse(target_user_id=target_id, relation_type="like", enabled=enabled, matched=matched or await _match_exists(db, user_id, target_id))
+    # matched 仅反映是否仍有有效 match（申请同意等），不再由喜欢产生
+    return RelationResponse(
+        target_user_id=target_id,
+        relation_type="like",
+        enabled=enabled,
+        matched=await _match_exists(db, user_id, target_id),
+    )
 
 
 async def set_follow(db: AsyncSession, user_id: int, target_id: int, enabled: bool) -> RelationResponse:
