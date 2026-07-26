@@ -41,9 +41,22 @@ def test_community_media_tables_are_defined() -> None:
 def test_community_media_routes_registered() -> None:
     from app.main import app
 
-    paths = {getattr(r, "path", None) for r in app.routes}
-    assert "/api/v1/community/media/uploads" in paths
-    assert "/api/v1/community/media/{media_id}" in paths
+    paths: set[str] = set()
+    for route in app.routes:
+        path = getattr(route, "path", None)
+        if isinstance(path, str):
+            paths.add(path)
+        # Nested/mounted routers expose routes under .routes
+        for child in getattr(route, "routes", []) or []:
+            child_path = getattr(child, "path", None)
+            if isinstance(child_path, str):
+                paths.add(child_path)
+    assert "/api/v1/community/media/uploads" in paths or any(
+        p.endswith("/community/media/uploads") for p in paths
+    )
+    assert "/api/v1/community/media/{media_id}" in paths or any(
+        p.endswith("/community/media/{media_id}") for p in paths
+    )
 
 
 def test_community_media_response_shape() -> None:
