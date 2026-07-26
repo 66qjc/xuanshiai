@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field, model_validator
+
+PositiveInt = Annotated[int, Field(ge=1)]
 
 
 CITY_CODE_PATTERN = r"^(?:[0-9]{4}|[0-9]{6})$"
@@ -15,7 +17,7 @@ class CommunityPostCreate(BaseModel):
     content: str = Field(default="", max_length=2000)
     images: list[str] = Field(default_factory=list, max_length=9)
     video: str | None = Field(default=None, max_length=500)
-    image_media_ids: list[int] = Field(default_factory=list, max_length=9)
+    image_media_ids: list[PositiveInt] = Field(default_factory=list, max_length=9)
     video_media_id: int | None = Field(default=None, ge=1)
     location: str | None = Field(default=None, max_length=128)
     topic_id: int | None = Field(default=None, ge=1)
@@ -224,7 +226,7 @@ class CommunityCollectResponse(BaseModel):
 class PaperPlaneCreate(BaseModel):
     content: str = Field(default="", max_length=1000)
     images: list[str] = Field(default_factory=list, max_length=6)
-    image_media_ids: list[int] = Field(default_factory=list, max_length=6)
+    image_media_ids: list[PositiveInt] = Field(default_factory=list, max_length=6)
     city: str | None = Field(default=None, max_length=64)
     tags: list[str] = Field(default_factory=list, max_length=5)
     is_anonymous: bool = True

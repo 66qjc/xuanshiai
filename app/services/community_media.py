@@ -324,7 +324,8 @@ async def resolve_owned_ready_media(
     )
     rows = {int(row["id"]): dict(row) for row in result.mappings().all()}
     ordered: list[dict[str, Any]] = []
-    for media_id in media_ids:
+    # unique_ids preserves first-seen order; never re-attach duplicate IDs
+    for media_id in unique_ids:
         row = rows.get(int(media_id))
         if row is None:
             raise HTTPException(422, detail=f"媒体不可用: {media_id}")
@@ -339,7 +340,31 @@ async def bind_media(
     target_type: str,
     target_id: int,
 ) -> None:
+    """Attach ready media to a target and mark them bound.
+
+    Each media row is locked with FOR UPDATE, then attachment INSERT and
+    ready→bound UPDATE run in the caller's transaction. Non-ready / missing
+    media fails the whole bind so no orphan attachments remain.
+    """
     for order, media_id in enumerate(media_ids):
+        locked = await db.execute(
+            text(
+                """SELECT id, status
+                FROM community_media
+                WHERE id = :id AND deleted_at IS NULL
+                FOR UPDATE"""
+            ),
+            {"id": media_id},
+        )
+        row = locked.mappings().first()
+        if not row:
+            raise HTTPException(422, detail=f"媒体不存在: {media_id}")
+        if row["status"] != "ready":
+            raise HTTPException(
+                409,
+                detail=f"媒体状态不可绑定: {media_id} (status={row['status']})",
+            )
+
         await db.execute(
             text(
                 """INSERT INTO community_media_attachment
@@ -353,7 +378,7 @@ async def bind_media(
                 "sort_order": order,
             },
         )
-        await db.execute(
+        update_result = await db.execute(
             text(
                 """UPDATE community_media
                 SET status = 'bound', expire_at = NULL
@@ -361,6 +386,8 @@ async def bind_media(
             ),
             {"id": media_id},
         )
+        if getattr(update_result, "rowcount", 0) == 0:
+            raise HTTPException(409, detail=f"媒体绑定失败: {media_id}")
 
 
 async def cleanup_expired_unbound_media(db: AsyncSession, *, limit: int = 100) -> int:
