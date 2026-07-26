@@ -440,6 +440,7 @@ class DatabaseManager:
             ('community_post', 'user_id'),
             ('community_comment', 'user_id'),
             ('community_like', 'user_id'),
+            ('community_media', 'user_id'),
             ('paper_plane', 'user_id'),
             ('paper_plane_reply', 'user_id'),
             ('matchmaker_service', 'user_id'),
@@ -1347,6 +1348,52 @@ class DatabaseManager:
                     PRIMARY KEY (`id`),
                     UNIQUE KEY `uk_name` (`name`)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='话题分类'
+            """,
+
+            # ============================================
+            # 25c. 社区动态与纸飞机媒体
+            # ============================================
+            'community_media': """
+                CREATE TABLE IF NOT EXISTS `community_media` (
+                    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+                    `user_id` bigint unsigned NOT NULL,
+                    `purpose` varchar(32) NOT NULL COMMENT 'post|paper_plane',
+                    `media_type` varchar(16) NOT NULL COMMENT 'image|video',
+                    `file_url` varchar(512) NOT NULL,
+                    `storage_key` varchar(512) NOT NULL,
+                    `thumbnail_url` varchar(512) DEFAULT NULL,
+                    `mime_type` varchar(128) DEFAULT NULL,
+                    `file_size` bigint unsigned DEFAULT NULL,
+                    `duration_seconds` smallint unsigned DEFAULT NULL,
+                    `status` varchar(16) NOT NULL DEFAULT 'ready' COMMENT 'ready|bound|deleted',
+                    `deleted_at` datetime DEFAULT NULL,
+                    `expire_at` datetime DEFAULT NULL COMMENT '未绑定媒体过期时间',
+                    `created_at` datetime DEFAULT CURRENT_TIMESTAMP,
+                    `updated_at` datetime DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    PRIMARY KEY (`id`),
+                    UNIQUE KEY `uk_community_media_storage_key` (`storage_key`),
+                    KEY `idx_community_media_user_purpose` (`user_id`,`purpose`,`status`,`deleted_at`),
+                    KEY `idx_community_media_expire` (`status`,`expire_at`,`deleted_at`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='社区动态与纸飞机媒体'
+            """,
+
+            # ============================================
+            # 25d. 社区媒体绑定关系
+            # ============================================
+            'community_media_attachment': """
+                CREATE TABLE IF NOT EXISTS `community_media_attachment` (
+                    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+                    `media_id` bigint unsigned NOT NULL,
+                    `target_type` varchar(32) NOT NULL COMMENT 'post|paper_plane',
+                    `target_id` bigint unsigned NOT NULL,
+                    `sort_order` smallint unsigned NOT NULL DEFAULT '0',
+                    `created_at` datetime DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (`id`),
+                    UNIQUE KEY `uk_community_media_attachment_media` (`media_id`),
+                    KEY `idx_community_media_attachment_target` (`target_type`,`target_id`,`sort_order`),
+                    CONSTRAINT `fk_community_media_attachment_media`
+                        FOREIGN KEY (`media_id`) REFERENCES `community_media`(`id`) ON DELETE CASCADE
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='社区媒体绑定关系'
             """,
 
             # ============================================
