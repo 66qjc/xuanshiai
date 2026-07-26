@@ -4,7 +4,7 @@ from collections.abc import Awaitable, Callable
 import logging
 from typing import Any, Literal, TypeVar
 
-from fastapi import APIRouter, Body, Depends, Header, Path, Query
+from fastapi import APIRouter, Body, Depends, File, Form, Header, Path, Query, UploadFile
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -28,20 +28,27 @@ from app.schemas.community import (
     CommunityCollectResponse,
     CommunityCommentCreate,
     CommunityCommentResponse,
+    CommunityMediaResponse,
     CommunityPostCreate,
     CommunityPostPage,
     CommunityPostResponse,
     CommunityQuotasResponse,
+    CommunityReportCreate,
     CommunityReportReason,
+    CommunityReportResponse,
     CommunityTopicDetailResponse,
     CommunityTopicJoinResponse,
     CommunityTopicPage,
     CommunityTopicResponse,
+    PaperPlaneConversationResponse,
     PaperPlaneCreate,
+    PaperPlaneMessageCreate,
+    PaperPlaneMessageResponse,
     PaperPlaneReplyCreate,
     PaperPlaneReplyResponse,
     PaperPlaneResponse,
 )
+from app.services.community_media import delete_community_media, upload_community_media
 from app.services.community import (
     collect_post,
     create_comment,
@@ -49,6 +56,7 @@ from app.services.community import (
     create_post,
     delete_comment,
     delete_post,
+    end_paper_plane_conversation,
     get_activity,
     get_community_quotas,
     get_current_city,
@@ -56,20 +64,27 @@ from app.services.community import (
     get_topic,
     get_topic_detail,
     join_topic,
+    leave_topic,
+    like_comment,
     like_post,
     list_activities,
     list_banners,
     list_comments,
     list_my_activities,
+    list_paper_plane_conversations,
+    list_paper_plane_messages,
     list_paper_planes,
     list_posts,
     list_report_reasons,
     list_topics,
+    read_paper_plane_conversation,
     reply_paper_plane,
+    send_paper_plane_message,
     set_current_city,
     signup_activity,
 )
 from app.services.idempotency import abort, complete, reserve_or_replay
+from app.services.social import create_content_report
 
 router = APIRouter(dependencies=[Depends(get_verified_user)])
 ResponseModelT = TypeVar("ResponseModelT", bound=BaseModel)
@@ -119,6 +134,34 @@ async def _create_idempotently(
         except Exception:
             logger.exception("Failed to abort idempotency reservation")
         raise
+
+
+@router.post(
+    "/community/media/uploads",
+    response_model=CommunityMediaResponse,
+    status_code=201,
+    summary="上传社区媒体",
+)
+async def upload_media(
+    file: UploadFile = File(...),
+    purpose: str = Form(...),
+    current: CurrentUser = Depends(get_realname_verified_user),
+    db: AsyncSession = Depends(get_db),
+) -> CommunityMediaResponse:
+    return await upload_community_media(db, current.id, file, purpose)
+
+
+@router.delete(
+    "/community/media/{media_id}",
+    status_code=204,
+    summary="删除未绑定社区媒体",
+)
+async def remove_media(
+    media_id: int,
+    current: CurrentUser = Depends(get_realname_verified_user),
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    await delete_community_media(db, current.id, media_id)
 
 
 @router.post("/community/posts", response_model=CommunityPostResponse, status_code=201, summary="发布动态")
@@ -281,6 +324,32 @@ async def remove_comment(
     await delete_comment(db, current.id, comment_id)
 
 
+@router.put(
+    "/community/comments/{comment_id}/like",
+    response_model=CommunityCommentResponse,
+    summary="点赞评论",
+)
+async def like_comment_route(
+    comment_id: int = Path(..., ge=1),
+    current: CurrentUser = Depends(get_realname_verified_user),
+    db: AsyncSession = Depends(get_db),
+) -> CommunityCommentResponse:
+    return await like_comment(db, current.id, comment_id, True)
+
+
+@router.delete(
+    "/community/comments/{comment_id}/like",
+    response_model=CommunityCommentResponse,
+    summary="取消评论点赞",
+)
+async def unlike_comment_route(
+    comment_id: int = Path(..., ge=1),
+    current: CurrentUser = Depends(get_realname_verified_user),
+    db: AsyncSession = Depends(get_db),
+) -> CommunityCommentResponse:
+    return await like_comment(db, current.id, comment_id, False)
+
+
 @router.get("/community/topics", response_model=list[CommunityTopicResponse], summary="话题列表")
 async def topics(
     sort: Literal["hot", "latest"] = Query("hot"),
@@ -348,6 +417,19 @@ async def topic_join(
     db: AsyncSession = Depends(get_db),
 ) -> CommunityTopicJoinResponse:
     return await join_topic(db, current.id, topic_id)
+
+
+@router.delete(
+    "/community/topics/{topic_id}/leave",
+    response_model=CommunityTopicJoinResponse,
+    summary="取消参与话题",
+)
+async def topic_leave(
+    topic_id: int = Path(..., ge=1),
+    current: CurrentUser = Depends(get_realname_verified_user),
+    db: AsyncSession = Depends(get_db),
+) -> CommunityTopicJoinResponse:
+    return await leave_topic(db, current.id, topic_id)
 
 
 @router.get("/community/activities", response_model=ActivityPage, summary="线下活动列表")
@@ -435,6 +517,32 @@ async def report_reasons(current: CurrentUser = Depends(get_current_user)) -> li
     return [CommunityReportReason(**item) for item in list_report_reasons()]
 
 
+@router.post("/community/reports", response_model=CommunityReportResponse, status_code=201, summary="举报社区内容")
+async def create_community_report(
+    body: CommunityReportCreate,
+    current: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> CommunityReportResponse:
+    report = await create_content_report(
+        db,
+        current.id,
+        target_type=body.target_type,
+        target_id=body.target_id,
+        reason_id=body.reason_id,
+        description=body.description,
+        images=body.images,
+    )
+    return CommunityReportResponse(
+        id=report.id,
+        target_type=report.target_type,
+        target_id=report.target_id,
+        target_user_id=report.target_user_id,
+        type=report.type,
+        status=report.status,
+        created_at=report.created_at,
+    )
+
+
 @router.post("/paper-planes", response_model=PaperPlaneResponse, status_code=201, summary="发送纸飞机")
 async def send_plane(
     body: PaperPlaneCreate,
@@ -513,3 +621,89 @@ async def reply(
         PaperPlaneReplyResponse,
         lambda commit: reply_paper_plane(db, current.id, plane_id, body, commit=commit),
     )
+
+
+@router.get(
+    "/paper-plane-conversations",
+    response_model=list[PaperPlaneConversationResponse],
+    summary="纸飞机匿名会话列表",
+)
+async def plane_conversations(
+    page: int = Query(1, ge=1, le=1000),
+    page_size: int = Query(20, ge=1, le=50),
+    current: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> list[PaperPlaneConversationResponse]:
+    return await list_paper_plane_conversations(db, current.id, page, page_size)
+
+
+@router.get(
+    "/paper-plane-conversations/{conversation_id}/messages",
+    response_model=list[PaperPlaneMessageResponse],
+    summary="纸飞机匿名会话消息",
+)
+async def plane_conversation_messages(
+    conversation_id: int = Path(..., ge=1),
+    page: int = Query(1, ge=1, le=1000),
+    page_size: int = Query(50, ge=1, le=100),
+    current: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> list[PaperPlaneMessageResponse]:
+    return await list_paper_plane_messages(db, current.id, conversation_id, page, page_size)
+
+
+@router.post(
+    "/paper-plane-conversations/{conversation_id}/messages",
+    response_model=PaperPlaneMessageResponse,
+    status_code=201,
+    summary="发送纸飞机匿名会话消息",
+)
+async def plane_conversation_send(
+    conversation_id: int = Path(..., ge=1),
+    body: PaperPlaneMessageCreate = Body(...),
+    idempotency_key: str | None = Header(
+        default=None,
+        alias="Idempotency-Key",
+        min_length=8,
+        max_length=128,
+    ),
+    current: CurrentUser = Depends(get_realname_verified_user),
+    db: AsyncSession = Depends(get_db),
+) -> PaperPlaneMessageResponse:
+    return await _create_idempotently(
+        db,
+        current.id,
+        "community.paper_plane_message.create",
+        idempotency_key,
+        {"conversation_id": conversation_id, "body": body.model_dump(mode="json")},
+        PaperPlaneMessageResponse,
+        lambda commit: send_paper_plane_message(
+            db, current.id, conversation_id, body, commit=commit
+        ),
+    )
+
+
+@router.post(
+    "/paper-plane-conversations/{conversation_id}/read",
+    response_model=PaperPlaneConversationResponse,
+    summary="标记纸飞机会话已读",
+)
+async def plane_conversation_read(
+    conversation_id: int = Path(..., ge=1),
+    current: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> PaperPlaneConversationResponse:
+    return await read_paper_plane_conversation(db, current.id, conversation_id)
+
+
+@router.post(
+    "/paper-plane-conversations/{conversation_id}/end",
+    response_model=PaperPlaneConversationResponse,
+    summary="结束纸飞机匿名会话",
+)
+async def plane_conversation_end(
+    conversation_id: int = Path(..., ge=1),
+    current: CurrentUser = Depends(get_realname_verified_user),
+    db: AsyncSession = Depends(get_db),
+) -> PaperPlaneConversationResponse:
+    return await end_paper_plane_conversation(db, current.id, conversation_id)

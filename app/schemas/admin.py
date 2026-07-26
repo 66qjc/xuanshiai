@@ -1,5 +1,6 @@
 """Administrative moderation schemas."""
 
+from datetime import datetime
 from typing import Literal
 
 from pydantic import BaseModel, Field
@@ -20,14 +21,49 @@ class MediaReviewResponse(BaseModel):
 class ReportReviewRequest(BaseModel):
     status: Literal[1, 2]
     result: str = Field(min_length=1, max_length=255)
+    action: Literal["none", "hide_content", "restore_content", "dismiss"] = "none"
 
 
 class ReportReviewResponse(BaseModel):
     report_id: int
     status: Literal[1, 2]
     result: str
+    action: Literal["none", "hide_content", "restore_content", "dismiss"] = "none"
+    content_moderated: bool = False
 
 
+class AdminReportItem(BaseModel):
+    id: int
+    reporter_user_id: int
+    target_user_id: int
+    target_type: Literal["user", "post", "comment", "paper_plane"]
+    target_id: int | None
+    type: str | None
+    description: str | None
+    status: Literal[0, 1, 2]
+    result: str | None
+    created_at: datetime
+    updated_at: datetime | None = None
+
+
+class AdminReportPage(BaseModel):
+    items: list[AdminReportItem]
+    page: int
+    page_size: int
+    total: int
+    has_more: bool
+
+
+class ContentModerationRequest(BaseModel):
+    status: Literal[1, 2]
+    reason: str | None = Field(default=None, max_length=255)
+
+
+class ContentModerationResponse(BaseModel):
+    target_type: Literal["post", "comment", "paper_plane"]
+    target_id: int
+    status: Literal[1, 2]
+    reason: str | None = None
 
 
 class CertificationReviewRequest(BaseModel):

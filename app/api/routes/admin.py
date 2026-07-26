@@ -1,13 +1,25 @@
 """Administrative moderation routes."""
 
-from fastapi import APIRouter, Body, Depends, Path
+from typing import Literal
+
+from fastapi import APIRouter, Body, Depends, Path, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies import CurrentUser, get_current_admin
 from app.db.session import get_db
-from app.schemas.admin import CertificationReviewRequest, CertificationReviewResponse, MediaReviewRequest, MediaReviewResponse, ReportReviewRequest, ReportReviewResponse
+from app.schemas.admin import (
+    AdminReportPage,
+    CertificationReviewRequest,
+    CertificationReviewResponse,
+    ContentModerationRequest,
+    ContentModerationResponse,
+    MediaReviewRequest,
+    MediaReviewResponse,
+    ReportReviewRequest,
+    ReportReviewResponse,
+)
 from app.services.profile import review_media
-from app.services.social import review_report
+from app.services.social import list_admin_reports, moderate_content, review_report
 from app.services.certifications import review_certification
 
 router = APIRouter(prefix="/admin")
@@ -18,9 +30,90 @@ async def review_user_media(media_id: int = Path(..., ge=1), body: MediaReviewRe
     return await review_media(db, media_id, body)
 
 
+@router.get("/reports", response_model=AdminReportPage, summary="举报列表")
+async def list_reports(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    status: Literal[0, 1, 2] | None = Query(default=None),
+    target_type: Literal["user", "post", "comment", "paper_plane"] | None = Query(default=None),
+    admin: CurrentUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+) -> AdminReportPage:
+    return await list_admin_reports(db, page=page, page_size=page_size, status=status, target_type=target_type)
+
+
 @router.patch("/reports/{report_id}/review", response_model=ReportReviewResponse, summary="处理用户举报")
 async def review_user_report(report_id: int = Path(..., ge=1), body: ReportReviewRequest = Body(...), admin: CurrentUser = Depends(get_current_admin), db: AsyncSession = Depends(get_db)) -> ReportReviewResponse:
-    return await review_report(db, report_id, body)
+    return await review_report(db, report_id, body, actor_id=admin.id)
+
+
+@router.patch(
+    "/community/posts/{post_id}/moderation",
+    response_model=ContentModerationResponse,
+    summary="下架或恢复动态",
+)
+async def moderate_post(
+    post_id: int = Path(..., ge=1),
+    body: ContentModerationRequest = Body(...),
+    admin: CurrentUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+) -> ContentModerationResponse:
+    await moderate_content(
+        db,
+        target_type="post",
+        target_id=post_id,
+        hide=body.status == 2,
+        reason=body.reason,
+        actor_id=admin.id,
+    )
+    await db.commit()
+    return ContentModerationResponse(target_type="post", target_id=post_id, status=body.status, reason=body.reason)
+
+
+@router.patch(
+    "/community/comments/{comment_id}/moderation",
+    response_model=ContentModerationResponse,
+    summary="下架或恢复评论",
+)
+async def moderate_comment(
+    comment_id: int = Path(..., ge=1),
+    body: ContentModerationRequest = Body(...),
+    admin: CurrentUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+) -> ContentModerationResponse:
+    await moderate_content(
+        db,
+        target_type="comment",
+        target_id=comment_id,
+        hide=body.status == 2,
+        reason=body.reason,
+        actor_id=admin.id,
+    )
+    await db.commit()
+    return ContentModerationResponse(target_type="comment", target_id=comment_id, status=body.status, reason=body.reason)
+
+
+@router.patch(
+    "/community/paper-planes/{plane_id}/moderation",
+    response_model=ContentModerationResponse,
+    summary="下架或恢复纸飞机",
+)
+async def moderate_paper_plane(
+    plane_id: int = Path(..., ge=1),
+    body: ContentModerationRequest = Body(...),
+    admin: CurrentUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+) -> ContentModerationResponse:
+    await moderate_content(
+        db,
+        target_type="paper_plane",
+        target_id=plane_id,
+        hide=body.status == 2,
+        reason=body.reason,
+        actor_id=admin.id,
+    )
+    await db.commit()
+    return ContentModerationResponse(target_type="paper_plane", target_id=plane_id, status=body.status, reason=body.reason)
 
 
 @router.patch("/users/{user_id}/certifications/{kind}/review", response_model=CertificationReviewResponse, summary="审核用户资质认证")

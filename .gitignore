@@ -27,6 +27,10 @@ logs/*
 storage/uploads/*
 !storage/uploads/.gitkeep
 
+# Local startup scripts (contain local conda paths)
+start.bat
+start.sh
+
 # IDE and operating system files
 .idea/
 .vscode/*.log

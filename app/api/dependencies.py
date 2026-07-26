@@ -69,7 +69,7 @@ async def get_realname_verified_user(
     current: CurrentUser = Depends(get_verified_user),
 ) -> CurrentUser:
     if current.realname_status != 2:
-        raise HTTPException(status_code=403, detail="璇峰厛瀹屾垚瀹炲悕璁よ瘉")
+        raise HTTPException(status_code=403, detail="请先完成实名认证")
     return current
 
 
