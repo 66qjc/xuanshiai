@@ -19,4 +19,6 @@
 
 申请状态：`SUBMITTED`、`CONTACTED`、`ACCEPTED`、`DECLINED`、`CLOSED`。拒绝或关闭必须填写 `reason`。只有 `ACCEPTED` 才能由管理员安排约会。
 
+红娘基于服务单发起约见时，服务状态必须为 `1=服务中` 或 `2=服务完成`；`3=已取消/退款`、服务过期、红娘停用或账号封禁时禁止发起。约见记录必须保留 `service_id` 和 `matchmaker_id`，以便退款、责任和分成追溯。
+
 约会状态：`SCHEDULED`、`REMINDED`、`CHECKED_IN`、`COMPLETED`、`CANCELLED`、`NO_SHOW`。反馈只有约会进入 `CHECKED_IN` 或 `COMPLETED` 后允许提交。

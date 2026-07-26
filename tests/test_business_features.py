@@ -3,7 +3,7 @@ from pydantic import ValidationError
 import pytest
 
 from app.main import app
-from app.schemas.finance import CommissionRuleCreate
+from app.schemas.finance import CommissionRuleCreate, ProductCommissionConfigCreate
 from app.schemas.organization import StoreCreate
 
 
@@ -20,6 +20,7 @@ def test_business_routes_are_registered_and_protected() -> None:
     assert "/api/v1/finance/orders" in paths
     assert "/api/v1/finance/commission-entries" in paths
     assert "/api/v1/admin/finance/commission-rules" in paths
+    assert "/api/v1/admin/finance/product-commission-rules/{product_id}" in paths
     assert "/api/v1/admin/finance/report" in paths
     assert "/api/v1/admin/finance/orders/{order_id}/refund" in paths
     assert schema["tags"][:8] == [
@@ -46,3 +47,8 @@ def test_business_schemas_validate_contracts() -> None:
     assert rule.rate_percent == 10
     with pytest.raises(ValidationError):
         CommissionRuleCreate(beneficiary_type="store", name="门店", mode="rate")
+    with pytest.raises(ValidationError):
+        ProductCommissionConfigCreate(beneficiary_type="store", mode="rate")
+    assert ProductCommissionConfigCreate(
+        beneficiary_type="service_matchmaker", mode="rate", rate_percent="10.0000"
+    ).rate_percent == 10

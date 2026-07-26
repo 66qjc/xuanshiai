@@ -454,7 +454,19 @@ Content-Type: application/json
 | 分配红娘 | 否 | 否 | 是 |
 | 查看申请人联系方式 | 一期不返回 | 按业务授权 | 后台按治理需要 |
 
-## 12. 现有模糊点
+## 12. 联系方式授权交换
+
+红娘微信交付和用户双方联系方式交换是两条不同流程。`PATCH /matchmaker/service-requests/{service_id}/contact` 只交付红娘自己的微信，不代表双方用户已经同意交换联系方式。
+
+| 方法 | 路径 | 权限 | 用途 |
+| --- | --- | --- | --- |
+| `POST` | `/matchmaker/service-requests/{service_id}/contact-exchanges` | 被分配的服务红娘 | 创建双方联系方式授权申请 |
+| `GET` | `/matchmaker/service-requests/contact-exchanges/{exchange_id}` | 交换双方 | 查询授权状态 |
+| `PATCH` | `/matchmaker/service-requests/contact-exchanges/{exchange_id}` | 交换双方 | `CONSENT` 同意或 `REVOKE` 撤回 |
+
+授权状态为 `PENDING`、`ONE_SIDE_CONSENT`、`APPROVED`、`DELIVERED`、`REVOKED`、`HIDDEN`。只有双方都同意后才能进入 `APPROVED`，退款、拉黑、账号注销或风控处理会进入 `HIDDEN`。已交付记录不删除，只停止后续展示并保留审计记录。
+
+## 13. 现有模糊点
 
 - 具体哪些功能必须实名认证仍待产品确认；本模块当前提交牵线申请先要求实名认证。
 - 一期是否允许收费红娘、会员、积分和爆灯尚未实现，当前 `service_type=2` 固定为基础/免费牵线。
@@ -465,7 +477,7 @@ Content-Type: application/json
 - 超级管理员查看敏感材料、导出证据和聊天原文的二次确认及留存期限仍待确认。
 - 申请认识次数、推荐算法、会员曝光和爆灯规则不在本期红娘服务接口中实现。
 
-## 13. Swagger 手动测试前置条件
+## 14. Swagger 手动测试前置条件
 
 1. 启动后端：
 
@@ -489,7 +501,7 @@ Bearer <对应账号的 access_token>
    - 对应用户一条 `user_role.role_code='service_matchmaker'` 且 `status=1` 的角色。
    - 一个已完成实名认证的普通测试用户。
 
-## 14. Swagger 手动测试顺序
+## 15. Swagger 手动测试顺序
 
 ### 场景 A：公开查看红娘
 
@@ -548,7 +560,7 @@ Bearer <对应账号的 access_token>
 - `status=2` 但不填写 `feedback`。
 - `service_id` 非正整数。
 
-## 15. 运行检查
+## 16. 运行检查
 
 ```powershell
 .\.venv\Scripts\python.exe -m compileall -q app

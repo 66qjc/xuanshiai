@@ -18,6 +18,9 @@ from app.schemas.matchmaker import (
     MatchmakerCard,
     MatchmakerPage,
     MatchmakerContactResponse,
+    MatchmakerContactExchangeCreate,
+    MatchmakerContactExchangeResponse,
+    MatchmakerContactExchangeUpdate,
     MatchmakerContactUpdate,
     MatchmakerServiceOrderCreate,
     MatchmakerServiceOrderResponse,
@@ -160,6 +163,14 @@ def _order_response(row: Any) -> MatchmakerServiceOrderResponse:
         created_at=_datetime(row["created_at"]),
         pay_time=_datetime(row["pay_time"]) if row["pay_time"] else None,
     )
+
+
+def _exchange_response(row: Any) -> MatchmakerContactExchangeResponse:
+    values = dict(row)
+    for field in ("source_consented_at", "target_consented_at", "delivered_at", "hidden_at", "created_at", "updated_at"):
+        if values[field]:
+            values[field] = _datetime(values[field])
+    return MatchmakerContactExchangeResponse(**values)
 
 
 async def list_service_products(db: AsyncSession) -> list[MatchmakerServiceProductResponse]:
@@ -391,6 +402,86 @@ async def get_matchmaker_contact(
     })
     await db.commit()
     return MatchmakerContactResponse(**dict(contact))
+
+
+async def create_contact_exchange(
+    db: AsyncSession, current: CurrentUser, service_id: int, request: MatchmakerContactExchangeCreate
+) -> MatchmakerContactExchangeResponse:
+    service_result = await db.execute(text("""SELECT id, user_id, matchmaker_id, status
+        FROM matchmaker_service WHERE id = :id FOR UPDATE"""), {"id": service_id})
+    service = service_result.mappings().first()
+    if not service or service["matchmaker_id"] != current.id:
+        raise HTTPException(404, detail="服务不存在或不属于当前红娘")
+    if service["status"] not in (1, 2):
+        raise HTTPException(409, detail="当前服务状态不能发起联系方式交换")
+    if request.target_user_id == service["user_id"]:
+        raise HTTPException(422, detail="不能将服务用户作为联系方式交换对象")
+    target = await db.execute(text("SELECT id FROM users WHERE id = :id AND status = 1"), {"id": request.target_user_id})
+    if not target.scalar():
+        raise HTTPException(404, detail="联系方式交换对象不存在或不可用")
+    existing = await db.execute(text("""SELECT id, service_id, source_user_id, target_user_id,
+        status, source_consented_at, target_consented_at, delivered_at, hidden_at, hidden_reason,
+        created_at, updated_at FROM matchmaker_contact_exchange
+        WHERE service_id = :service_id AND source_user_id = :source_id AND target_user_id = :target_id
+        FOR UPDATE"""), {"service_id": service_id, "source_id": service["user_id"], "target_id": request.target_user_id})
+    row = existing.mappings().first()
+    if row:
+        return _exchange_response(row)
+    result = await db.execute(text("""INSERT INTO matchmaker_contact_exchange
+        (service_id, source_user_id, target_user_id, status)
+        VALUES (:service_id, :source_id, :target_id, 'PENDING')"""), {
+        "service_id": service_id, "source_id": service["user_id"], "target_id": request.target_user_id,
+    })
+    exchange_id = int(result.lastrowid)
+    await _notify(db, int(request.target_user_id), "matchmaker_contact_exchange", "收到联系方式交换申请", "红娘邀请你授权交换联系方式", exchange_id)
+    await db.commit()
+    result = await db.execute(text("""SELECT id, service_id, source_user_id, target_user_id,
+        status, source_consented_at, target_consented_at, delivered_at, hidden_at, hidden_reason,
+        created_at, updated_at FROM matchmaker_contact_exchange WHERE id = :id"""), {"id": exchange_id})
+    return _exchange_response(result.mappings().one())
+
+
+async def update_contact_exchange(
+    db: AsyncSession, current: CurrentUser, exchange_id: int, request: MatchmakerContactExchangeUpdate
+) -> MatchmakerContactExchangeResponse:
+    result = await db.execute(text("""SELECT id, service_id, source_user_id, target_user_id,
+        status, source_consented_at, target_consented_at, delivered_at, hidden_at, hidden_reason,
+        created_at, updated_at FROM matchmaker_contact_exchange WHERE id = :id FOR UPDATE"""), {"id": exchange_id})
+    row = result.mappings().first()
+    if not row or current.id not in (row["source_user_id"], row["target_user_id"]):
+        raise HTTPException(404, detail="联系方式交换不存在或无权操作")
+    if request.action == "REVOKE":
+        if row["status"] in ("DELIVERED", "HIDDEN"):
+            raise HTTPException(409, detail="已交付的联系方式不能删除历史事实")
+        await db.execute(text("""UPDATE matchmaker_contact_exchange SET status = 'REVOKED',
+            hidden_at = UTC_TIMESTAMP(), hidden_reason = '用户撤回授权', updated_at = UTC_TIMESTAMP()
+            WHERE id = :id"""), {"id": exchange_id})
+    else:
+        column = "source_consented_at" if current.id == row["source_user_id"] else "target_consented_at"
+        await db.execute(text(f"""UPDATE matchmaker_contact_exchange SET {column} = COALESCE({column}, UTC_TIMESTAMP()),
+            status = CASE WHEN source_consented_at IS NOT NULL AND target_consented_at IS NOT NULL
+                THEN 'APPROVED' ELSE 'ONE_SIDE_CONSENT' END, updated_at = UTC_TIMESTAMP()
+            WHERE id = :id AND status NOT IN ('REVOKED', 'HIDDEN')"""), {"id": exchange_id})
+    await db.commit()
+    result = await db.execute(text("""SELECT id, service_id, source_user_id, target_user_id,
+        status, source_consented_at, target_consented_at, delivered_at, hidden_at, hidden_reason,
+        created_at, updated_at FROM matchmaker_contact_exchange WHERE id = :id"""), {"id": exchange_id})
+    return _exchange_response(result.mappings().one())
+
+
+async def get_contact_exchange(
+    db: AsyncSession, current: CurrentUser, exchange_id: int
+) -> MatchmakerContactExchangeResponse:
+    result = await db.execute(text("""SELECT id, service_id, source_user_id, target_user_id,
+        status, source_consented_at, target_consented_at, delivered_at, hidden_at, hidden_reason,
+        created_at, updated_at FROM matchmaker_contact_exchange
+        WHERE id = :id AND (source_user_id = :user_id OR target_user_id = :user_id)"""), {
+        "id": exchange_id, "user_id": current.id,
+    })
+    row = result.mappings().first()
+    if not row:
+        raise HTTPException(404, detail="联系方式交换不存在或无权查看")
+    return _exchange_response(row)
 
 
 async def list_service_requests(

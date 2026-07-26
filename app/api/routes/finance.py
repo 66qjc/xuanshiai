@@ -13,6 +13,8 @@ from app.schemas.finance import (
     FinanceOrderCreate,
     FinanceReportRow,
     FinanceRefundRequest,
+    ProductCommissionConfigCreate,
+    ProductCommissionConfigResponse,
     PaymentOrderResponse,
     WithdrawalCreate,
     WithdrawalResponse,
@@ -30,6 +32,7 @@ from app.services.finance import (
     mark_order_paid_and_settle,
     request_withdrawal,
     review_withdrawal,
+    create_product_commission_config,
 )
 
 router = APIRouter(prefix="/finance")
@@ -64,6 +67,14 @@ async def rule(body: CommissionRuleCreate = Body(...), admin: CurrentUser = Depe
 @admin_router.get("/commission-rules", response_model=list[CommissionRuleResponse], summary="查询分成规则")
 async def rules(admin: CurrentUser = Depends(get_current_admin), db: AsyncSession = Depends(get_db)) -> list[CommissionRuleResponse]:
     return await list_rules(db)
+
+
+@admin_router.post("/product-commission-rules/{product_id}", response_model=ProductCommissionConfigResponse, status_code=201, summary="配置商品分成对象")
+async def product_commission_rule(
+    product_id: int = Path(..., ge=1), body: ProductCommissionConfigCreate = Body(...),
+    admin: CurrentUser = Depends(get_current_admin), db: AsyncSession = Depends(get_db),
+) -> ProductCommissionConfigResponse:
+    return await create_product_commission_config(db, admin, product_id, body)
 
 
 @admin_router.get("/report", response_model=list[FinanceReportRow], summary="查询分成汇总报表")

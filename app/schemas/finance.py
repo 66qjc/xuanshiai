@@ -37,6 +37,33 @@ class CommissionRuleResponse(BaseModel):
     created_at: datetime
 
 
+class ProductCommissionConfigCreate(BaseModel):
+    beneficiary_type: Literal["service_matchmaker", "store", "promoter", "partner"]
+    mode: Literal["fixed", "rate"]
+    fixed_amount: Decimal | None = Field(default=None, ge=0, decimal_places=2)
+    rate_percent: Decimal | None = Field(default=None, ge=0, le=100, decimal_places=4)
+
+    @model_validator(mode="after")
+    def validate_mode(self) -> "ProductCommissionConfigCreate":
+        if self.mode == "fixed" and self.fixed_amount is None:
+            raise ValueError("固定金额配置必须填写 fixed_amount")
+        if self.mode == "rate" and self.rate_percent is None:
+            raise ValueError("比例配置必须填写 rate_percent")
+        return self
+
+
+class ProductCommissionConfigResponse(BaseModel):
+    id: int
+    product_id: int
+    beneficiary_type: str
+    mode: str
+    fixed_amount: Decimal | None
+    rate_percent: Decimal | None
+    version: int
+    status: Literal[1, 2]
+    created_at: datetime
+
+
 class FinanceOrderCreate(BaseModel):
     product_type: int = Field(ge=1, le=32)
     product_name: str = Field(min_length=1, max_length=128)
