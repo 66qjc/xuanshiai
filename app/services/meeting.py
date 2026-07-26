@@ -47,8 +47,8 @@ async def create_matchmaker_meeting_request(
     service = service_result.mappings().first()
     if not service:
         raise HTTPException(404, detail="服务单不存在或不属于当前红娘")
-    if service["status"] not in (1,):
-        raise HTTPException(409, detail="只有服务中的红娘服务才能发起约见")
+    if service["status"] not in (1, 2):
+        raise HTTPException(409, detail="只有服务中或服务完成的红娘服务才能发起约见")
     if request.target_user_id == service["user_id"]:
         raise HTTPException(422, detail="不能将服务用户作为约见对象")
     target = await db.execute(text("SELECT id FROM users WHERE id = :id AND status = 1"), {"id": request.target_user_id})

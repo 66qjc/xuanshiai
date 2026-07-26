@@ -21,6 +21,8 @@ from app.schemas.finance import (
     FinanceReportRow,
     FinanceRefundRequest,
     PaymentOrderResponse,
+    ProductCommissionConfigCreate,
+    ProductCommissionConfigResponse,
     WithdrawalCreate,
     WithdrawalResponse,
     WithdrawalReview,
@@ -45,6 +47,38 @@ def _withdrawal(row: Any) -> WithdrawalResponse:
 
 def _rule(row: Any) -> CommissionRuleResponse:
     return CommissionRuleResponse(**{**dict(row), "created_at": _dt(row["created_at"])})
+
+
+def _product_commission(row: Any) -> ProductCommissionConfigResponse:
+    return ProductCommissionConfigResponse(**{**dict(row), "created_at": _dt(row["created_at"])})
+
+
+async def create_product_commission_config(
+    db: AsyncSession, admin: CurrentUser, product_id: int, request: ProductCommissionConfigCreate
+) -> ProductCommissionConfigResponse:
+    product = await db.execute(text("SELECT id FROM matchmaker_service_product WHERE id = :id"), {"id": product_id})
+    if not product.scalar():
+        raise HTTPException(404, detail="红娘服务商品不存在")
+    version = int((await db.execute(text("""SELECT COALESCE(MAX(version), 0) + 1
+        FROM product_commission_config WHERE product_id = :product_id AND beneficiary_type = :kind"""), {
+            "product_id": product_id, "kind": request.beneficiary_type,
+        })).scalar() or 1)
+    await db.execute(text("""UPDATE product_commission_config SET status = 2
+        WHERE product_id = :product_id AND beneficiary_type = :kind AND status = 1"""), {
+        "product_id": product_id, "kind": request.beneficiary_type,
+    })
+    result = await db.execute(text("""INSERT INTO product_commission_config
+        (product_id, beneficiary_type, mode, fixed_amount, rate_percent, version, created_by)
+        VALUES (:product_id, :kind, :mode, :fixed_amount, :rate_percent, :version, :admin_id)"""), {
+        "product_id": product_id, "kind": request.beneficiary_type, "mode": request.mode,
+        "fixed_amount": request.fixed_amount, "rate_percent": request.rate_percent,
+        "version": version, "admin_id": admin.id,
+    })
+    await db.commit()
+    row = (await db.execute(text("""SELECT id, product_id, beneficiary_type, mode,
+        fixed_amount, rate_percent, version, status, created_at
+        FROM product_commission_config WHERE id = :id"""), {"id": result.lastrowid})).mappings().one()
+    return _product_commission(row)
 
 
 async def create_rule(db: AsyncSession, admin: CurrentUser, request: CommissionRuleCreate) -> CommissionRuleResponse:
@@ -130,9 +164,13 @@ async def mark_order_paid_and_settle(db: AsyncSession, admin: CurrentUser, order
     total = Decimal("0.00")
     entries: list[CommissionEntryResponse] = []
     for kind, beneficiary_id in beneficiaries:
-        rule_result = await db.execute(text("""SELECT id, mode, fixed_amount, rate_percent, version
-            FROM commission_rule WHERE beneficiary_type = :kind AND status = 1
-            ORDER BY priority DESC, id DESC LIMIT 1"""), {"kind": kind})
+        rule_table = "product_commission_config" if order.get("service_product_id") else "commission_rule"
+        rule_result = await db.execute(text(f"""SELECT id, mode, fixed_amount, rate_percent, version
+            FROM {rule_table} WHERE beneficiary_type = :kind AND status = 1
+            {"AND product_id = :product_id" if rule_table == "product_commission_config" else ""}
+            ORDER BY version DESC, id DESC LIMIT 1"""), {
+                "kind": kind, "product_id": order.get("service_product_id"),
+            })
         rule = rule_result.mappings().first()
         if not rule:
             continue
@@ -205,7 +243,8 @@ async def release_commission(db: AsyncSession, admin: CurrentUser, entry_id: int
 
 
 async def refund_order(db: AsyncSession, admin: CurrentUser, order_id: int, request: FinanceRefundRequest) -> None:
-    result = await db.execute(text("SELECT id, status FROM payment_order WHERE id = :id FOR UPDATE"), {"id": order_id})
+    result = await db.execute(text("""SELECT id, status, service_request_id
+        FROM payment_order WHERE id = :id FOR UPDATE"""), {"id": order_id})
     order = result.mappings().first()
     if not order:
         raise HTTPException(404, detail="支付订单不存在")
@@ -224,6 +263,27 @@ async def refund_order(db: AsyncSession, admin: CurrentUser, order_id: int, requ
             "account_type": account_type, "account_id": entry["beneficiary_id"], "amount": entry["amount"],
             "state": state, "source_id": entry["id"], "key": f"ledger:commission-refund:{entry['id']}",
         })
+    service_result = await db.execute(text("""SELECT id FROM matchmaker_service
+        WHERE order_id = :order_id FOR UPDATE"""), {"order_id": order_id})
+    for service_row in service_result.mappings().all():
+        service_id = int(service_row["id"])
+        await db.execute(text("""UPDATE matchmaker_service SET status = 3,
+            feedback = CONCAT(COALESCE(feedback, ''), '\n退款关闭：', :reason),
+            end_at = COALESCE(end_at, UTC_TIMESTAMP()), updated_at = UTC_TIMESTAMP()
+            WHERE id = :service_id AND status <> 3"""), {"service_id": service_id, "reason": request.reason})
+        await db.execute(text("""UPDATE matchmaker_contact_exchange SET status = 'HIDDEN',
+            hidden_at = UTC_TIMESTAMP(), hidden_reason = '订单退款', updated_at = UTC_TIMESTAMP()
+            WHERE service_id = :service_id AND status NOT IN ('REVOKED', 'HIDDEN')"""), {"service_id": service_id})
+        await db.execute(text("""UPDATE meeting_request SET status = 'CLOSED', updated_at = UTC_TIMESTAMP()
+            WHERE service_id = :service_id AND status IN ('SUBMITTED', 'CONTACTED', 'ACCEPTED')"""), {"service_id": service_id})
+        await db.execute(text("""UPDATE meeting_record mr JOIN meeting_request rq ON rq.id = mr.request_id
+            SET mr.status = 'CANCELLED', mr.cancel_reason = '关联红娘服务已退款', mr.updated_at = UTC_TIMESTAMP()
+            WHERE rq.service_id = :service_id AND mr.status IN ('SCHEDULED', 'REMINDED')"""), {"service_id": service_id})
+        await db.execute(text("""INSERT INTO business_audit_log
+            (actor_user_id, action, resource_type, resource_id, reason)
+            VALUES (:admin_id, 'matchmaker_service.refund_close', 'matchmaker_service', :service_id, :reason)"""), {
+            "admin_id": admin.id, "service_id": service_id, "reason": request.reason,
+        })
     await db.execute(text("UPDATE payment_order SET status = 3, refund_time = UTC_TIMESTAMP() WHERE id = :id"), {"id": order_id})
     await db.commit()
 
@@ -238,6 +298,9 @@ async def get_balance(db: AsyncSession, account_type: str, account_id: int) -> A
 
 
 async def request_withdrawal(db: AsyncSession, current: CurrentUser, request: WithdrawalCreate) -> WithdrawalResponse:
+    # Serialize balance checks with other withdrawals for the same account.
+    await db.execute(text("""SELECT id FROM account_ledger
+        WHERE account_type = 'user' AND account_id = :user_id FOR UPDATE"""), {"user_id": current.id})
     balance = await get_balance(db, "user", current.id)
     if Decimal(str(balance.available_amount)) < request.amount:
         raise HTTPException(409, detail="可提现余额不足")
@@ -263,7 +326,12 @@ async def review_withdrawal(db: AsyncSession, admin: CurrentUser, withdrawal_id:
     row = result.mappings().first()
     if not row:
         raise HTTPException(404, detail="提现申请不存在")
-    if row["status"] in ("SUCCEEDED", "REJECTED"):
+    allowed = {
+        "PENDING_REVIEW": {"APPROVED", "REJECTED"},
+        "APPROVED": {"PROCESSING", "FAILED", "REJECTED"},
+        "PROCESSING": {"SUCCEEDED", "FAILED"},
+    }
+    if request.status not in allowed.get(row["status"], set()):
         raise HTTPException(409, detail="提现申请已经结束")
     if request.status in ("REJECTED", "FAILED"):
         await db.execute(text("""INSERT INTO account_ledger
