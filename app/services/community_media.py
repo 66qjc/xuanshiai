@@ -288,6 +288,87 @@ async def delete_community_media(db: AsyncSession, user_id: int, media_id: int) 
             pass
 
 
+FORBIDDEN_URL_PREFIXES = (
+    "wxfile://",
+    "file://",
+    "temp://",
+    "http://",
+    "https://",
+)
+ALLOWED_STORAGE_PREFIX = "/storage/uploads/"
+
+
+def _is_forbidden_media_url(url: str) -> bool:
+    value = (url or "").strip()
+    if not value:
+        return True
+    lowered = value.casefold()
+    if any(lowered.startswith(prefix) for prefix in FORBIDDEN_URL_PREFIXES):
+        return True
+    # Windows absolute paths: C:\... or C:/...
+    if len(value) >= 2 and value[1] == ":" and value[0].isalpha():
+        return True
+    # UNC / absolute disk-ish paths without controlled storage prefix
+    if value.startswith("\\\\") or value.startswith("//"):
+        return True
+    if value.startswith("/") and not value.startswith(ALLOWED_STORAGE_PREFIX):
+        return True
+    if not value.startswith(ALLOWED_STORAGE_PREFIX):
+        return True
+    return False
+
+
+async def assert_owned_media_urls(
+    db: AsyncSession,
+    user_id: int,
+    urls: list[str] | None,
+    *,
+    purpose: str,
+    media_type: str | None = None,
+) -> list[dict[str, Any]]:
+    """Validate legacy media URLs are owned community_media rows for purpose.
+
+    Returns matching media rows (ready or bound) in input order. Ready rows
+    should be bound by the caller after the target insert.
+    """
+    ordered_urls = [str(u).strip() for u in (urls or []) if str(u).strip()]
+    if not ordered_urls:
+        return []
+
+    rows_out: list[dict[str, Any]] = []
+    for url in ordered_urls:
+        if _is_forbidden_media_url(url):
+            raise HTTPException(422, detail="仅允许使用已上传的社区媒体地址")
+        params: dict[str, Any] = {
+            "user_id": user_id,
+            "purpose": purpose,
+            "url": url,
+        }
+        type_clause = ""
+        if media_type is not None:
+            type_clause = " AND media_type = :media_type"
+            params["media_type"] = media_type
+        result = await db.execute(
+            text(
+                f"""SELECT *
+                FROM community_media
+                WHERE file_url = :url
+                  AND user_id = :user_id
+                  AND purpose = :purpose
+                  AND deleted_at IS NULL
+                  AND status IN ('ready', 'bound')
+                  {type_clause}
+                LIMIT 1"""
+            ),
+            params,
+        )
+        row = result.mappings().first()
+        if not row:
+            raise HTTPException(422, detail="仅允许使用已上传的社区媒体地址")
+        rows_out.append(dict(row))
+    return rows_out
+
+
 async def resolve_owned_ready_media(
     db: AsyncSession,
     user_id: int,

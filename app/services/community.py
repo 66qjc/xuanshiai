@@ -37,6 +37,11 @@ from app.schemas.community import (
     PaperPlaneReplyResponse,
     PaperPlaneResponse,
 )
+from app.services.community_media import (
+    assert_owned_media_urls,
+    bind_media,
+    resolve_owned_ready_media,
+)
 from app.services.profile import _calculate_age, _json_list
 
 logger = logging.getLogger(__name__)
@@ -155,6 +160,62 @@ async def create_post(
     *,
     commit: bool = True,
 ) -> CommunityPostResponse:
+    from app.services.content_filter import assert_text_allowed
+
+    content = (request.content or "").strip()
+    if content:
+        await assert_text_allowed(db, content, field="动态内容")
+
+    image_urls: list[str] = []
+    video_url: str | None = None
+    bind_ids: list[int] = []
+
+    if request.image_media_ids:
+        rows = await resolve_owned_ready_media(
+            db,
+            user_id,
+            list(request.image_media_ids),
+            purpose="post",
+            media_type="image",
+        )
+        image_urls = [str(r["file_url"]) for r in rows]
+        bind_ids = [int(r["id"]) for r in rows]
+    elif request.video_media_id is not None:
+        rows = await resolve_owned_ready_media(
+            db,
+            user_id,
+            [int(request.video_media_id)],
+            purpose="post",
+            media_type="video",
+        )
+        video_url = str(rows[0]["file_url"])
+        bind_ids = [int(rows[0]["id"])]
+    else:
+        # Legacy transition: only controlled owned community_media URLs
+        if request.images:
+            image_rows = await assert_owned_media_urls(
+                db,
+                user_id,
+                list(request.images),
+                purpose="post",
+                media_type="image",
+            )
+            image_urls = [str(r["file_url"]) for r in image_rows]
+            bind_ids.extend(
+                int(r["id"]) for r in image_rows if str(r.get("status") or "") == "ready"
+            )
+        if request.video:
+            video_rows = await assert_owned_media_urls(
+                db,
+                user_id,
+                [request.video],
+                purpose="post",
+                media_type="video",
+            )
+            video_url = str(video_rows[0]["file_url"])
+            if str(video_rows[0].get("status") or "") == "ready":
+                bind_ids.append(int(video_rows[0]["id"]))
+
     if request.topic_id is not None:
         topic = await db.execute(
             text("SELECT id FROM community_topic WHERE id = :topic_id AND is_active = 1"),
@@ -171,17 +232,25 @@ async def create_post(
         {
             "user_id": user_id,
             "topic_id": request.topic_id,
-            "content": request.content,
-            "images": json.dumps(request.images, ensure_ascii=False),
-            "video": request.video,
+            "content": content,
+            "images": json.dumps(image_urls, ensure_ascii=False),
+            "video": video_url,
             "location": request.location,
             "visibility": request.visibility,
             "declaration": request.declaration,
         },
     )
+    post_id = int(result.lastrowid)
+    if bind_ids:
+        await bind_media(
+            db,
+            media_ids=bind_ids,
+            target_type="post",
+            target_id=post_id,
+        )
     if commit:
         await db.commit()
-    return await get_post(db, user_id, int(result.lastrowid))
+    return await get_post(db, user_id, post_id)
 
 
 async def get_post(db: AsyncSession, user_id: int, post_id: int) -> CommunityPostResponse:
@@ -461,11 +530,35 @@ async def list_posts(
 
 async def delete_post(db: AsyncSession, user_id: int, post_id: int) -> None:
     result = await db.execute(
-        text("UPDATE community_post SET status = 3, updated_at = UTC_TIMESTAMP() WHERE id = :post_id AND user_id = :user_id AND status = 1"),
+        text(
+            "UPDATE community_post SET status = 3, updated_at = UTC_TIMESTAMP() "
+            "WHERE id = :post_id AND user_id = :user_id AND status = 1"
+        ),
         {"post_id": post_id, "user_id": user_id},
     )
     if not result.rowcount:
         raise HTTPException(404, detail="动态不存在或无权删除")
+    # Soft-lifecycle attached media: mark deleted for cleanup without clearing post URL fields
+    attached = await db.execute(
+        text(
+            """SELECT media_id FROM community_media_attachment
+            WHERE target_type = 'post' AND target_id = :post_id"""
+        ),
+        {"post_id": post_id},
+    )
+    media_ids = [int(row["media_id"]) for row in attached.mappings().all()]
+    if media_ids:
+        placeholders = ", ".join(f":id{i}" for i in range(len(media_ids)))
+        params = {f"id{i}": mid for i, mid in enumerate(media_ids)}
+        await db.execute(
+            text(
+                f"""UPDATE community_media
+                SET status = 'deleted', deleted_at = UTC_TIMESTAMP()
+                WHERE id IN ({placeholders})
+                  AND deleted_at IS NULL"""
+            ),
+            params,
+        )
     await db.commit()
 
 
@@ -1125,6 +1218,36 @@ async def create_paper_plane(
     quota_key: str | None = None,
 ) -> PaperPlaneResponse:
     from app.core.redis import daily_quota_key
+    from app.services.content_filter import assert_text_allowed
+
+    content = (request.content or "").strip()
+    if content:
+        await assert_text_allowed(db, content, field="纸飞机内容")
+
+    image_urls: list[str] = []
+    bind_ids: list[int] = []
+    if request.image_media_ids:
+        rows = await resolve_owned_ready_media(
+            db,
+            user_id,
+            list(request.image_media_ids),
+            purpose="paper_plane",
+            media_type="image",
+        )
+        image_urls = [str(r["file_url"]) for r in rows]
+        bind_ids = [int(r["id"]) for r in rows]
+    elif request.images:
+        image_rows = await assert_owned_media_urls(
+            db,
+            user_id,
+            list(request.images),
+            purpose="paper_plane",
+            media_type="image",
+        )
+        image_urls = [str(r["file_url"]) for r in image_rows]
+        bind_ids = [
+            int(r["id"]) for r in image_rows if str(r.get("status") or "") == "ready"
+        ]
 
     key = quota_key or daily_quota_key("paper-plane", user_id)
     if not await consume_daily(key, 3):
@@ -1138,14 +1261,22 @@ async def create_paper_plane(
             ),
             {
                 "user_id": user_id,
-                "content": request.content,
-                "images": json.dumps(request.images, ensure_ascii=False),
+                "content": content,
+                "images": json.dumps(image_urls, ensure_ascii=False),
                 "city": request.city,
                 "tags": json.dumps(request.tags, ensure_ascii=False),
                 "is_anonymous": int(request.is_anonymous),
                 "expire_at": datetime.now(UTC).replace(tzinfo=None) + timedelta(hours=24),
             },
         )
+        plane_id = int(result.lastrowid)
+        if bind_ids:
+            await bind_media(
+                db,
+                media_ids=bind_ids,
+                target_type="paper_plane",
+                target_id=plane_id,
+            )
         if commit:
             await db.commit()
             committed = True
@@ -1154,7 +1285,7 @@ async def create_paper_plane(
                 """SELECT id, content, images, city, tags, is_anonymous,
                 reply_count, created_at FROM paper_plane WHERE id = :id"""
             ),
-            {"id": result.lastrowid},
+            {"id": plane_id},
         )
         return await _paper_response(dict(created.mappings().one()))
     except Exception:
