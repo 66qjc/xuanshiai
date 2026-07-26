@@ -425,6 +425,46 @@ async def test_assert_owned_media_urls_rejects_unowned_url() -> None:
     assert exc.value.status_code == 422
 
 
+def _patch_content_filter(monkeypatch) -> AsyncMock:
+    """Ensure content_filter imports and stub assert_text_allowed without swallowing ImportError."""
+    from app.services import content_filter as content_filter_mod
+
+    stub = AsyncMock()
+    monkeypatch.setattr(content_filter_mod, "assert_text_allowed", stub)
+    return stub
+
+
+@pytest.mark.asyncio
+async def test_create_post_with_content_imports_content_filter(monkeypatch) -> None:
+    """Non-empty content must import content_filter without ModuleNotFoundError."""
+    from app.schemas.community import CommunityPostCreate
+    from app.services import community as community_svc
+    from app.services import content_filter as content_filter_mod
+
+    assert hasattr(content_filter_mod, "assert_text_allowed")
+    filter_stub = _patch_content_filter(monkeypatch)
+
+    insert_result = SimpleNamespace(lastrowid=12)
+    db = AsyncMock()
+    db.execute = AsyncMock(return_value=insert_result)
+    db.commit = AsyncMock()
+
+    async def fake_get_post(db, user_id, post_id):
+        return SimpleNamespace(id=post_id, user_id=user_id, images=[], video=None, content="hello")
+
+    monkeypatch.setattr(community_svc, "get_post", fake_get_post)
+
+    post = await community_svc.create_post(
+        db,
+        user_id=1,
+        request=CommunityPostCreate(content="hello"),
+        commit=True,
+    )
+    assert post.id == 12
+    filter_stub.assert_awaited()
+    assert filter_stub.await_args.args[1] == "hello"
+
+
 @pytest.mark.asyncio
 async def test_create_post_binds_image_media_ids(monkeypatch) -> None:
     from app.schemas.community import CommunityPostCreate
@@ -466,9 +506,6 @@ async def test_create_post_binds_image_media_ids(monkeypatch) -> None:
             content="",
         )
 
-    async def no_filter(*_a, **_k):
-        return None
-
     insert_result = SimpleNamespace(lastrowid=100)
     db = AsyncMock()
     db.execute = AsyncMock(return_value=insert_result)
@@ -479,12 +516,7 @@ async def test_create_post_binds_image_media_ids(monkeypatch) -> None:
     monkeypatch.setattr(community_svc, "resolve_owned_ready_media", fake_resolve)
     monkeypatch.setattr(community_svc, "bind_media", fake_bind)
     monkeypatch.setattr(community_svc, "get_post", fake_get_post)
-    try:
-        from app.services import content_filter
-
-        monkeypatch.setattr(content_filter, "assert_text_allowed", no_filter)
-    except Exception:
-        pass
+    _patch_content_filter(monkeypatch)
 
     request = CommunityPostCreate(content="", image_media_ids=[5, 6])
     post = await community_svc.create_post(db, user_id=7, request=request, commit=True)
@@ -503,6 +535,67 @@ async def test_create_post_binds_image_media_ids(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_create_post_binds_video_media_id(monkeypatch) -> None:
+    from app.schemas.community import CommunityPostCreate
+    from app.services import community as community_svc
+    from app.services import community_media as media_svc
+
+    resolve_mock = AsyncMock(
+        return_value=[
+            {
+                "id": 88,
+                "file_url": "/storage/uploads/3/community/v.mp4",
+                "status": "ready",
+                "media_type": "video",
+            }
+        ]
+    )
+    bind_mock = AsyncMock()
+
+    async def fake_get_post(db, user_id, post_id):
+        return SimpleNamespace(
+            id=post_id,
+            user_id=user_id,
+            images=[],
+            video="/storage/uploads/3/community/v.mp4",
+            content="clip",
+        )
+
+    insert_result = SimpleNamespace(lastrowid=200)
+    db = AsyncMock()
+    db.execute = AsyncMock(return_value=insert_result)
+    db.commit = AsyncMock()
+
+    monkeypatch.setattr(media_svc, "resolve_owned_ready_media", resolve_mock)
+    monkeypatch.setattr(media_svc, "bind_media", bind_mock)
+    monkeypatch.setattr(community_svc, "resolve_owned_ready_media", resolve_mock)
+    monkeypatch.setattr(community_svc, "bind_media", bind_mock)
+    monkeypatch.setattr(community_svc, "get_post", fake_get_post)
+    _patch_content_filter(monkeypatch)
+
+    post = await community_svc.create_post(
+        db,
+        user_id=3,
+        request=CommunityPostCreate(content="clip", video_media_id=88),
+        commit=True,
+    )
+    assert post.id == 200
+    resolve_mock.assert_awaited()
+    resolve_kwargs = resolve_mock.await_args
+    assert resolve_kwargs.kwargs["purpose"] == "post"
+    assert resolve_kwargs.kwargs["media_type"] == "video"
+    assert list(resolve_kwargs.args[2]) == [88]
+    bind_mock.assert_awaited_once()
+    bind_kwargs = bind_mock.await_args.kwargs
+    assert bind_kwargs["media_ids"] == [88]
+    assert bind_kwargs["target_type"] == "post"
+    assert bind_kwargs["target_id"] == 200
+    insert_params = db.execute.await_args_list[0].args[1]
+    assert insert_params["video"] == "/storage/uploads/3/community/v.mp4"
+    assert json.loads(insert_params["images"]) == []
+
+
+@pytest.mark.asyncio
 async def test_create_post_rejects_foreign_media_id(monkeypatch) -> None:
     from app.schemas.community import CommunityPostCreate
     from app.services import community as community_svc
@@ -511,15 +604,7 @@ async def test_create_post_rejects_foreign_media_id(monkeypatch) -> None:
         raise HTTPException(422, detail="媒体不可用: 99")
 
     monkeypatch.setattr(community_svc, "resolve_owned_ready_media", fake_resolve)
-    try:
-        from app.services import content_filter
-
-        async def no_filter(*_a, **_k):
-            return None
-
-        monkeypatch.setattr(content_filter, "assert_text_allowed", no_filter)
-    except Exception:
-        pass
+    _patch_content_filter(monkeypatch)
 
     db = AsyncMock()
     with pytest.raises(HTTPException) as exc:
@@ -541,15 +626,7 @@ async def test_create_post_rejects_legacy_external_image_url(monkeypatch) -> Non
         raise AssertionError("should not resolve media ids")
 
     monkeypatch.setattr(community_svc, "resolve_owned_ready_media", boom)
-    try:
-        from app.services import content_filter
-
-        async def no_filter(*_a, **_k):
-            return None
-
-        monkeypatch.setattr(content_filter, "assert_text_allowed", no_filter)
-    except Exception:
-        pass
+    _patch_content_filter(monkeypatch)
 
     db = AsyncMock()
     with pytest.raises(HTTPException) as exc:
@@ -592,15 +669,7 @@ async def test_create_post_legacy_ready_url_binds(monkeypatch) -> None:
     monkeypatch.setattr(media_svc, "bind_media", fake_bind)
     monkeypatch.setattr(community_svc, "bind_media", fake_bind)
     monkeypatch.setattr(community_svc, "get_post", fake_get_post)
-    try:
-        from app.services import content_filter
-
-        async def no_filter(*_a, **_k):
-            return None
-
-        monkeypatch.setattr(content_filter, "assert_text_allowed", no_filter)
-    except Exception:
-        pass
+    _patch_content_filter(monkeypatch)
 
     await community_svc.create_post(
         db,
@@ -657,15 +726,7 @@ async def test_create_paper_plane_binds_image_media_ids(monkeypatch) -> None:
     monkeypatch.setattr(community_svc, "resolve_owned_ready_media", fake_resolve)
     monkeypatch.setattr(community_svc, "bind_media", fake_bind)
     monkeypatch.setattr(community_svc, "consume_daily", consume)
-    try:
-        from app.services import content_filter
-
-        async def no_filter(*_a, **_k):
-            return None
-
-        monkeypatch.setattr(content_filter, "assert_text_allowed", no_filter)
-    except Exception:
-        pass
+    _patch_content_filter(monkeypatch)
 
     resp = await community_svc.create_paper_plane(
         db,
