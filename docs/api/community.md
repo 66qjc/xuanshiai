@@ -15,9 +15,9 @@ Content-Type: application/json
 {"detail":"错误原因"}
 ```
 
-当前实现复用 FastAPI、Pydantic、SQLAlchemy AsyncSession 和 Redis 日额度工具。动态/纸飞机的图片地址必须由前端先获得，但本组接口当前只校验地址字符串长度和数组数量，不负责文件上传、图片内容识别或敏感词审核。
+当前实现复用 FastAPI、Pydantic、SQLAlchemy AsyncSession 和 Redis 日额度工具。社区图文/短视频请先调用 `POST /api/v1/community/media/uploads` 拿到 `media_id`，发布时传 `image_media_ids` / `video_media_id`（或过渡期的已上传 storage URL）。本组接口不负责图片内容识别；文本敏感词 MVP 已接入写路径。
 
-以下社区写操作还要求 `realname_status == 2`：发布/删除动态、动态点赞或取消点赞、收藏或取消收藏、发表/删除评论、参与话题、活动报名、发送或回复纸飞机。未通过实名时返回 `403`：
+以下社区写操作还要求 `realname_status == 2`：发布/删除动态、动态点赞或取消点赞、收藏或取消收藏、发表/删除评论、参与话题、活动报名、发送或回复纸飞机、社区媒体上传/删除。未通过实名时返回 `403`：
 
 ```json
 {"detail":"璇峰厛瀹屾垚瀹炲悕璁よ瘉"}
@@ -71,20 +71,42 @@ Idempotency-Key: post-20260725-0001
 
 | 字段 | 位置 | 类型 | 必填 | 默认值 | 规则 | 含义 |
 | --- | --- | --- | --- | --- | --- | --- |
-| `content` | body | string | 是 | 无 | 1~2000 字符 | 动态正文 |
-| `images` | body | array[string] | 否 | `[]` | 最多 9 个地址 | 动态图片地址 |
-| `video` | body | string/null | 否 | `null` | 最长 500 字符 | 动态视频地址 |
+| `content` | body | string | 条件 | `""` | 最长 2000；与媒体至少一个非空 | 动态正文；允许仅媒体无正文（media-only） |
+| `image_media_ids` | body | array[integer] | 否 | `[]` | 最多 9 个；元素 `>=1`；与 `video_media_id` / 视频互斥 | 优先：先上传得到的社区图片媒体 ID |
+| `video_media_id` | body | integer/null | 否 | `null` | `>=1`；与图片字段互斥 | 优先：先上传得到的社区视频媒体 ID |
+| `images` | body | array[string] | 否 | `[]` | 最多 9 个；过渡期 URL | 兼容旧客户端：须为本人已上传且 `status=ready` 的 `/storage/uploads/{user_id}/community/...`；禁止外链/本地临时路径 |
+| `video` | body | string/null | 否 | `null` | 最长 500；过渡期 URL | 兼容旧客户端：规则同 `images` |
 | `location` | body | string/null | 否 | `null` | 最长 128 字符 | 展示位置文本 |
 | `topic_id` | body | integer/null | 否 | `null` | 非空时 `>=1` | 话题 ID；可通过 `GET /api/v1/community/topics`、`GET /api/v1/community/topics/page` 查询，并用 `GET /api/v1/community/topics/{topic_id}` 或 `GET /api/v1/community/topics/{topic_id}/detail` 查看详情 |
 | `visibility` | body | integer | 否 | `0` | `0` / `1` / `2` | `0` 公开，`1` 仅双向匹配用户可见，`2` 仅作者本人可见 |
 | `declaration` | body | string | 否 | `""` | `""` / `"内容包含虚构演绎"` / `"内容包含广告推广"` / `"内容可能引起不适"` | 作者选择的内容声明 |
 
-请求示例：
+规则补充：
+
+- `content`、图片（`image_media_ids` 或 `images`）、视频（`video_media_id` 或 `video`）三者不可同时为空。
+- 图片与视频不可混用（含 id 与 URL 混用）。
+- 发布成功后服务端把对应 `community_media` 从 `ready` 绑为 `bound`，响应里的 `images`/`video` 仍是可展示的 storage URL。
+
+推荐请求示例（media id）：
+
+```json
+{
+  "content":"",
+  "image_media_ids":[101,102],
+  "video_media_id":null,
+  "location":"上海",
+  "topic_id":null,
+  "visibility":1,
+  "declaration":""
+}
+```
+
+过渡期 URL 示例：
 
 ```json
 {
   "content":"今天去看了一个展览",
-  "images":["/storage/uploads/1/photo.webp"],
+  "images":["/storage/uploads/1/community/a.webp"],
   "video":null,
   "location":"上海",
   "topic_id":null,
@@ -96,7 +118,11 @@ Idempotency-Key: post-20260725-0001
 非法示例：
 
 ```json
-{"content":"","images":[]}
+{"content":"","images":[],"image_media_ids":[]}
+```
+
+```json
+{"content":"x","image_media_ids":[1],"video_media_id":2}
 ```
 
 成功返回 `CommunityPostResponse`：
@@ -260,17 +286,21 @@ Authorization: Bearer <access_token>
 
 | 字段 | 位置 | 类型 | 必填 | 默认值 | 规则 | 含义 |
 | --- | --- | --- | --- | --- | --- | --- |
-| `content` | body | string | 是 | 无 | 1~1000 字符 | 纸飞机正文 |
-| `images` | body | array[string] | 否 | `[]` | 最多 6 个地址 | 附图地址 |
+| `content` | body | string | 条件 | `""` | 最长 1000；与媒体至少一个非空 | 纸飞机正文；允许仅图片无正文 |
+| `image_media_ids` | body | array[integer] | 否 | `[]` | 最多 6 个；元素 `>=1` | 优先：社区媒体上传得到的图片 ID（`purpose=paper_plane`） |
+| `images` | body | array[string] | 否 | `[]` | 最多 6 个；过渡期 URL | 兼容旧客户端：须为本人已上传 ready 的 community storage URL |
 | `city` | body | string/null | 否 | `null` | 最长 64 字符 | 展示城市 |
 | `tags` | body | array[string] | 否 | `[]` | 最多 5 个标签 | 纸飞机标签 |
 | `is_anonymous` | body | boolean | 否 | `true` | 布尔值 | 是否匿名展示 |
+
+说明：纸飞机**不支持视频**（无 `video` / `video_media_id` 字段）；上传时 `purpose=paper_plane` 且文件为视频会返回 `422`。
 
 请求示例：
 
 ```json
 {
   "content":"想认识同样喜欢旅行的人",
+  "image_media_ids":[9],
   "images":[],
   "city":"杭州",
   "tags":["旅行","交友"],
@@ -633,6 +663,128 @@ PUT 请求体：
 
 实际提交举报请使用社交接口 `POST /api/v1/security/reports/{target_id}`。
 
+## 11. 社区媒体上传
+
+社区动态与纸飞机的图文/短视频统一走本节接口（与通用语音上传 `POST /api/v1/media/uploads` 不同）。推荐流程：先上传拿 `media_id` → 再在发布接口传入 id → 服务端绑定。
+
+### 11.1 上传媒体
+
+#### `POST /api/v1/community/media/uploads`
+
+- Content-Type：`multipart/form-data`（不要用 `application/json`）
+- 权限：已登录、绑定手机号且 `realname_status == 2`（`get_realname_verified_user`）
+- 成功状态：`201 Created`
+
+请求字段：
+
+| 字段 | 位置 | 类型 | 必填 | 默认值 | 规则 | 含义 |
+| --- | --- | --- | --- | --- | --- | --- |
+| `file` | form | file | 是 | 无 | 见下方类型与大小 | 媒体文件本体 |
+| `purpose` | form | string | 是 | 无 | `post` 或 `paper_plane` | 用途；发布时 resolve 必须与用途一致 |
+
+类型与限制：
+
+| 类型 | 判定 | 大小上限 | 其他 |
+| --- | --- | --- | --- |
+| 图片 | 非视频路径；真实解码 JPEG/PNG/WEBP | 5MB；像素 ≤ 2500 万 | 服务端转存 WebP + 缩略图 |
+| 视频 | `Content-Type` 以 `video/` 开头或文件名以 `.mp4` 结尾 | 50MB | 仅 MP4；时长 1~30 秒；依赖本机 `ffprobe` |
+
+成功响应 `CommunityMediaResponse`：
+
+| 字段 | 类型 | 必返 | 空值含义 | 含义 |
+| --- | --- | --- | --- | --- |
+| `id` | integer | 是 | 不为空 | 媒体 ID（发布时使用） |
+| `purpose` | string | 是 | 不为空 | `post` / `paper_plane` |
+| `media_type` | string | 是 | 不为空 | `image` / `video` |
+| `url` | string | 是 | 不为空 | 可访问 storage 路径 |
+| `thumbnail_url` | string/null | 是 | 视频为 `null` | 缩略图路径 |
+| `file_size` | integer/null | 是 | 可能为 0 | 字节数 |
+| `duration_seconds` | integer/null | 是 | 图片为 `null` | 视频时长（秒，向上取整） |
+| `status` | string | 是 | 不为空 | 初始恒为 `ready` |
+
+请求示例（multipart 概念）：
+
+```http
+POST /api/v1/community/media/uploads HTTP/1.1
+Authorization: Bearer <access_token>
+Content-Type: multipart/form-data; boundary=----bound
+
+------bound
+Content-Disposition: form-data; name="purpose"
+
+post
+------bound
+Content-Disposition: form-data; name="file"; filename="a.jpg"
+Content-Type: image/jpeg
+
+<binary>
+------bound--
+```
+
+成功响应示例：
+
+```json
+{
+  "id": 42,
+  "purpose": "post",
+  "media_type": "image",
+  "url": "/storage/uploads/7/community/a.webp",
+  "thumbnail_url": "/storage/uploads/7/community/a-thumb.webp",
+  "file_size": 1280,
+  "duration_seconds": null,
+  "status": "ready"
+}
+```
+
+错误码：
+
+| 状态 | 场景 | 示例 `detail` | 客户端建议 |
+| --- | --- | --- | --- |
+| `401` | 未登录 / token 无效 | （鉴权中间件） | 重新登录 |
+| `403` | 未实名通过 | 请先完成实名认证 | 引导实名 |
+| `413` | 图片/视频过大或像素超限 | `文件大小不能超过5MB` / `视频大小不能超过50MB` | 压缩后重试 |
+| `415` | 伪造成像/非支持格式/非 MP4 视频 | `图片内容无法识别` / `仅支持MP4视频` | 换真实 JPG/PNG/WEBP 或 MP4 |
+| `422` | 空文件、非法 purpose、纸飞机传视频、时长超限等 | `purpose 仅支持 post 或 paper_plane` / `纸飞机不支持视频` / `视频时长不能超过30秒` | 修正参数 |
+| `503` | 视频路径但本机无 `ffprobe` | `视频处理服务未配置，请安装ffprobe` | 运维安装 ffprobe |
+
+### 11.2 删除未绑定媒体
+
+#### `DELETE /api/v1/community/media/{media_id}`
+
+- 权限：已登录 + 实名；仅所有者
+- 成功：`204 No Content`（无响应体）
+- `404`：媒体不存在或不属于当前用户 / 已删除
+- `409`：`status=bound` 已绑定动态或纸飞机，不可删（`媒体已绑定内容，无法删除`）
+
+路径参数：
+
+| 参数 | 位置 | 类型 | 必填 | 规则 | 含义 |
+| --- | --- | --- | --- | --- | --- |
+| `media_id` | path | integer | 是 | `>=1` | 媒体 ID |
+
+### 11.3 生命周期与清理
+
+| `status` | 含义 |
+| --- | --- |
+| `ready` | 已上传、未绑定；可删除；可在发布时绑定 |
+| `bound` | 已绑定到动态或纸飞机；不可主动删除 |
+| `deleted` | 软删除（用户删除或过期清理） |
+
+流程：
+
+1. 上传成功 → `ready`，写入 `expire_at = now + 24h`（`UNBOUND_TTL_HOURS=24`）。
+2. `POST /community/posts` 或 `POST /paper-planes` 使用对应 id（或过渡 URL）成功 → `ready` → `bound`，并写入 `community_media_attachment`。
+3. 未绑定且超过 `expire_at` 的 `ready` 记录，由服务端函数 `cleanup_expired_unbound_media(db, limit=100)` 批量标为 `deleted` 并尽量删除磁盘文件。
+4. 清理入口：当前为**可手动/定时调用的服务函数**（非对外 HTTP 接口）；运维或后台任务按需调用即可。删除动态时，已绑定媒体会随帖一并标为 `deleted`。
+
+### 11.4 与发布接口的关系（变更摘要）
+
+- 动态：新增 `image_media_ids`、`video_media_id`；`content` 允许 media-only（空字符串 + 媒体）。
+- 纸飞机：新增 `image_media_ids`（最多 6）；无视频字段。
+- 旧 `images` / `video`（动态）与纸飞机 `images`：过渡期仍接受，但必须是本人 `community_media` 的 ready storage URL；外链、`wxfile://`、本地盘符等一律 `422`。
+- 响应模型仍返回 URL 列表（`images`/`video`），前端展示不必改；新客户端应以上传 id 为准。
+
+
 ## 10. 与社交 / 发现模块的协作
 
 社区前端还需对接已有社交与发现接口（不在本文件重复定义完整契约，见 `docs/api/social.md`、`docs/api/discovery.md`）：
@@ -750,7 +902,15 @@ Legacy clients may continue sending all three fields without a breaking change:
 The stored name and phone are nevertheless taken from the canonical account
 records, not these request values.
 
-当前未提供：动态/纸飞机媒体上传接口、媒体内容审核、敏感词审核、评论点赞接口、纸飞机语音、纸飞机回复自动转私信、独立话题参与表、后台社区审核列表。`join_topic` 仅做存在性校验与幂等成功，不以独立表记录参与。
+当前未提供：媒体内容流式审核、敏感词三态（替换*/进审）与词库管理 CRUD、评论点赞接口、纸飞机语音、纸飞机回复自动转私信、独立话题参与表。`join_topic` 仅做存在性校验与幂等成功，不以独立表记录参与。
+
+### 2026-07-26（社区媒体上传与发布绑定）
+
+- 新增 `POST /api/v1/community/media/uploads`（multipart：`file` + `purpose`）与 `DELETE /api/v1/community/media/{media_id}`。
+- 新增表 `community_media` / `community_media_attachment`；状态机 `ready` → `bound` / `deleted`。
+- `POST /api/v1/community/posts` 增加 `image_media_ids`、`video_media_id`；允许 media-only；旧 `images`/`video` 过渡为本人 storage URL。
+- `POST /api/v1/paper-planes` 增加 `image_media_ids`；不支持视频。
+- 未绑定媒体 24h 过期，由 `cleanup_expired_unbound_media` 清理。
 
 ### 2026-07-25（实名权限与评论可见性）
 

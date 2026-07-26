@@ -468,6 +468,7 @@ def test_primary_community_and_social_docs_match_current_contracts() -> None:
         "#### `GET /api/v1/community/topics/{topic_id}/detail`", 1
     )[1].split("### 7.4", 1)[0]
     primary_quotas = community_primary.split("### 9.2", 1)[1].split("### 9.3", 1)[0]
+    primary_media = community_primary.split("## 11.", 1)[1]
 
     assert "当前未提供话题查询接口" not in community_primary
     assert "`latest` / `following` / `city` / `liked_users` / `following_and_liked`" in primary_feed
@@ -475,6 +476,15 @@ def test_primary_community_and_social_docs_match_current_contracts() -> None:
     assert '"posts":[]' not in primary_topic_detail
     assert '"points_available":false' in primary_quotas
     assert '"points_available":true' not in primary_quotas
+
+    # Community media upload contracts (Task 4)
+    assert "POST /api/v1/community/media/uploads" in primary_media
+    assert "DELETE /api/v1/community/media/{media_id}" in primary_media
+    assert "image_media_ids" in community_primary
+    assert "video_media_id" in community_primary
+    assert "cleanup_expired_unbound_media" in primary_media
+    assert "`ready`" in primary_media and "`bound`" in primary_media
+    assert "multipart/form-data" in primary_media
 
     social_docs = Path("docs/api/social.md").read_text(encoding="utf-8")
     likes = social_docs.split("### 2.1", 1)[1].split("### 2.2", 1)[0]

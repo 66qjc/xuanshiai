@@ -109,13 +109,43 @@ def test_image_outputs_rejects_non_image() -> None:
     assert exc.value.status_code == 415
 
 
+def _media_db_for_image_insert(*, media_id: int = 42, purpose: str = "post") -> AsyncMock:
+    insert_result = SimpleNamespace(lastrowid=media_id)
+    select_mappings = MagicMock()
+    select_mappings.one.return_value = {
+        "id": media_id,
+        "purpose": purpose,
+        "media_type": "image",
+        "file_url": f"/storage/uploads/7/community/{media_id}.webp",
+        "thumbnail_url": f"/storage/uploads/7/community/{media_id}-thumb.webp",
+        "file_size": 100,
+        "duration_seconds": None,
+        "status": "ready",
+    }
+    select_result = MagicMock()
+    select_result.mappings.return_value = select_mappings
+    db = AsyncMock()
+    db.execute = AsyncMock(side_effect=[insert_result, select_result])
+    db.commit = AsyncMock()
+    return db
+
+
+def _prepare_upload_root(monkeypatch, media_svc) -> Path:
+    import shutil
+
+    upload_root = ROOT / ".pytest_media_upload"
+    if upload_root.exists():
+        shutil.rmtree(upload_root, ignore_errors=True)
+    upload_root.mkdir(exist_ok=True)
+    monkeypatch.setattr(media_svc.settings, "upload_dir", str(upload_root))
+    return upload_root
+
+
 @pytest.mark.asyncio
 async def test_upload_paper_plane_rejects_video_like_file(monkeypatch) -> None:
     from app.services import community_media as media_svc
 
-    upload_root = ROOT / ".pytest_media_upload"
-    upload_root.mkdir(exist_ok=True)
-    monkeypatch.setattr(media_svc.settings, "upload_dir", str(upload_root))
+    _prepare_upload_root(monkeypatch, media_svc)
     db = AsyncMock()
     upload = UploadFile(
         filename="clip.mp4",
@@ -132,9 +162,7 @@ async def test_upload_paper_plane_rejects_video_like_file(monkeypatch) -> None:
 async def test_upload_rejects_invalid_purpose(monkeypatch) -> None:
     from app.services import community_media as media_svc
 
-    upload_root = ROOT / ".pytest_media_upload"
-    upload_root.mkdir(exist_ok=True)
-    monkeypatch.setattr(media_svc.settings, "upload_dir", str(upload_root))
+    _prepare_upload_root(monkeypatch, media_svc)
     db = AsyncMock()
     upload = UploadFile(
         filename="a.png",
@@ -152,30 +180,8 @@ async def test_upload_small_png_succeeds(monkeypatch) -> None:
 
     from app.services import community_media as media_svc
 
-    upload_root = ROOT / ".pytest_media_upload"
-    if upload_root.exists():
-        shutil.rmtree(upload_root, ignore_errors=True)
-    upload_root.mkdir(exist_ok=True)
-    monkeypatch.setattr(media_svc.settings, "upload_dir", str(upload_root))
-
-    insert_result = SimpleNamespace(lastrowid=42)
-    select_mappings = MagicMock()
-    select_mappings.one.return_value = {
-        "id": 42,
-        "purpose": "post",
-        "media_type": "image",
-        "file_url": "/storage/uploads/7/community/x.webp",
-        "thumbnail_url": "/storage/uploads/7/community/x-thumb.webp",
-        "file_size": 100,
-        "duration_seconds": None,
-        "status": "ready",
-    }
-    select_result = MagicMock()
-    select_result.mappings.return_value = select_mappings
-
-    db = AsyncMock()
-    db.execute = AsyncMock(side_effect=[insert_result, select_result])
-    db.commit = AsyncMock()
+    upload_root = _prepare_upload_root(monkeypatch, media_svc)
+    db = _media_db_for_image_insert(media_id=42, purpose="post")
 
     upload = UploadFile(
         filename="tiny.png",
@@ -189,6 +195,178 @@ async def test_upload_small_png_succeeds(monkeypatch) -> None:
     assert db.commit.await_count == 1
     written = list((upload_root / "7" / "community").glob("*.webp"))
     assert len(written) == 2
+    shutil.rmtree(upload_root, ignore_errors=True)
+
+
+@pytest.mark.asyncio
+async def test_upload_valid_jpeg_succeeds(monkeypatch) -> None:
+    """最小合法 JPEG 经 upload_community_media 落盘为 webp 并返回 ready。"""
+    import shutil
+
+    from app.services import community_media as media_svc
+
+    upload_root = _prepare_upload_root(monkeypatch, media_svc)
+    db = _media_db_for_image_insert(media_id=55, purpose="post")
+    upload = UploadFile(
+        filename="tiny.jpg",
+        file=BytesIO(_tiny_jpeg_bytes()),
+        headers={"content-type": "image/jpeg"},
+    )
+    resp = await media_svc.upload_community_media(db, user_id=7, file=upload, purpose="post")
+    assert resp.id == 55
+    assert resp.status == "ready"
+    assert resp.media_type == "image"
+    written = list((upload_root / "7" / "community").glob("*.webp"))
+    assert len(written) == 2
+    shutil.rmtree(upload_root, ignore_errors=True)
+
+
+@pytest.mark.asyncio
+async def test_upload_forged_image_content_type_returns_415(monkeypatch) -> None:
+    """content_type 声称 image/png，body 为伪造字节 → 415。"""
+    from app.services import community_media as media_svc
+
+    _prepare_upload_root(monkeypatch, media_svc)
+    db = AsyncMock()
+    upload = UploadFile(
+        filename="fake.png",
+        file=BytesIO(b"not-an-image"),
+        headers={"content-type": "image/png"},
+    )
+    with pytest.raises(HTTPException) as exc:
+        await media_svc.upload_community_media(db, user_id=1, file=upload, purpose="post")
+    assert exc.value.status_code == 415
+    assert db.execute.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_upload_image_oversize_returns_413(monkeypatch) -> None:
+    """超过 IMAGE_MAX_BYTES 的图片 payload → 413（mock 小阈值）。"""
+    from app.services import community_media as media_svc
+
+    _prepare_upload_root(monkeypatch, media_svc)
+    monkeypatch.setattr(media_svc, "IMAGE_MAX_BYTES", 64)
+    db = AsyncMock()
+    # 合法 JPEG 但大于 mock 上限 64 字节
+    payload = _tiny_jpeg_bytes()
+    assert len(payload) > 64
+    upload = UploadFile(
+        filename="big.jpg",
+        file=BytesIO(payload),
+        headers={"content-type": "image/jpeg"},
+    )
+    with pytest.raises(HTTPException) as exc:
+        await media_svc.upload_community_media(db, user_id=1, file=upload, purpose="post")
+    assert exc.value.status_code == 413
+    assert "MB" in str(exc.value.detail) or "大小" in str(exc.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_probe_video_missing_ffprobe_returns_503(monkeypatch) -> None:
+    from app.services import community_media as media_svc
+
+    monkeypatch.setattr(media_svc.shutil, "which", lambda _name: None)
+    with pytest.raises(HTTPException) as exc:
+        await media_svc._probe_video(Path("missing.mp4"))
+    assert exc.value.status_code == 503
+    assert "ffprobe" in str(exc.value.detail).lower() or "视频" in str(exc.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_probe_video_rejects_non_mp4(monkeypatch) -> None:
+    """ffprobe 返回非 mp4 容器名 → 415。"""
+    from app.services import community_media as media_svc
+
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self):
+            payload = json.dumps(
+                {"format": {"format_name": "matroska,webm", "duration": "5.0"}}
+            ).encode("utf-8")
+            return payload, b""
+
+        def kill(self) -> None:
+            return None
+
+    async def fake_exec(*_args, **_kwargs):
+        return FakeProcess()
+
+    monkeypatch.setattr(media_svc.shutil, "which", lambda _name: "ffprobe")
+    monkeypatch.setattr(media_svc.asyncio, "create_subprocess_exec", fake_exec)
+
+    with pytest.raises(HTTPException) as exc:
+        await media_svc._probe_video(Path("clip.webm"))
+    assert exc.value.status_code == 415
+    assert "MP4" in str(exc.value.detail) or "mp4" in str(exc.value.detail).lower()
+
+
+@pytest.mark.asyncio
+async def test_upload_video_oversize_returns_413(monkeypatch) -> None:
+    """视频边读边写超过 VIDEO_MAX_BYTES → 413。"""
+    from app.services import community_media as media_svc
+
+    upload_root = _prepare_upload_root(monkeypatch, media_svc)
+    monkeypatch.setattr(media_svc, "VIDEO_MAX_BYTES", 32)
+    db = AsyncMock()
+    upload = UploadFile(
+        filename="clip.mp4",
+        file=BytesIO(b"x" * 64),
+        headers={"content-type": "video/mp4"},
+    )
+    with pytest.raises(HTTPException) as exc:
+        await media_svc.upload_community_media(db, user_id=3, file=upload, purpose="post")
+    assert exc.value.status_code == 413
+    assert "50MB" in str(exc.value.detail) or "视频" in str(exc.value.detail)
+    # temp file cleaned in finally
+    leftovers = list((upload_root / "3" / "community").glob("video-*.upload"))
+    assert leftovers == []
+
+
+@pytest.mark.asyncio
+async def test_upload_post_video_with_monkeypatched_probe(monkeypatch) -> None:
+    """post 用途视频：monkeypatch _probe_video 返回 10 秒，跳过真实 ffprobe。"""
+    import shutil
+
+    from app.services import community_media as media_svc
+
+    upload_root = _prepare_upload_root(monkeypatch, media_svc)
+
+    async def fake_probe(_path: Path) -> int:
+        return 10
+
+    monkeypatch.setattr(media_svc, "_probe_video", fake_probe)
+
+    insert_result = SimpleNamespace(lastrowid=77)
+    select_mappings = MagicMock()
+    select_mappings.one.return_value = {
+        "id": 77,
+        "purpose": "post",
+        "media_type": "video",
+        "file_url": "/storage/uploads/3/community/v.mp4",
+        "thumbnail_url": None,
+        "file_size": 12,
+        "duration_seconds": 10,
+        "status": "ready",
+    }
+    select_result = MagicMock()
+    select_result.mappings.return_value = select_mappings
+    db = AsyncMock()
+    db.execute = AsyncMock(side_effect=[insert_result, select_result])
+    db.commit = AsyncMock()
+
+    upload = UploadFile(
+        filename="clip.mp4",
+        file=BytesIO(b"fake-mp4-bytes"),
+        headers={"content-type": "video/mp4"},
+    )
+    resp = await media_svc.upload_community_media(db, user_id=3, file=upload, purpose="post")
+    assert resp.id == 77
+    assert resp.media_type == "video"
+    assert resp.duration_seconds == 10
+    assert resp.status == "ready"
+    written = list((upload_root / "3" / "community").glob("*.mp4"))
+    assert len(written) == 1
     shutil.rmtree(upload_root, ignore_errors=True)
 
 
