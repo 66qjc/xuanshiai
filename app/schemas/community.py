@@ -5,20 +5,43 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 CITY_CODE_PATTERN = r"^(?:[0-9]{4}|[0-9]{6})$"
 
 
 class CommunityPostCreate(BaseModel):
-    content: str = Field(min_length=1, max_length=2000)
+    content: str = Field(default="", max_length=2000)
     images: list[str] = Field(default_factory=list, max_length=9)
     video: str | None = Field(default=None, max_length=500)
+    image_media_ids: list[int] = Field(default_factory=list, max_length=9)
+    video_media_id: int | None = Field(default=None, ge=1)
     location: str | None = Field(default=None, max_length=128)
     topic_id: int | None = Field(default=None, ge=1)
     visibility: Literal[0, 1, 2] = 0
     declaration: Literal["", "内容包含虚构演绎", "内容包含广告推广", "内容可能引起不适"] = ""
+
+    @model_validator(mode="after")
+    def validate_media_and_content(self) -> "CommunityPostCreate":
+        text = (self.content or "").strip()
+        self.content = text
+        image_ids = list(self.image_media_ids or [])
+        has_image_ids = len(image_ids) > 0
+        has_video_id = self.video_media_id is not None
+        has_images = len(self.images or []) > 0
+        has_video = bool(self.video)
+        if has_image_ids and has_video_id:
+            raise ValueError("图片和视频不能同时存在")
+        if has_images and has_video:
+            raise ValueError("图片和视频不能同时存在")
+        if (has_image_ids or has_images) and (has_video_id or has_video):
+            raise ValueError("图片和视频不能同时存在")
+        if len(image_ids) > 9:
+            raise ValueError("图片最多 9 张")
+        if not text and not has_image_ids and not has_video_id and not has_images and not has_video:
+            raise ValueError("正文与媒体不能同时为空")
+        return self
 
 
 class CommunityPostResponse(BaseModel):
@@ -199,11 +222,31 @@ class CommunityCollectResponse(BaseModel):
 
 
 class PaperPlaneCreate(BaseModel):
-    content: str = Field(min_length=1, max_length=1000)
+    content: str = Field(default="", max_length=1000)
     images: list[str] = Field(default_factory=list, max_length=6)
+    image_media_ids: list[int] = Field(default_factory=list, max_length=6)
     city: str | None = Field(default=None, max_length=64)
     tags: list[str] = Field(default_factory=list, max_length=5)
     is_anonymous: bool = True
+    voice_url: str | None = Field(default=None, max_length=500)
+    voice_duration_sec: int | None = Field(default=None, ge=1, le=60)
+
+    @model_validator(mode="after")
+    def require_text_or_voice_or_images(self) -> "PaperPlaneCreate":
+        text = (self.content or "").strip()
+        has_voice = bool(self.voice_url)
+        has_image_ids = len(self.image_media_ids or []) > 0
+        has_images = len(self.images or []) > 0
+        if not text and not has_voice and not has_image_ids and not has_images:
+            raise ValueError("纸飞机至少需要文字、语音或图片")
+        if self.voice_url and self.voice_duration_sec is None:
+            raise ValueError("语音纸飞机需提供 voice_duration_sec")
+        if self.voice_duration_sec is not None and not self.voice_url:
+            raise ValueError("voice_duration_sec 需配合 voice_url")
+        if len(self.image_media_ids or []) > 6:
+            raise ValueError("纸飞机图片最多 6 张")
+        self.content = text
+        return self
 
 
 class PaperPlaneResponse(BaseModel):
@@ -229,3 +272,15 @@ class PaperPlaneReplyResponse(BaseModel):
     content: str
     is_anonymous: bool
     created_at: datetime
+
+
+class CommunityMediaResponse(BaseModel):
+    id: int
+    purpose: Literal["post", "paper_plane"]
+    media_type: Literal["image", "video"]
+    url: str
+    thumbnail_url: str | None = None
+    file_size: int | None = None
+    duration_seconds: int | None = None
+    status: Literal["ready", "bound", "deleted"]
+

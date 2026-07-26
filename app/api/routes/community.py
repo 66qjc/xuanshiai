@@ -4,7 +4,7 @@ from collections.abc import Awaitable, Callable
 import logging
 from typing import Any, Literal, TypeVar
 
-from fastapi import APIRouter, Body, Depends, Header, Path, Query
+from fastapi import APIRouter, Body, Depends, File, Form, Header, Path, Query, UploadFile
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -28,6 +28,7 @@ from app.schemas.community import (
     CommunityCollectResponse,
     CommunityCommentCreate,
     CommunityCommentResponse,
+    CommunityMediaResponse,
     CommunityPostCreate,
     CommunityPostPage,
     CommunityPostResponse,
@@ -42,6 +43,7 @@ from app.schemas.community import (
     PaperPlaneReplyResponse,
     PaperPlaneResponse,
 )
+from app.services.community_media import delete_community_media, upload_community_media
 from app.services.community import (
     collect_post,
     create_comment,
@@ -119,6 +121,34 @@ async def _create_idempotently(
         except Exception:
             logger.exception("Failed to abort idempotency reservation")
         raise
+
+
+@router.post(
+    "/community/media/uploads",
+    response_model=CommunityMediaResponse,
+    status_code=201,
+    summary="上传社区媒体",
+)
+async def upload_media(
+    file: UploadFile = File(...),
+    purpose: str = Form(...),
+    current: CurrentUser = Depends(get_realname_verified_user),
+    db: AsyncSession = Depends(get_db),
+) -> CommunityMediaResponse:
+    return await upload_community_media(db, current.id, file, purpose)
+
+
+@router.delete(
+    "/community/media/{media_id}",
+    status_code=204,
+    summary="删除未绑定社区媒体",
+)
+async def remove_media(
+    media_id: int,
+    current: CurrentUser = Depends(get_realname_verified_user),
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    await delete_community_media(db, current.id, media_id)
 
 
 @router.post("/community/posts", response_model=CommunityPostResponse, status_code=201, summary="发布动态")
