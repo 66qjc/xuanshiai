@@ -49,6 +49,12 @@ async def _is_blocked(db: AsyncSession, left_id: int, right_id: int) -> bool:
     return bool(result.scalar())
 
 
+async def ensure_users_can_interact(db: AsyncSession, left_id: int, right_id: int) -> None:
+    """Reject interactions when either user has blocked the other."""
+    if left_id == right_id or await _is_blocked(db, left_id, right_id):
+        raise HTTPException(403, detail="双方当前不能进行该互动")
+
+
 async def _match_exists(db: AsyncSession, user_id: int, target_id: int) -> bool:
     result = await db.execute(
         text("SELECT 1 FROM user_match WHERE user_id = :user_id AND target_user_id = :target_id AND status IN (1, 2)"),

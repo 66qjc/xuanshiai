@@ -10,6 +10,7 @@ from app.schemas.matchmaker import (
     MatchmakerCard,
     MatchmakerContactResponse,
     MatchmakerContactExchangeCreate,
+    MatchmakerContactExchangeContactsResponse,
     MatchmakerContactExchangeResponse,
     MatchmakerContactExchangeUpdate,
     MatchmakerContactUpdate,
@@ -31,6 +32,7 @@ from app.services.matchmaker import (
     create_service_request,
     create_service_order,
     get_matchmaker_contact,
+    get_contact_exchange_contacts,
     get_service_order,
     get_matchmaker,
     list_service_products,
@@ -204,6 +206,15 @@ async def get_exchange(
     db: AsyncSession = Depends(get_db),
 ) -> MatchmakerContactExchangeResponse:
     return await get_contact_exchange(db, current, exchange_id)
+
+
+@requests_router.get("/contact-exchanges/{exchange_id}/contacts", response_model=MatchmakerContactExchangeContactsResponse, summary="查看已授权双方联系方式")
+async def exchange_contacts(
+    exchange_id: int = Path(..., ge=1),
+    current: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> MatchmakerContactExchangeContactsResponse:
+    return await get_contact_exchange_contacts(db, current, exchange_id)
 
 
 admin_router = APIRouter(prefix="/admin/matchmaker/service-requests")

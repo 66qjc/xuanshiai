@@ -242,6 +242,7 @@ class DatabaseManager:
             },
             'user_matchmaker_apply': {
                 'application_type': "`application_type` varchar(32) NOT NULL DEFAULT 'service_matchmaker' COMMENT '申请类型 promoter推广红娘 partner合伙人 service_matchmaker服务红娘'",
+                'application_details': "`application_details` json DEFAULT NULL COMMENT '红娘审核扩展资料'",
                 'reviewed_by': "`reviewed_by` bigint unsigned DEFAULT NULL",
                 'reviewed_at': "`reviewed_at` datetime DEFAULT NULL",
                 'suspended_at': "`suspended_at` datetime DEFAULT NULL",
@@ -1146,6 +1147,7 @@ class DatabaseManager:
                     `phone` varchar(20) DEFAULT NULL,
                     `intro` text COMMENT '自我介绍/优势',
                     `cert_images` json DEFAULT NULL COMMENT '资质证书图片',
+                    `application_details` json DEFAULT NULL COMMENT '红娘审核扩展资料',
                     `status` tinyint DEFAULT '0' COMMENT '0待审核 1通过 2驳回',
                     `fail_reason` varchar(255) DEFAULT NULL,
                     `reviewed_by` bigint unsigned DEFAULT NULL,
