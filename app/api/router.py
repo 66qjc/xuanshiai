@@ -12,6 +12,7 @@ from app.api.routes import (
     health,
     identity,
     matchmaker,
+    media,
     meeting,
     membership,
     organization,
@@ -43,6 +44,7 @@ api_router.include_router(matchmaker.requests_router, tags=["红娘"])
 api_router.include_router(meeting.router, tags=["红娘"])
 api_router.include_router(social.router, tags=["消息"])
 api_router.include_router(community.router, tags=["社区"])
+api_router.include_router(media.router, tags=["社区"])
 api_router.include_router(admin.router, tags=["管理后台"])
 api_router.include_router(matchmaker.admin_router, tags=["管理后台"])
 api_router.include_router(meeting.admin_router, tags=["管理后台"])

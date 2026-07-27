@@ -20,7 +20,7 @@ Content-Type: application/json
 {"detail":"错误原因"}
 ```
 
-当前管理模块提供媒体审核、举报处理和红娘牵线服务申请管理接口；媒体/举报历史接口仍未提供完整审核列表、批量审核和操作日志查询能力。
+当前管理模块提供媒体审核、举报列表/处理、社区内容下架恢复，以及红娘牵线服务申请管理接口。批量审核与完整操作日志查询仍可后续增强；内容处置会写入 `business_audit_log`。
 
 ## 2. 媒体审核
 
@@ -84,9 +84,24 @@ Content-Type: application/json
 
 ## 3. 举报处理
 
+### `GET /api/v1/admin/reports`
+
+用途：分页查看举报队列。成功状态 `200 OK`。
+
+查询参数：
+
+| 参数 | 类型 | 必填 | 默认 | 含义 |
+| --- | --- | --- | --- | --- |
+| `page` | integer | 否 | 1 | 页码 |
+| `page_size` | integer | 否 | 20 | 1~100 |
+| `status` | integer/null | 否 | null | `0` 待处理 / `1` 已处理 / `2` 驳回 |
+| `target_type` | string/null | 否 | null | `user` / `post` / `comment` / `paper_plane` |
+
+返回：`items[]`（含 `reporter_user_id`、`target_user_id`、`target_type`、`target_id`、`type`、`description`、`status`、`result`、时间字段）、`page`、`page_size`、`total`、`has_more`。
+
 ### `PATCH /api/v1/admin/reports/{report_id}/review`
 
-用途：处理用户提交的举报记录。成功状态：`200 OK`。
+用途：处理用户/内容举报记录。成功状态：`200 OK`。
 
 路径参数：
 
@@ -100,40 +115,34 @@ Content-Type: application/json
 | --- | --- | --- | --- | --- | --- | --- |
 | `status` | body | integer | 是 | 无 | `1` 已处理，`2` 驳回 | 举报处理结果状态 |
 | `result` | body | string | 是 | 无 | 1~255 字符 | 审核结论或处理措施 |
+| `action` | body | string | 否 | `none` | `none` / `hide_content` / `restore_content` / `dismiss` | 显式副作用；默认只改工单 |
+
+- `none`：仅更新 `status`/`result`（兼容旧客户端）
+- `hide_content` / `restore_content`：仅当 `target_type` 为内容时下架/恢复；用户举报返回 `422`
+- `dismiss`：强制 `status=2`，不动内容
+- **不会**自动封禁账号或通知举报人
 
 请求示例：
 
-```http
-PATCH /api/v1/admin/reports/31/review
-Authorization: Bearer <admin_access_token>
-Content-Type: application/json
-```
-
 ```json
-{"status":1,"result":"已确认违规，限制对方账号7天"}
+{"status":1,"result":"确认违规并下架","action":"hide_content"}
 ```
 
-成功返回：
+成功返回：`report_id`、`status`、`result`、`action`、`content_moderated`。
 
-| 字段 | 类型 | 必返 | 空值含义 | 含义 |
-| --- | --- | --- | --- | --- |
-| `report_id` | integer | 是 | 不为空 | 举报记录 ID |
-| `status` | integer | 是 | `1/2` | 更新后的处理状态 |
-| `result` | string | 是 | 不为空 | 处理结果说明 |
+### 社区内容下架 / 恢复
 
-成功响应：
+统一请求体：`{"status":1|2,"reason":"..."}`，其中 `1` 恢复可见，`2` 下架隐藏。
 
-```json
-{"report_id":31,"status":1,"result":"已确认违规，限制对方账号7天"}
-```
+| 方法 | 路径 | 后端效果 |
+| --- | --- | --- |
+| `PATCH` | `/api/v1/admin/community/posts/{post_id}/moderation` | 动态 `status`：下架=3，恢复=1（与用户自删共用 3，列表均不可见） |
+| `PATCH` | `/api/v1/admin/community/comments/{comment_id}/moderation` | 评论 `status`：下架=2，恢复=1 |
+| `PATCH` | `/api/v1/admin/community/paper-planes/{plane_id}/moderation` | 纸飞机 `moderation_status`：下架=2，恢复=1（不动 lifecycle `status`） |
 
-举报不存在时返回：
+成功返回：`target_type`、`target_id`、`status`、`reason`。不存在 → `404`。
 
-```json
-{"detail":"举报记录不存在"}
-```
-
-当前实现只更新举报记录的 `status`、`result` 和更新时间，不会自动执行封禁、删除内容或向举报人发送通知；这些动作需要后续增加明确的审核策略和独立接口。红娘申请审核通知不属于本举报接口，见 `docs/api/identity.md`。
+红娘申请审核通知不属于本举报接口，见 `docs/api/identity.md`。
 
 ## 4. 权限和错误响应
 

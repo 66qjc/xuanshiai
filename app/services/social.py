@@ -291,24 +291,322 @@ async def set_block(db: AsyncSession, user_id: int, target_id: int, request: Blo
     await db.commit()
 
 
+async def _ensure_report_images(db: AsyncSession, user_id: int, images: list[str]) -> None:
+    if not images:
+        return
+    media = await db.execute(
+        text("SELECT file_url FROM user_media WHERE user_id=:user_id AND deleted_at IS NULL"),
+        {"user_id": user_id},
+    )
+    owned = {row[0] for row in media.all()}
+    if any(image not in owned for image in images):
+        raise HTTPException(422, detail="举报证据必须来自当前用户已上传的媒体")
+
+
+async def _insert_report(
+    db: AsyncSession,
+    *,
+    user_id: int,
+    target_user_id: int,
+    target_type: str,
+    target_id: int | None,
+    report_type: str,
+    description: str | None,
+    images: list[str],
+) -> ReportResponse:
+    result = await db.execute(
+        text(
+            """INSERT INTO user_report
+            (user_id, target_user_id, target_type, target_id, type, `desc`, images)
+            VALUES (:user_id, :target_user_id, :target_type, :target_id, :type, :description, :images)"""
+        ),
+        {
+            "user_id": user_id,
+            "target_user_id": target_user_id,
+            "target_type": target_type,
+            "target_id": target_id,
+            "type": report_type,
+            "description": description,
+            "images": json.dumps(images, ensure_ascii=False),
+        },
+    )
+    await db.commit()
+    created = await db.execute(
+        text(
+            """SELECT id, target_user_id, target_type, target_id, type, status, created_at
+            FROM user_report WHERE id = :id"""
+        ),
+        {"id": result.lastrowid},
+    )
+    row = dict(created.mappings().one())
+    return ReportResponse(
+        id=int(row["id"]),
+        target_user_id=int(row["target_user_id"]),
+        target_type=row.get("target_type") or "user",
+        target_id=int(row["target_id"]) if row.get("target_id") is not None else None,
+        type=row["type"],
+        status=int(row["status"]),
+        created_at=row["created_at"],
+    )
+
+
 async def create_report(db: AsyncSession, user_id: int, target_id: int, request: ReportRequest) -> ReportResponse:
     await _ensure_target(db, user_id, target_id)
-    if request.images:
-        media = await db.execute(text("SELECT file_url FROM user_media WHERE user_id=:user_id AND deleted_at IS NULL"), {"user_id": user_id})
-        owned = {row[0] for row in media.all()}
-        if any(image not in owned for image in request.images):
-            raise HTTPException(422, detail="举报证据必须来自当前用户已上传的媒体")
-    result = await db.execute(text("""INSERT INTO user_report (user_id, target_user_id, type, `desc`, images)
-        VALUES (:user_id, :target_id, :type, :description, :images)"""), {"user_id": user_id, "target_id": target_id, "type": request.type, "description": request.description, "images": json.dumps(request.images, ensure_ascii=False)})
-    await db.commit()
-    created = await db.execute(text("SELECT id, target_user_id, type, status, created_at FROM user_report WHERE id = :id"), {"id": result.lastrowid})
-    return ReportResponse(**created.mappings().one())
+    await _ensure_report_images(db, user_id, request.images)
+    return await _insert_report(
+        db,
+        user_id=user_id,
+        target_user_id=target_id,
+        target_type="user",
+        target_id=target_id,
+        report_type=request.type,
+        description=request.description,
+        images=request.images,
+    )
 
 
-async def review_report(db: AsyncSession, report_id: int, request: ReportReviewRequest) -> ReportReviewResponse:
-    result = await db.execute(text("SELECT id FROM user_report WHERE id = :report_id FOR UPDATE"), {"report_id": report_id})
-    if not result.scalar():
+async def create_content_report(
+    db: AsyncSession,
+    user_id: int,
+    *,
+    target_type: str,
+    target_id: int,
+    reason_id: str,
+    description: str | None = None,
+    images: list[str] | None = None,
+) -> ReportResponse:
+    from app.services.community import REPORT_REASONS
+
+    allowed = {item["id"] for item in REPORT_REASONS}
+    if reason_id not in allowed:
+        raise HTTPException(422, detail="举报原因无效")
+    image_list = images or []
+    await _ensure_report_images(db, user_id, image_list)
+
+    if target_type == "post":
+        result = await db.execute(
+            text("SELECT id, user_id FROM community_post WHERE id = :target_id"),
+            {"target_id": target_id},
+        )
+        row = result.mappings().first()
+        if not row:
+            raise HTTPException(404, detail="动态不存在")
+    elif target_type == "comment":
+        result = await db.execute(
+            text("SELECT id, user_id FROM community_comment WHERE id = :target_id"),
+            {"target_id": target_id},
+        )
+        row = result.mappings().first()
+        if not row:
+            raise HTTPException(404, detail="评论不存在")
+    elif target_type == "paper_plane":
+        result = await db.execute(
+            text("SELECT id, user_id FROM paper_plane WHERE id = :target_id"),
+            {"target_id": target_id},
+        )
+        row = result.mappings().first()
+        if not row:
+            raise HTTPException(404, detail="纸飞机不存在")
+    else:
+        raise HTTPException(422, detail="不支持的举报对象类型")
+
+    owner_id = int(row["user_id"])
+    if owner_id == user_id:
+        raise HTTPException(422, detail="不能举报自己的内容")
+
+    # 防止同一用户对同一目标重复举报，刷爆审核队列
+    duplicated = await db.execute(
+        text(
+            """SELECT 1 FROM user_report
+            WHERE user_id = :user_id
+              AND target_type = :target_type
+              AND target_id = :target_id
+              AND status = 0
+            LIMIT 1"""
+        ),
+        {"user_id": user_id, "target_type": target_type, "target_id": target_id},
+    )
+    if duplicated.scalar():
+        raise HTTPException(409, detail="该内容你已举报，请等待处理结果")
+
+    return await _insert_report(
+        db,
+        user_id=user_id,
+        target_user_id=owner_id,
+        target_type=target_type,
+        target_id=target_id,
+        report_type=reason_id,
+        description=description,
+        images=image_list,
+    )
+
+
+async def list_admin_reports(
+    db: AsyncSession,
+    *,
+    page: int,
+    page_size: int,
+    status: int | None = None,
+    target_type: str | None = None,
+) -> "AdminReportPage":
+    from app.schemas.admin import AdminReportItem, AdminReportPage
+
+    where = ["1=1"]
+    params: dict[str, Any] = {"limit": page_size, "offset": (page - 1) * page_size}
+    if status is not None:
+        where.append("status = :status")
+        params["status"] = status
+    if target_type is not None:
+        where.append("target_type = :target_type")
+        params["target_type"] = target_type
+    where_sql = " AND ".join(where)
+    total = int(
+        (
+            await db.execute(text(f"SELECT COUNT(*) FROM user_report WHERE {where_sql}"), params)
+        ).scalar()
+        or 0
+    )
+    result = await db.execute(
+        text(
+            f"""SELECT id, user_id AS reporter_user_id, target_user_id, target_type, target_id,
+            type, `desc` AS description, status, result, created_at, updated_at
+            FROM user_report
+            WHERE {where_sql}
+            ORDER BY created_at DESC, id DESC
+            LIMIT :limit OFFSET :offset"""
+        ),
+        params,
+    )
+    items = []
+    for row in result.mappings().all():
+        data = dict(row)
+        items.append(
+            AdminReportItem(
+                id=int(data["id"]),
+                reporter_user_id=int(data["reporter_user_id"]),
+                target_user_id=int(data["target_user_id"]),
+                target_type=data.get("target_type") or "user",
+                target_id=int(data["target_id"]) if data.get("target_id") is not None else None,
+                type=data.get("type"),
+                description=data.get("description"),
+                status=int(data["status"]),
+                result=data.get("result"),
+                created_at=data["created_at"],
+                updated_at=data.get("updated_at"),
+            )
+        )
+    return AdminReportPage(
+        items=items,
+        page=page,
+        page_size=page_size,
+        total=total,
+        has_more=page * page_size < total,
+    )
+
+
+async def moderate_content(
+    db: AsyncSession,
+    *,
+    target_type: str,
+    target_id: int,
+    hide: bool,
+    reason: str | None = None,
+    actor_id: int | None = None,
+) -> None:
+    if target_type == "post":
+        # status: 1 正常 / 3 违规下架（与用户自删共用；本期文档约定不可见）
+        status = 3 if hide else 1
+        result = await db.execute(
+            text("UPDATE community_post SET status = :status, updated_at = UTC_TIMESTAMP() WHERE id = :target_id"),
+            {"status": status, "target_id": target_id},
+        )
+        if result.rowcount == 0:
+            raise HTTPException(404, detail="动态不存在")
+    elif target_type == "comment":
+        status = 2 if hide else 1
+        result = await db.execute(
+            text("UPDATE community_comment SET status = :status WHERE id = :target_id"),
+            {"status": status, "target_id": target_id},
+        )
+        if result.rowcount == 0:
+            raise HTTPException(404, detail="评论不存在")
+    elif target_type == "paper_plane":
+        # lifecycle status 不动；仅改 moderation_status 1正常 2下架
+        status = 2 if hide else 1
+        result = await db.execute(
+            text("UPDATE paper_plane SET moderation_status = :status WHERE id = :target_id"),
+            {"status": status, "target_id": target_id},
+        )
+        if result.rowcount == 0:
+            raise HTTPException(404, detail="纸飞机不存在")
+    else:
+        raise HTTPException(422, detail="不支持的内容类型")
+
+    if actor_id is not None:
+        await db.execute(
+            text(
+                """INSERT INTO business_audit_log
+                (actor_user_id, action, resource_type, resource_id, reason)
+                VALUES (:actor_id, :action, :resource_type, :resource_id, :reason)"""
+            ),
+            {
+                "actor_id": actor_id,
+                "action": "hide_content" if hide else "restore_content",
+                "resource_type": target_type,
+                "resource_id": target_id,
+                "reason": reason,
+            },
+        )
+
+
+async def review_report(db: AsyncSession, report_id: int, request: ReportReviewRequest, *, actor_id: int | None = None) -> ReportReviewResponse:
+    result = await db.execute(
+        text(
+            """SELECT id, target_type, target_id, status FROM user_report
+            WHERE id = :report_id FOR UPDATE"""
+        ),
+        {"report_id": report_id},
+    )
+    row = result.mappings().first()
+    if not row:
         raise HTTPException(404, detail="举报记录不存在")
-    await db.execute(text("UPDATE user_report SET status = :status, result = :result, updated_at = UTC_TIMESTAMP() WHERE id = :report_id"), {"report_id": report_id, "status": request.status, "result": request.result})
+
+    action = request.action or "none"
+    status = request.status
+    if action == "dismiss":
+        status = 2
+    elif action in ("hide_content", "restore_content") and status not in (1, 2):
+        status = 1
+
+    content_moderated = False
+    target_type = row.get("target_type") or "user"
+    target_id = row.get("target_id")
+    if action in ("hide_content", "restore_content"):
+        if target_type == "user" or target_id is None:
+            raise HTTPException(422, detail="用户举报不支持内容处置，请使用内容下架接口")
+        await moderate_content(
+            db,
+            target_type=target_type,
+            target_id=int(target_id),
+            hide=(action == "hide_content"),
+            reason=request.result,
+            actor_id=actor_id,
+        )
+        content_moderated = True
+
+    await db.execute(
+        text(
+            """UPDATE user_report
+            SET status = :status, result = :result, updated_at = UTC_TIMESTAMP()
+            WHERE id = :report_id"""
+        ),
+        {"report_id": report_id, "status": status, "result": request.result},
+    )
     await db.commit()
-    return ReportReviewResponse(report_id=report_id, status=request.status, result=request.result)
+    return ReportReviewResponse(
+        report_id=report_id,
+        status=status,
+        result=request.result,
+        action=action,
+        content_moderated=content_moderated,
+    )

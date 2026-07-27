@@ -24,7 +24,7 @@ Content-Type: application/json
 - 关系、聊天、社区和安全接口要求账号存在有效手机号。
 - 目标用户必须处于公开交友状态，不能是当前用户本人，也不能与当前用户互相拉黑。
 - 聊天要求双方存在有效匹配关系（匹配状态 `1` 或 `2`）。
-- 喜欢、取消喜欢、关注、取消关注，以及发现模块的认识申请创建/同意/拒绝，要求当前用户 `realname_status == 2`；未通过返回 `403` 和 `{"detail":"璇峰厛瀹屾垚瀹炲悕璁よ瘉"}`。
+- 喜欢、取消喜欢、关注、取消关注，以及发现模块的认识申请创建/同意/拒绝，要求当前用户 `realname_status == 2`；未通过返回 `403` 和 `{"detail":"请先完成实名认证"}`。
 - 关系列表读取、举报和拉黑/解除拉黑继续允许已登录、已绑定手机号的非实名用户使用。
 - 关系写入使用数据库唯一约束和 `INSERT IGNORE`，重复喜欢/关注通常会返回当前状态，不会新增重复记录。
 - 当前发送消息、发布内容、举报没有 `Idempotency-Key` 机制；网络超时后不要盲目重试写请求，应先查询结果。
@@ -441,6 +441,8 @@ Authorization: Bearer <access_token>
 | --- | --- | --- | --- |
 | `id` | integer | 是 | 举报记录 ID |
 | `target_user_id` | integer | 是 | 被举报用户 ID |
+| `target_type` | string | 是 | 固定 `user`（用户举报轨） |
+| `target_id` | integer/null | 是 | 与 `target_user_id` 相同 |
 | `type` | string | 是 | 举报类型 |
 | `status` | integer | 是 | `0` 待处理，`1` 已处理，`2` 已驳回 |
 | `created_at` | datetime | 是 | 创建时间 |
@@ -448,10 +450,10 @@ Authorization: Bearer <access_token>
 成功响应：
 
 ```json
-{"id":31,"target_user_id":23,"type":"骚扰","status":0,"created_at":"2026-07-20T11:00:00"}
+{"id":31,"target_user_id":23,"target_type":"user","target_id":23,"type":"骚扰","status":0,"created_at":"2026-07-20T11:00:00"}
 ```
 
-当前接口只保存举报记录，不会自动封禁目标用户；后台处理见 `docs/api/admin.md`。
+当前接口只保存**用户**举报记录（`target_type=user`），不会自动封禁目标用户。社区帖子/评论/纸飞机请使用 `POST /api/v1/community/reports`（见 `docs/api/community.md`）。后台处理见 `docs/api/admin.md`。
 
 ## 8. 错误响应
 
@@ -459,7 +461,7 @@ Authorization: Bearer <access_token>
 | --- | --- | --- | --- |
 | `401` | 未登录、Token 无效或会话失效 | `请先登录` | 清理 Token 并重新登录 |
 | `403` | 未绑定手机号、未匹配、已拉黑或无权限 | `当前没有聊天权限` | 展示绑定/匹配/权限提示 |
-| `403` | 喜欢/关注或认识申请写操作未通过实名认证 | `璇峰厛瀹屾垚瀹炲悕璁よ瘉` | 引导实名认证；举报、拉黑和读取仍可用 |
+| `403` | 喜欢/关注或认识申请写操作未通过实名认证 | `请先完成实名认证` | 引导实名认证；举报、拉黑和读取仍可用 |
 | `404` | 用户、会话、消息、关系或举报目标不存在 | `聊天会话不存在` | 刷新列表并移除失效项 |
 | `409` | 业务状态冲突 | `关系状态冲突` | 重新查询当前状态 |
 | `410` | 调用已废弃的 `GET /relations/liked-by` | `鍠滄鍒楄〃浠呮湰浜哄彲瑙?` | 移除该入口；仅使用 `GET /relations/likes` |

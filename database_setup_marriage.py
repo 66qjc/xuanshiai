@@ -17,6 +17,11 @@ FAIL_CLOSED_COMMUNITY_COLUMNS = frozenset(
         ("user_profile", "community_city_updated_at"),
         ("community_post", "visibility"),
         ("community_post", "declaration"),
+        ("user_report", "target_type"),
+        ("user_report", "target_id"),
+        ("paper_plane", "moderation_status"),
+        ("paper_plane", "voice_url"),
+        ("paper_plane", "voice_duration_sec"),
     }
 )
 
@@ -227,6 +232,15 @@ class DatabaseManager:
                 'visibility': "`visibility` tinyint NOT NULL DEFAULT '0' COMMENT '0公开 1仅好友 2仅自己'",
                 'declaration': "`declaration` varchar(32) NOT NULL DEFAULT '' COMMENT '内容声明'",
             },
+            'user_report': {
+                'target_type': "`target_type` varchar(32) NOT NULL DEFAULT 'user' COMMENT 'user|post|comment|paper_plane'",
+                'target_id': "`target_id` bigint unsigned DEFAULT NULL COMMENT '内容对象ID；user 举报可为空或等于 target_user_id'",
+            },
+            'paper_plane': {
+                'moderation_status': "`moderation_status` tinyint NOT NULL DEFAULT '1' COMMENT '1正常 2下架（与 lifecycle status 分离）'",
+                'voice_url': "`voice_url` varchar(500) DEFAULT NULL COMMENT '语音地址'",
+                'voice_duration_sec': "`voice_duration_sec` int DEFAULT NULL COMMENT '语音时长秒'",
+            },
             'user_login_log': {
                 'login_status': "`login_status` tinyint NOT NULL DEFAULT '1' COMMENT '1成功 2失败'",
                 'failure_reason': "`failure_reason` varchar(255) DEFAULT NULL",
@@ -273,7 +287,32 @@ class DatabaseManager:
             self._ensure_table_columns(cursor, f'`{table_name}`', columns)
         self._ensure_matchmaker_application_index(cursor)
         self._ensure_payment_order_idempotency_index(cursor)
+        self._ensure_community_post_feed_indexes(cursor)
         self._ensure_idempotency_contract(cursor)
+
+    def _ensure_community_post_feed_indexes(self, cursor):
+        """为社区动态流补齐复合索引，避免 status + 排序走 filesort。"""
+        indexes = {
+            'idx_status_top_created': '(`status`,`is_top`,`created_at`)',
+            'idx_status_like_created': '(`status`,`like_count`,`created_at`)',
+        }
+        for index_name, columns in indexes.items():
+            try:
+                cursor.execute(f"""
+                    SELECT INDEX_NAME
+                    FROM information_schema.STATISTICS
+                    WHERE TABLE_SCHEMA = DATABASE()
+                      AND TABLE_NAME = 'community_post'
+                      AND INDEX_NAME = '{index_name}'
+                """)
+                if cursor.fetchone():
+                    continue
+                cursor.execute(
+                    f"ALTER TABLE `community_post` ADD KEY `{index_name}` {columns}"
+                )
+                logger.debug(f"✅ 社区动态索引 {index_name} 已添加")
+            except pymysql.MySQLError as exc:
+                logger.warning(f"⚠️ 社区动态索引 {index_name} 添加失败: {exc}")
 
     def _ensure_idempotency_contract(self, cursor):
         """Upgrade the durable idempotency table without relying on server-local time."""
@@ -441,6 +480,7 @@ class DatabaseManager:
             ('community_post', 'user_id'),
             ('community_comment', 'user_id'),
             ('community_like', 'user_id'),
+            ('community_media', 'user_id'),
             ('paper_plane', 'user_id'),
             ('paper_plane_reply', 'user_id'),
             ('matchmaker_service', 'user_id'),
@@ -912,7 +952,9 @@ class DatabaseManager:
                 CREATE TABLE IF NOT EXISTS `user_report` (
                     `id` bigint unsigned NOT NULL AUTO_INCREMENT,
                     `user_id` bigint unsigned NOT NULL COMMENT '举报人',
-                    `target_user_id` bigint unsigned NOT NULL COMMENT '被举报人',
+                    `target_user_id` bigint unsigned NOT NULL COMMENT '被举报人/内容作者',
+                    `target_type` varchar(32) NOT NULL DEFAULT 'user' COMMENT 'user|post|comment|paper_plane',
+                    `target_id` bigint unsigned DEFAULT NULL COMMENT '内容对象ID；user 举报可为空或等于 target_user_id',
                     `type` varchar(64) DEFAULT NULL COMMENT '举报类型 骚扰/虚假/诈骗等',
                     `desc` text COMMENT '描述',
                     `images` json DEFAULT NULL COMMENT '截图证据',
@@ -921,7 +963,9 @@ class DatabaseManager:
                     `created_at` datetime DEFAULT CURRENT_TIMESTAMP,
                     `updated_at` datetime DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                     PRIMARY KEY (`id`),
-                    KEY `idx_target` (`target_user_id`)
+                    KEY `idx_target` (`target_user_id`),
+                    KEY `idx_target_object` (`target_type`, `target_id`),
+                    KEY `idx_status_created` (`status`, `created_at`)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='举报记录'
             """,
 
@@ -1295,7 +1339,9 @@ class DatabaseManager:
                     PRIMARY KEY (`id`),
                     KEY `idx_user` (`user_id`),
                     KEY `idx_topic` (`topic_id`),
-                    KEY `idx_created` (`created_at`)
+                    KEY `idx_created` (`created_at`),
+                    KEY `idx_status_top_created` (`status`,`is_top`,`created_at`),
+                    KEY `idx_status_like_created` (`status`,`like_count`,`created_at`)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='社区动态'
             """,
 
@@ -1327,7 +1373,7 @@ class DatabaseManager:
                     `id` bigint unsigned NOT NULL AUTO_INCREMENT,
                     `user_id` bigint unsigned NOT NULL,
                     `target_id` bigint unsigned NOT NULL,
-                    `type` tinyint DEFAULT '1' COMMENT '1动态 2评论',
+                    `type` tinyint DEFAULT '1' COMMENT '1动态 2评论 3收藏',
                     `created_at` datetime DEFAULT CURRENT_TIMESTAMP,
                     PRIMARY KEY (`id`),
                     UNIQUE KEY `uk_user_target` (`user_id`,`target_id`,`type`),
@@ -1352,6 +1398,68 @@ class DatabaseManager:
             """,
 
             # ============================================
+            # 25b. 话题参与
+            # ============================================
+            'community_topic_participant': """
+                CREATE TABLE IF NOT EXISTS `community_topic_participant` (
+                    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+                    `topic_id` bigint unsigned NOT NULL,
+                    `user_id` bigint unsigned NOT NULL,
+                    `created_at` datetime DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (`id`),
+                    UNIQUE KEY `uk_topic_user` (`topic_id`, `user_id`),
+                    KEY `idx_user` (`user_id`),
+                    KEY `idx_topic_created` (`topic_id`, `created_at`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='话题参与'
+            """,
+
+            # ============================================
+            # 25c. 社区动态与纸飞机媒体
+            # ============================================
+            'community_media': """
+                CREATE TABLE IF NOT EXISTS `community_media` (
+                    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+                    `user_id` bigint unsigned NOT NULL,
+                    `purpose` varchar(32) NOT NULL COMMENT 'post|paper_plane',
+                    `media_type` varchar(16) NOT NULL COMMENT 'image|video',
+                    `file_url` varchar(512) NOT NULL,
+                    `storage_key` varchar(512) NOT NULL,
+                    `thumbnail_url` varchar(512) DEFAULT NULL,
+                    `mime_type` varchar(128) DEFAULT NULL,
+                    `file_size` bigint unsigned DEFAULT NULL,
+                    `duration_seconds` smallint unsigned DEFAULT NULL,
+                    `status` varchar(16) NOT NULL DEFAULT 'ready' COMMENT 'ready|bound|deleted',
+                    `deleted_at` datetime DEFAULT NULL,
+                    `expire_at` datetime DEFAULT NULL COMMENT '未绑定媒体过期时间',
+                    `created_at` datetime DEFAULT CURRENT_TIMESTAMP,
+                    `updated_at` datetime DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    PRIMARY KEY (`id`),
+                    UNIQUE KEY `uk_community_media_storage_key` (`storage_key`),
+                    KEY `idx_community_media_user_purpose` (`user_id`,`purpose`,`status`,`deleted_at`),
+                    KEY `idx_community_media_expire` (`status`,`expire_at`,`deleted_at`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='社区动态与纸飞机媒体'
+            """,
+
+            # ============================================
+            # 25d. 社区媒体绑定关系
+            # ============================================
+            'community_media_attachment': """
+                CREATE TABLE IF NOT EXISTS `community_media_attachment` (
+                    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+                    `media_id` bigint unsigned NOT NULL,
+                    `target_type` varchar(32) NOT NULL COMMENT 'post|paper_plane',
+                    `target_id` bigint unsigned NOT NULL,
+                    `sort_order` smallint unsigned NOT NULL DEFAULT '0',
+                    `created_at` datetime DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (`id`),
+                    UNIQUE KEY `uk_community_media_attachment_media` (`media_id`),
+                    KEY `idx_community_media_attachment_target` (`target_type`,`target_id`,`sort_order`),
+                    CONSTRAINT `fk_community_media_attachment_media`
+                        FOREIGN KEY (`media_id`) REFERENCES `community_media`(`id`) ON DELETE CASCADE
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='社区媒体绑定关系'
+            """,
+
+            # ============================================
             # 26. 纸飞机（漂流瓶）
             # ============================================
             'paper_plane': """
@@ -1363,14 +1471,18 @@ class DatabaseManager:
                     `city` varchar(64) DEFAULT NULL COMMENT '同城城市',
                     `tags` json DEFAULT NULL COMMENT '标签 如 三观/情感/吐槽',
                     `is_anonymous` tinyint DEFAULT '1' COMMENT '是否匿名 0否 1是',
+                    `voice_url` varchar(500) DEFAULT NULL COMMENT '语音地址',
+                    `voice_duration_sec` int DEFAULT NULL COMMENT '语音时长秒',
                     `reply_count` int DEFAULT '0',
                     `like_count` int DEFAULT '0',
                     `status` tinyint DEFAULT '1' COMMENT '1待回应 2已回应 3已过期',
+                    `moderation_status` tinyint NOT NULL DEFAULT '1' COMMENT '1正常 2下架（与 lifecycle status 分离）',
                     `expire_at` datetime DEFAULT NULL COMMENT '过期时间（默认24小时）',
                     `created_at` datetime DEFAULT CURRENT_TIMESTAMP,
                     PRIMARY KEY (`id`),
                     KEY `idx_city` (`city`),
                     KEY `idx_status` (`status`),
+                    KEY `idx_moderation_status` (`moderation_status`),
                     KEY `idx_created` (`created_at`)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='纸飞机（漂流瓶）'
             """,
@@ -1390,6 +1502,50 @@ class DatabaseManager:
                     KEY `idx_plane` (`plane_id`),
                     KEY `idx_user` (`user_id`)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='纸飞机回复'
+            """,
+
+            # ============================================
+            # 27b. 纸飞机匿名会话
+            # ============================================
+            'paper_plane_conversation': """
+                CREATE TABLE IF NOT EXISTS `paper_plane_conversation` (
+                    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+                    `plane_id` bigint unsigned NOT NULL,
+                    `owner_id` bigint unsigned NOT NULL COMMENT '纸飞机主人',
+                    `replier_id` bigint unsigned NOT NULL COMMENT '回复者',
+                    `status` tinyint DEFAULT '1' COMMENT '1进行中 2已结束',
+                    `last_message` varchar(200) DEFAULT NULL,
+                    `last_message_at` datetime DEFAULT NULL,
+                    `owner_unread` int DEFAULT '0',
+                    `replier_unread` int DEFAULT '0',
+                    `created_at` datetime DEFAULT CURRENT_TIMESTAMP,
+                    `updated_at` datetime DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    PRIMARY KEY (`id`),
+                    UNIQUE KEY `uk_plane_replier` (`plane_id`,`replier_id`),
+                    KEY `idx_owner` (`owner_id`),
+                    KEY `idx_replier` (`replier_id`),
+                    KEY `idx_last_message` (`last_message_at`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='纸飞机匿名会话'
+            """,
+
+            # ============================================
+            # 27c. 纸飞机匿名会话消息
+            # ============================================
+            'paper_plane_message': """
+                CREATE TABLE IF NOT EXISTS `paper_plane_message` (
+                    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+                    `conversation_id` bigint unsigned NOT NULL,
+                    `from_user_id` bigint unsigned NOT NULL,
+                    `content` text,
+                    `type` tinyint DEFAULT '1' COMMENT '1文本 3语音',
+                    `media_url` varchar(500) DEFAULT NULL,
+                    `voice_duration_sec` int DEFAULT NULL,
+                    `reply_id` bigint unsigned DEFAULT NULL COMMENT '关联首次 paper_plane_reply',
+                    `created_at` datetime DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (`id`),
+                    KEY `idx_conversation` (`conversation_id`),
+                    KEY `idx_from_user` (`from_user_id`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='纸飞机匿名会话消息'
             """,
 
             # ============================================
@@ -2051,10 +2207,28 @@ class DatabaseManager:
         # 兼容已存在的旧库：CREATE TABLE IF NOT EXISTS 不会补齐新增字段。
         self._ensure_required_columns(cursor)
 
+        # 历史发帖作者回填到话题参与表（幂等，可重复执行）
+        self._backfill_topic_participants(cursor)
+
         # 添加外键约束
         self._add_all_foreign_keys(cursor)
 
         logger.info(f"✅ 数据库表结构初始化完成（{len(tables)}张表）")
+
+    def _backfill_topic_participants(self, cursor) -> None:
+        """将 status=1 话题帖作者幂等写入 community_topic_participant。"""
+        cursor.execute(
+            """
+            INSERT IGNORE INTO community_topic_participant (topic_id, user_id, created_at)
+            SELECT p.topic_id, p.user_id, MIN(p.created_at)
+            FROM community_post p
+            INNER JOIN community_topic t ON t.id = p.topic_id AND t.is_active = 1
+            WHERE p.topic_id IS NOT NULL AND p.status = 1
+            GROUP BY p.topic_id, p.user_id
+            """
+        )
+        affected = cursor.rowcount if cursor.rowcount is not None and cursor.rowcount >= 0 else 0
+        logger.info("话题参与回填完成（新增/忽略行数 rowcount=%s）", affected)
 
     def create_test_data(self, cursor, conn) -> int:
         """创建测试数据（可选）"""

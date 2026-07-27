@@ -32,10 +32,18 @@ from app.schemas.community import (
     CommunityTopicJoinResponse,
     CommunityTopicPage,
     CommunityTopicResponse,
+    PaperPlaneConversationResponse,
     PaperPlaneCreate,
+    PaperPlaneMessageCreate,
+    PaperPlaneMessageResponse,
     PaperPlaneReplyCreate,
     PaperPlaneReplyResponse,
     PaperPlaneResponse,
+)
+from app.services.community_media import (
+    assert_owned_media_urls,
+    bind_media,
+    resolve_owned_ready_media,
 )
 from app.services.profile import _calculate_age, _json_list
 
@@ -155,6 +163,62 @@ async def create_post(
     *,
     commit: bool = True,
 ) -> CommunityPostResponse:
+    from app.services.content_filter import assert_text_allowed
+
+    content = (request.content or "").strip()
+    if content:
+        await assert_text_allowed(db, content, field="动态内容")
+
+    image_urls: list[str] = []
+    video_url: str | None = None
+    bind_ids: list[int] = []
+
+    if request.image_media_ids:
+        rows = await resolve_owned_ready_media(
+            db,
+            user_id,
+            list(request.image_media_ids),
+            purpose="post",
+            media_type="image",
+        )
+        image_urls = [str(r["file_url"]) for r in rows]
+        bind_ids = [int(r["id"]) for r in rows]
+    elif request.video_media_id is not None:
+        rows = await resolve_owned_ready_media(
+            db,
+            user_id,
+            [int(request.video_media_id)],
+            purpose="post",
+            media_type="video",
+        )
+        video_url = str(rows[0]["file_url"])
+        bind_ids = [int(rows[0]["id"])]
+    else:
+        # Legacy transition: only controlled owned community_media URLs
+        if request.images:
+            image_rows = await assert_owned_media_urls(
+                db,
+                user_id,
+                list(request.images),
+                purpose="post",
+                media_type="image",
+            )
+            image_urls = [str(r["file_url"]) for r in image_rows]
+            bind_ids.extend(
+                int(r["id"]) for r in image_rows if str(r.get("status") or "") == "ready"
+            )
+        if request.video:
+            video_rows = await assert_owned_media_urls(
+                db,
+                user_id,
+                [request.video],
+                purpose="post",
+                media_type="video",
+            )
+            video_url = str(video_rows[0]["file_url"])
+            if str(video_rows[0].get("status") or "") == "ready":
+                bind_ids.append(int(video_rows[0]["id"]))
+
     if request.topic_id is not None:
         topic = await db.execute(
             text("SELECT id FROM community_topic WHERE id = :topic_id AND is_active = 1"),
@@ -171,17 +235,33 @@ async def create_post(
         {
             "user_id": user_id,
             "topic_id": request.topic_id,
-            "content": request.content,
-            "images": json.dumps(request.images, ensure_ascii=False),
-            "video": request.video,
+            "content": content,
+            "images": json.dumps(image_urls, ensure_ascii=False),
+            "video": video_url,
             "location": request.location,
             "visibility": request.visibility,
             "declaration": request.declaration,
         },
     )
+    post_id = int(result.lastrowid)
+    if bind_ids:
+        await bind_media(
+            db,
+            media_ids=bind_ids,
+            target_type="post",
+            target_id=post_id,
+        )
+    if request.topic_id is not None:
+        await db.execute(
+            text(
+                """INSERT IGNORE INTO community_topic_participant (topic_id, user_id)
+                VALUES (:topic_id, :user_id)"""
+            ),
+            {"topic_id": request.topic_id, "user_id": user_id},
+        )
     if commit:
         await db.commit()
-    return await get_post(db, user_id, int(result.lastrowid))
+    return await get_post(db, user_id, post_id)
 
 
 async def get_post(db: AsyncSession, user_id: int, post_id: int) -> CommunityPostResponse:
@@ -461,11 +541,35 @@ async def list_posts(
 
 async def delete_post(db: AsyncSession, user_id: int, post_id: int) -> None:
     result = await db.execute(
-        text("UPDATE community_post SET status = 3, updated_at = UTC_TIMESTAMP() WHERE id = :post_id AND user_id = :user_id AND status = 1"),
+        text(
+            "UPDATE community_post SET status = 3, updated_at = UTC_TIMESTAMP() "
+            "WHERE id = :post_id AND user_id = :user_id AND status = 1"
+        ),
         {"post_id": post_id, "user_id": user_id},
     )
     if not result.rowcount:
         raise HTTPException(404, detail="动态不存在或无权删除")
+    # Soft-lifecycle attached media: mark deleted for cleanup without clearing post URL fields
+    attached = await db.execute(
+        text(
+            """SELECT media_id FROM community_media_attachment
+            WHERE target_type = 'post' AND target_id = :post_id"""
+        ),
+        {"post_id": post_id},
+    )
+    media_ids = [int(row["media_id"]) for row in attached.mappings().all()]
+    if media_ids:
+        placeholders = ", ".join(f":id{i}" for i in range(len(media_ids)))
+        params = {f"id{i}": mid for i, mid in enumerate(media_ids)}
+        await db.execute(
+            text(
+                f"""UPDATE community_media
+                SET status = 'deleted', deleted_at = UTC_TIMESTAMP()
+                WHERE id IN ({placeholders})
+                  AND deleted_at IS NULL"""
+            ),
+            params,
+        )
     await db.commit()
 
 
@@ -522,6 +626,15 @@ async def collect_post(db: AsyncSession, user_id: int, post_id: int, enabled: bo
     return CommunityCollectResponse(id=post_id, is_collected=liked, collect_count=count)
 
 
+_COMMENT_SELECT = """SELECT c.id, c.post_id, c.user_id, u.nickname, u.avatar, c.parent_id,
+            c.content, c.like_count, c.created_at,
+            EXISTS (
+              SELECT 1 FROM community_like l
+              WHERE l.user_id = :user_id AND l.target_id = c.id AND l.type = 2
+            ) AS is_liked
+            FROM community_comment c JOIN users u ON u.id = c.user_id"""
+
+
 def _comment_response(row: dict[str, Any]) -> CommunityCommentResponse:
     return CommunityCommentResponse(
         id=int(row["id"]),
@@ -532,8 +645,23 @@ def _comment_response(row: dict[str, Any]) -> CommunityCommentResponse:
         parent_id=row.get("parent_id"),
         content=row["content"],
         like_count=int(row.get("like_count") or 0),
+        is_liked=bool(row.get("is_liked")),
         created_at=row["created_at"],
     )
+
+
+async def _get_comment(
+    db: AsyncSession, user_id: int, comment_id: int
+) -> CommunityCommentResponse:
+    result = await db.execute(
+        text(_COMMENT_SELECT + " WHERE c.id = :comment_id AND c.status = 1"),
+        {"user_id": user_id, "comment_id": comment_id},
+    )
+    row = result.mappings().first()
+    if not row:
+        raise HTTPException(404, detail="评论不存在")
+    await get_post(db, user_id, int(row["post_id"]))
+    return _comment_response(dict(row))
 
 
 async def list_comments(
@@ -542,11 +670,15 @@ async def list_comments(
     await get_post(db, user_id, post_id)
     result = await db.execute(
         text(
-            """SELECT c.id, c.post_id, c.user_id, u.nickname, u.avatar, c.parent_id,
-            c.content, c.like_count, c.created_at FROM community_comment c JOIN users u ON u.id = c.user_id
-            WHERE c.post_id = :post_id AND c.status = 1 ORDER BY c.created_at ASC LIMIT :limit OFFSET :offset"""
+            _COMMENT_SELECT
+            + " WHERE c.post_id = :post_id AND c.status = 1 ORDER BY c.created_at ASC LIMIT :limit OFFSET :offset"
         ),
-        {"post_id": post_id, "limit": page_size, "offset": (page - 1) * page_size},
+        {
+            "user_id": user_id,
+            "post_id": post_id,
+            "limit": page_size,
+            "offset": (page - 1) * page_size,
+        },
     )
     return [_comment_response(dict(row)) for row in result.mappings().all()]
 
@@ -559,6 +691,9 @@ async def create_comment(
     *,
     commit: bool = True,
 ) -> CommunityCommentResponse:
+    from app.services.content_filter import assert_text_allowed
+
+    await assert_text_allowed(db, request.content, field="评论内容")
     await get_post(db, user_id, post_id)
     if request.parent_id:
         parent = await db.execute(
@@ -578,17 +713,57 @@ async def create_comment(
             "content": request.content,
         },
     )
-    await db.execute(text("UPDATE community_post SET comment_count = comment_count + 1 WHERE id = :post_id"), {"post_id": post_id})
+    # 与 like_count 一致采用重算而非增量，避免并发/回滚下计数永久漂移
+    await db.execute(
+        text(
+            """UPDATE community_post
+            SET comment_count = (
+              SELECT COUNT(*) FROM community_comment
+              WHERE post_id = :post_id AND status = 1
+            )
+            WHERE id = :post_id"""
+        ),
+        {"post_id": post_id},
+    )
     if commit:
         await db.commit()
     created = await db.execute(
-        text(
-            """SELECT c.id, c.post_id, c.user_id, u.nickname, u.avatar, c.parent_id,
-            c.content, c.like_count, c.created_at FROM community_comment c JOIN users u ON u.id = c.user_id WHERE c.id = :id"""
-        ),
-        {"id": result.lastrowid},
+        text(_COMMENT_SELECT + " WHERE c.id = :id"),
+        {"user_id": user_id, "id": result.lastrowid},
     )
     return _comment_response(dict(created.mappings().one()))
+
+
+async def like_comment(
+    db: AsyncSession, user_id: int, comment_id: int, enabled: bool
+) -> CommunityCommentResponse:
+    await _get_comment(db, user_id, comment_id)
+    if enabled:
+        await db.execute(
+            text(
+                "INSERT IGNORE INTO community_like (user_id, target_id, type) VALUES (:user_id, :comment_id, 2)"
+            ),
+            {"user_id": user_id, "comment_id": comment_id},
+        )
+    else:
+        await db.execute(
+            text(
+                "DELETE FROM community_like WHERE user_id = :user_id AND target_id = :comment_id AND type = 2"
+            ),
+            {"user_id": user_id, "comment_id": comment_id},
+        )
+    await db.execute(
+        text(
+            """UPDATE community_comment
+            SET like_count = (
+              SELECT COUNT(*) FROM community_like WHERE target_id = :comment_id AND type = 2
+            )
+            WHERE id = :comment_id"""
+        ),
+        {"comment_id": comment_id},
+    )
+    await db.commit()
+    return await _get_comment(db, user_id, comment_id)
 
 
 async def delete_comment(db: AsyncSession, user_id: int, comment_id: int) -> None:
@@ -600,8 +775,16 @@ async def delete_comment(db: AsyncSession, user_id: int, comment_id: int) -> Non
     if not row:
         raise HTTPException(404, detail="评论不存在或无权删除")
     await db.execute(text("UPDATE community_comment SET status = 2 WHERE id = :comment_id"), {"comment_id": comment_id})
+    # 与 create_comment 一致采用重算，避免增量式计数漂移
     await db.execute(
-        text("UPDATE community_post SET comment_count = GREATEST(comment_count - 1, 0) WHERE id = :post_id"),
+        text(
+            """UPDATE community_post
+            SET comment_count = (
+              SELECT COUNT(*) FROM community_comment
+              WHERE post_id = :post_id AND status = 1
+            )
+            WHERE id = :post_id"""
+        ),
         {"post_id": row["post_id"]},
     )
     await db.commit()
@@ -626,9 +809,10 @@ def _topic_response(row: dict[str, Any]) -> CommunityTopicResponse:
 
 _TOPIC_SELECT = """SELECT t.id, t.name, t.icon, t.sort, t.created_at,
     (SELECT COUNT(*) FROM community_post p WHERE p.topic_id = t.id AND p.status = 1) AS post_count,
-    (SELECT COUNT(DISTINCT p.user_id) FROM community_post p WHERE p.topic_id = t.id AND p.status = 1) AS participant_count,
+    (SELECT COUNT(*) FROM community_topic_participant tp WHERE tp.topic_id = t.id) AS participant_count,
     EXISTS (
-      SELECT 1 FROM community_post p WHERE p.topic_id = t.id AND p.user_id = :user_id AND p.status = 1
+      SELECT 1 FROM community_topic_participant tp
+      WHERE tp.topic_id = t.id AND tp.user_id = :user_id
     ) AS joined
     FROM community_topic t
     WHERE t.is_active = 1"""
@@ -700,10 +884,50 @@ async def get_topic_detail(
     return CommunityTopicDetailResponse(topic=topic, posts=posts, sort=sort)
 
 
+async def _topic_participant_count(db: AsyncSession, topic_id: int) -> int:
+    result = await db.execute(
+        text("SELECT COUNT(*) FROM community_topic_participant WHERE topic_id = :topic_id"),
+        {"topic_id": topic_id},
+    )
+    return int(result.scalar() or 0)
+
+
 async def join_topic(db: AsyncSession, user_id: int, topic_id: int) -> CommunityTopicJoinResponse:
     await get_topic(db, user_id, topic_id)
-    # 无独立参与表：以是否发过该话题动态作为 joined 语义；join 接口幂等成功
-    return CommunityTopicJoinResponse(success=True, joined=True, topic_id=topic_id)
+    await db.execute(
+        text(
+            """INSERT IGNORE INTO community_topic_participant (topic_id, user_id)
+            VALUES (:topic_id, :user_id)"""
+        ),
+        {"topic_id": topic_id, "user_id": user_id},
+    )
+    await db.commit()
+    count = await _topic_participant_count(db, topic_id)
+    return CommunityTopicJoinResponse(
+        success=True,
+        joined=True,
+        topic_id=topic_id,
+        participant_count=count,
+    )
+
+
+async def leave_topic(db: AsyncSession, user_id: int, topic_id: int) -> CommunityTopicJoinResponse:
+    await get_topic(db, user_id, topic_id)
+    await db.execute(
+        text(
+            """DELETE FROM community_topic_participant
+            WHERE topic_id = :topic_id AND user_id = :user_id"""
+        ),
+        {"topic_id": topic_id, "user_id": user_id},
+    )
+    await db.commit()
+    count = await _topic_participant_count(db, topic_id)
+    return CommunityTopicJoinResponse(
+        success=True,
+        joined=False,
+        topic_id=topic_id,
+        participant_count=count,
+    )
 
 
 def _activity_response(row: dict[str, Any], *, reveal_address: bool) -> ActivityResponse:
@@ -1097,14 +1321,17 @@ def list_report_reasons() -> list[dict[str, str]]:
 
 
 async def _paper_response(row: dict[str, Any]) -> PaperPlaneResponse:
+    duration = row.get("voice_duration_sec")
     return PaperPlaneResponse(
         id=int(row["id"]),
-        content=row["content"],
+        content=row["content"] or "",
         images=_json_values(row.get("images")),
         city=row.get("city"),
         tags=_json_values(row.get("tags")),
         is_anonymous=bool(row["is_anonymous"]),
         reply_count=int(row.get("reply_count") or 0),
+        voice_url=row.get("voice_url"),
+        voice_duration_sec=int(duration) if duration is not None else None,
         created_at=row["created_at"],
     )
 
@@ -1116,6 +1343,10 @@ async def _refund_quota_after_failure(key: str) -> None:
         logger.exception("Failed to refund daily quota after database failure")
 
 
+_PAPER_SELECT = """SELECT id, content, images, city, tags, is_anonymous,
+                reply_count, voice_url, voice_duration_sec, created_at FROM paper_plane"""
+
+
 async def create_paper_plane(
     db: AsyncSession,
     user_id: int,
@@ -1125,6 +1356,36 @@ async def create_paper_plane(
     quota_key: str | None = None,
 ) -> PaperPlaneResponse:
     from app.core.redis import daily_quota_key
+    from app.services.content_filter import assert_text_allowed
+
+    content = (request.content or "").strip()
+    if content:
+        await assert_text_allowed(db, content, field="纸飞机内容")
+
+    image_urls: list[str] = []
+    bind_ids: list[int] = []
+    if request.image_media_ids:
+        rows = await resolve_owned_ready_media(
+            db,
+            user_id,
+            list(request.image_media_ids),
+            purpose="paper_plane",
+            media_type="image",
+        )
+        image_urls = [str(r["file_url"]) for r in rows]
+        bind_ids = [int(r["id"]) for r in rows]
+    elif request.images:
+        image_rows = await assert_owned_media_urls(
+            db,
+            user_id,
+            list(request.images),
+            purpose="paper_plane",
+            media_type="image",
+        )
+        image_urls = [str(r["file_url"]) for r in image_rows]
+        bind_ids = [
+            int(r["id"]) for r in image_rows if str(r.get("status") or "") == "ready"
+        ]
 
     key = quota_key or daily_quota_key("paper-plane", user_id)
     if not await consume_daily(key, 3):
@@ -1133,28 +1394,40 @@ async def create_paper_plane(
     try:
         result = await db.execute(
             text(
-                """INSERT INTO paper_plane (user_id, content, images, city, tags, is_anonymous, expire_at)
-                VALUES (:user_id, :content, :images, :city, :tags, :is_anonymous, :expire_at)"""
+                """INSERT INTO paper_plane (
+                    user_id, content, images, city, tags, is_anonymous,
+                    voice_url, voice_duration_sec, expire_at
+                ) VALUES (
+                    :user_id, :content, :images, :city, :tags, :is_anonymous,
+                    :voice_url, :voice_duration_sec, :expire_at
+                )"""
             ),
             {
                 "user_id": user_id,
-                "content": request.content,
-                "images": json.dumps(request.images, ensure_ascii=False),
+                "content": content,
+                "images": json.dumps(image_urls, ensure_ascii=False),
                 "city": request.city,
                 "tags": json.dumps(request.tags, ensure_ascii=False),
                 "is_anonymous": int(request.is_anonymous),
+                "voice_url": request.voice_url,
+                "voice_duration_sec": request.voice_duration_sec,
                 "expire_at": datetime.now(UTC).replace(tzinfo=None) + timedelta(hours=24),
             },
         )
+        plane_id = int(result.lastrowid)
+        if bind_ids:
+            await bind_media(
+                db,
+                media_ids=bind_ids,
+                target_type="paper_plane",
+                target_id=plane_id,
+            )
         if commit:
             await db.commit()
             committed = True
         created = await db.execute(
-            text(
-                """SELECT id, content, images, city, tags, is_anonymous,
-                reply_count, created_at FROM paper_plane WHERE id = :id"""
-            ),
-            {"id": result.lastrowid},
+            text(_PAPER_SELECT + " WHERE id = :id"),
+            {"id": plane_id},
         )
         return await _paper_response(dict(created.mappings().one()))
     except Exception:
@@ -1175,13 +1448,110 @@ async def list_paper_planes(db: AsyncSession, user_id: int, page: int, page_size
     )
     result = await db.execute(
         text(
-            f"""SELECT p.id, p.content, p.images, p.city, p.tags, p.is_anonymous, p.reply_count, p.created_at
-            FROM paper_plane p WHERE {own_clause} AND p.status = 1 AND (p.expire_at IS NULL OR p.expire_at > UTC_TIMESTAMP())
+            f"""SELECT p.id, p.content, p.images, p.city, p.tags, p.is_anonymous, p.reply_count,
+            p.voice_url, p.voice_duration_sec, p.created_at
+            FROM paper_plane p
+            WHERE {own_clause}
+              AND p.status = 1
+              AND COALESCE(p.moderation_status, 1) = 1
+              AND (p.expire_at IS NULL OR p.expire_at > UTC_TIMESTAMP())
             ORDER BY p.created_at DESC LIMIT :limit OFFSET :offset"""
         ),
         {"user_id": user_id, "limit": page_size, "offset": (page - 1) * page_size},
     )
     return [await _paper_response(dict(row)) for row in result.mappings().all()]
+
+
+def _conversation_response(row: dict[str, Any], viewer_id: int) -> PaperPlaneConversationResponse:
+    owner_id = int(row["owner_id"])
+    replier_id = int(row["replier_id"])
+    if viewer_id == owner_id:
+        unread = int(row.get("owner_unread") or 0)
+        peer_label = "匿名回复者"
+    else:
+        unread = int(row.get("replier_unread") or 0)
+        peer_label = "纸飞机主人"
+    return PaperPlaneConversationResponse(
+        id=int(row["id"]),
+        plane_id=int(row["plane_id"]),
+        owner_id=owner_id,
+        replier_id=replier_id,
+        status=int(row["status"]),
+        last_message=row.get("last_message"),
+        last_message_at=row.get("last_message_at"),
+        unread_count=unread,
+        plane_content=row.get("plane_content"),
+        peer_label=peer_label,
+        created_at=row["created_at"],
+    )
+
+
+async def _get_or_create_plane_conversation(
+    db: AsyncSession,
+    *,
+    plane_id: int,
+    owner_id: int,
+    replier_id: int,
+    first_message: str,
+    reply_id: int | None = None,
+) -> int:
+    existing = await db.execute(
+        text(
+            """SELECT id FROM paper_plane_conversation
+            WHERE plane_id = :plane_id AND replier_id = :replier_id LIMIT 1"""
+        ),
+        {"plane_id": plane_id, "replier_id": replier_id},
+    )
+    row = existing.mappings().first()
+    if row:
+        conversation_id = int(row["id"])
+    else:
+        created = await db.execute(
+            text(
+                """INSERT INTO paper_plane_conversation (
+                    plane_id, owner_id, replier_id, status, last_message, last_message_at,
+                    owner_unread, replier_unread
+                ) VALUES (
+                    :plane_id, :owner_id, :replier_id, 1, :last_message, UTC_TIMESTAMP(),
+                    1, 0
+                )"""
+            ),
+            {
+                "plane_id": plane_id,
+                "owner_id": owner_id,
+                "replier_id": replier_id,
+                "last_message": first_message[:200],
+            },
+        )
+        conversation_id = int(created.lastrowid)
+    await db.execute(
+        text(
+            """INSERT INTO paper_plane_message (
+                conversation_id, from_user_id, content, type, reply_id
+            ) VALUES (
+                :conversation_id, :from_user_id, :content, 1, :reply_id
+            )"""
+        ),
+        {
+            "conversation_id": conversation_id,
+            "from_user_id": replier_id,
+            "content": first_message,
+            "reply_id": reply_id,
+        },
+    )
+    if row:
+        await db.execute(
+            text(
+                """UPDATE paper_plane_conversation
+                SET last_message = :last_message,
+                    last_message_at = UTC_TIMESTAMP(),
+                    owner_unread = owner_unread + 1,
+                    status = CASE WHEN status = 2 THEN 1 ELSE status END
+                WHERE id = :id"""
+            ),
+            {"id": conversation_id, "last_message": first_message[:200]},
+        )
+    return conversation_id
 
 
 async def reply_paper_plane(
@@ -1192,9 +1562,16 @@ async def reply_paper_plane(
     *,
     commit: bool = True,
 ) -> PaperPlaneReplyResponse:
+    from app.services.content_filter import assert_text_allowed
+
+    await assert_text_allowed(db, request.content, field="纸飞机回复")
     result = await db.execute(
         text(
-            "SELECT id, user_id FROM paper_plane WHERE id = :plane_id AND status = 1 AND (expire_at IS NULL OR expire_at > UTC_TIMESTAMP())"
+            """SELECT id, user_id FROM paper_plane
+            WHERE id = :plane_id
+              AND status = 1
+              AND COALESCE(moderation_status, 1) = 1
+              AND (expire_at IS NULL OR expire_at > UTC_TIMESTAMP())"""
         ),
         {"plane_id": plane_id},
     )
@@ -1214,16 +1591,229 @@ async def reply_paper_plane(
             "is_anonymous": int(request.is_anonymous),
         },
     )
+    reply_id = int(result.lastrowid)
     await db.execute(
         text(
             "UPDATE paper_plane SET reply_count = reply_count + 1, status = CASE WHEN reply_count + 1 >= 5 THEN 2 ELSE 1 END WHERE id = :plane_id"
         ),
         {"plane_id": plane_id},
     )
+    conversation_id = await _get_or_create_plane_conversation(
+        db,
+        plane_id=plane_id,
+        owner_id=int(plane["user_id"]),
+        replier_id=user_id,
+        first_message=request.content,
+        reply_id=reply_id,
+    )
     if commit:
         await db.commit()
     created = await db.execute(
         text("SELECT id, plane_id, user_id, content, is_anonymous, created_at FROM paper_plane_reply WHERE id = :id"),
+        {"id": reply_id},
+    )
+    payload = dict(created.mappings().one())
+    return PaperPlaneReplyResponse(
+        id=int(payload["id"]),
+        plane_id=int(payload["plane_id"]),
+        user_id=int(payload["user_id"]),
+        content=payload["content"],
+        is_anonymous=bool(payload["is_anonymous"]),
+        conversation_id=conversation_id,
+        created_at=payload["created_at"],
+    )
+
+
+async def list_paper_plane_conversations(
+    db: AsyncSession, user_id: int, page: int, page_size: int
+) -> list[PaperPlaneConversationResponse]:
+    result = await db.execute(
+        text(
+            """SELECT c.id, c.plane_id, c.owner_id, c.replier_id, c.status,
+            c.last_message, c.last_message_at, c.owner_unread, c.replier_unread,
+            c.created_at, p.content AS plane_content
+            FROM paper_plane_conversation c
+            JOIN paper_plane p ON p.id = c.plane_id
+            WHERE c.owner_id = :user_id OR c.replier_id = :user_id
+            ORDER BY COALESCE(c.last_message_at, c.created_at) DESC, c.id DESC
+            LIMIT :limit OFFSET :offset"""
+        ),
+        {"user_id": user_id, "limit": page_size, "offset": (page - 1) * page_size},
+    )
+    return [_conversation_response(dict(row), user_id) for row in result.mappings().all()]
+
+
+async def _require_plane_conversation(
+    db: AsyncSession, user_id: int, conversation_id: int
+) -> dict[str, Any]:
+    result = await db.execute(
+        text(
+            """SELECT id, plane_id, owner_id, replier_id, status, last_message, last_message_at,
+            owner_unread, replier_unread, created_at
+            FROM paper_plane_conversation WHERE id = :id"""
+        ),
+        {"id": conversation_id},
+    )
+    row = result.mappings().first()
+    if not row:
+        raise HTTPException(404, detail="纸飞机会话不存在")
+    if user_id not in (int(row["owner_id"]), int(row["replier_id"])):
+        raise HTTPException(403, detail="无权访问该纸飞机会话")
+    return dict(row)
+
+
+async def list_paper_plane_messages(
+    db: AsyncSession, user_id: int, conversation_id: int, page: int, page_size: int
+) -> list[PaperPlaneMessageResponse]:
+    await _require_plane_conversation(db, user_id, conversation_id)
+    result = await db.execute(
+        text(
+            """SELECT id, conversation_id, from_user_id, content, type, media_url,
+            voice_duration_sec, created_at
+            FROM paper_plane_message
+            WHERE conversation_id = :conversation_id
+            ORDER BY created_at DESC, id DESC
+            LIMIT :limit OFFSET :offset"""
+        ),
+        {
+            "conversation_id": conversation_id,
+            "limit": page_size,
+            "offset": (page - 1) * page_size,
+        },
+    )
+    items: list[PaperPlaneMessageResponse] = []
+    for row in result.mappings().all():
+        duration = row.get("voice_duration_sec")
+        items.append(
+            PaperPlaneMessageResponse(
+                id=int(row["id"]),
+                conversation_id=int(row["conversation_id"]),
+                from_user_id=int(row["from_user_id"]),
+                content=row["content"] or "",
+                type=int(row["type"]),
+                media_url=row.get("media_url"),
+                voice_duration_sec=int(duration) if duration is not None else None,
+                created_at=row["created_at"],
+            )
+        )
+    return items
+
+
+async def send_paper_plane_message(
+    db: AsyncSession,
+    user_id: int,
+    conversation_id: int,
+    request: PaperPlaneMessageCreate,
+    *,
+    commit: bool = True,
+) -> PaperPlaneMessageResponse:
+    from app.services.content_filter import assert_text_allowed
+
+    # 文本消息过滤敏感词；语音消息（type=3）content 为空，无需过滤
+    if request.type == 1 and (request.content or "").strip():
+        await assert_text_allowed(db, request.content, field="会话消息")
+
+    conv = await _require_plane_conversation(db, user_id, conversation_id)
+    if int(conv["status"]) != 1:
+        raise HTTPException(422, detail="对话已结束")
+    preview = request.content if request.type == 1 else "[语音]"
+    result = await db.execute(
+        text(
+            """INSERT INTO paper_plane_message (
+                conversation_id, from_user_id, content, type, media_url, voice_duration_sec
+            ) VALUES (
+                :conversation_id, :from_user_id, :content, :type, :media_url, :voice_duration_sec
+            )"""
+        ),
+        {
+            "conversation_id": conversation_id,
+            "from_user_id": user_id,
+            "content": request.content or "",
+            "type": int(request.type),
+            "media_url": request.media_url,
+            "voice_duration_sec": request.voice_duration_sec,
+        },
+    )
+    if user_id == int(conv["owner_id"]):
+        unread_sql = "replier_unread = replier_unread + 1"
+    else:
+        unread_sql = "owner_unread = owner_unread + 1"
+    await db.execute(
+        text(
+            f"""UPDATE paper_plane_conversation
+            SET last_message = :last_message, last_message_at = UTC_TIMESTAMP(), {unread_sql}
+            WHERE id = :id"""
+        ),
+        {"id": conversation_id, "last_message": preview[:200]},
+    )
+    if commit:
+        await db.commit()
+    created = await db.execute(
+        text(
+            """SELECT id, conversation_id, from_user_id, content, type, media_url,
+            voice_duration_sec, created_at FROM paper_plane_message WHERE id = :id"""
+        ),
         {"id": result.lastrowid},
     )
-    return PaperPlaneReplyResponse(**created.mappings().one())
+    row = created.mappings().one()
+    duration = row.get("voice_duration_sec")
+    return PaperPlaneMessageResponse(
+        id=int(row["id"]),
+        conversation_id=int(row["conversation_id"]),
+        from_user_id=int(row["from_user_id"]),
+        content=row["content"] or "",
+        type=int(row["type"]),
+        media_url=row.get("media_url"),
+        voice_duration_sec=int(duration) if duration is not None else None,
+        created_at=row["created_at"],
+    )
+
+
+async def read_paper_plane_conversation(
+    db: AsyncSession, user_id: int, conversation_id: int
+) -> PaperPlaneConversationResponse:
+    conv = await _require_plane_conversation(db, user_id, conversation_id)
+    if user_id == int(conv["owner_id"]):
+        field = "owner_unread = 0"
+    else:
+        field = "replier_unread = 0"
+    await db.execute(
+        text(f"UPDATE paper_plane_conversation SET {field} WHERE id = :id"),
+        {"id": conversation_id},
+    )
+    await db.commit()
+    result = await db.execute(
+        text(
+            """SELECT c.id, c.plane_id, c.owner_id, c.replier_id, c.status,
+            c.last_message, c.last_message_at, c.owner_unread, c.replier_unread,
+            c.created_at, p.content AS plane_content
+            FROM paper_plane_conversation c
+            JOIN paper_plane p ON p.id = c.plane_id
+            WHERE c.id = :id"""
+        ),
+        {"id": conversation_id},
+    )
+    return _conversation_response(dict(result.mappings().one()), user_id)
+
+
+async def end_paper_plane_conversation(
+    db: AsyncSession, user_id: int, conversation_id: int
+) -> PaperPlaneConversationResponse:
+    await _require_plane_conversation(db, user_id, conversation_id)
+    await db.execute(
+        text("UPDATE paper_plane_conversation SET status = 2 WHERE id = :id"),
+        {"id": conversation_id},
+    )
+    await db.commit()
+    result = await db.execute(
+        text(
+            """SELECT c.id, c.plane_id, c.owner_id, c.replier_id, c.status,
+            c.last_message, c.last_message_at, c.owner_unread, c.replier_unread,
+            c.created_at, p.content AS plane_content
+            FROM paper_plane_conversation c
+            JOIN paper_plane p ON p.id = c.plane_id
+            WHERE c.id = :id"""
+        ),
+        {"id": conversation_id},
+    )
+    return _conversation_response(dict(result.mappings().one()), user_id)

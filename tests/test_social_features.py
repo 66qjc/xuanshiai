@@ -61,6 +61,7 @@ def test_social_routes_are_registered_and_require_authentication() -> None:
     assert "/api/v1/notifications" in paths
     assert "/api/v1/security/reports/{target_id}" in paths
     assert "/api/v1/admin/media/{media_id}/review" in paths
+    assert "/api/v1/admin/reports" in paths
     assert "/api/v1/admin/reports/{report_id}/review" in paths
     assert "/api/v1/admin/users/{user_id}/certifications/{kind}/review" in paths
 

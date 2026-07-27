@@ -158,6 +158,8 @@ class ReportRequest(BaseModel):
 class ReportResponse(BaseModel):
     id: int
     target_user_id: int
+    target_type: Literal["user", "post", "comment", "paper_plane"] = "user"
+    target_id: int | None = None
     type: str
     status: Literal[0, 1, 2]
     created_at: datetime

@@ -402,14 +402,25 @@ async def community_database() -> CommunityDatabaseHarness:
 
 
 def route_dependencies(path: str, method: str) -> set[object]:
-    route = next(
-        context
-        for included in app.routes
-        if hasattr(included, "effective_route_contexts")
-        for context in included.effective_route_contexts()
-        if context.path == path and method in context.methods
-    )
-    return {dependency.call for dependency in route.dependant.dependencies}
+    method_u = method.upper()
+    matches = []
+    for route in app.routes:
+        route_path = getattr(route, "path", None)
+        methods = getattr(route, "methods", None) or set()
+        if route_path == path and method_u in {m.upper() for m in methods}:
+            matches.append(route)
+        for child in getattr(route, "routes", []) or []:
+            child_path = getattr(child, "path", None)
+            child_methods = getattr(child, "methods", None) or set()
+            if child_path == path and method_u in {m.upper() for m in child_methods}:
+                matches.append(child)
+    if not matches:
+        raise AssertionError(f"route not found: {method_u} {path}")
+    route = matches[0]
+    dependant = getattr(route, "dependant", None)
+    if dependant is None:
+        raise AssertionError(f"route has no dependant: {method_u} {path}")
+    return {dependency.call for dependency in dependant.dependencies}
 
 
 def test_community_content_limits() -> None:
@@ -468,6 +479,7 @@ def test_primary_community_and_social_docs_match_current_contracts() -> None:
         "#### `GET /api/v1/community/topics/{topic_id}/detail`", 1
     )[1].split("### 7.4", 1)[0]
     primary_quotas = community_primary.split("### 9.2", 1)[1].split("### 9.3", 1)[0]
+    primary_media = community_primary.split("## 11.", 1)[1]
 
     assert "当前未提供话题查询接口" not in community_primary
     assert "`latest` / `following` / `city` / `liked_users` / `following_and_liked`" in primary_feed
@@ -475,6 +487,15 @@ def test_primary_community_and_social_docs_match_current_contracts() -> None:
     assert '"posts":[]' not in primary_topic_detail
     assert '"points_available":false' in primary_quotas
     assert '"points_available":true' not in primary_quotas
+
+    # Community media upload contracts (Task 4)
+    assert "POST /api/v1/community/media/uploads" in primary_media
+    assert "DELETE /api/v1/community/media/{media_id}" in primary_media
+    assert "image_media_ids" in community_primary
+    assert "video_media_id" in community_primary
+    assert "cleanup_expired_unbound_media" in primary_media
+    assert "`ready`" in primary_media and "`bound`" in primary_media
+    assert "multipart/form-data" in primary_media
 
     social_docs = Path("docs/api/social.md").read_text(encoding="utf-8")
     likes = social_docs.split("### 2.1", 1)[1].split("### 2.2", 1)[0]
@@ -1447,9 +1468,17 @@ async def test_paper_plane_rollback_failure_preserves_database_error_and_attempt
     async def refund(key: str) -> None:
         refund_calls.append(key)
 
+    async def allow_text(*_args: object, **_kwargs: object) -> None:
+        return None
+
     monkeypatch.setattr(community_service, "consume_daily", consume)
     monkeypatch.setattr(community_service, "refund_daily", refund)
+    monkeypatch.setattr(
+        "app.services.content_filter.assert_text_allowed",
+        allow_text,
+    )
 
+    # content_filter is patched; first DB call is INSERT and should raise database_error.
     with pytest.raises(RuntimeError, match="paper-plane insert failed"):
         await community_service.create_paper_plane(
             RollbackFailingSession(database_error),
