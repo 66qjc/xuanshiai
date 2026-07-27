@@ -58,6 +58,7 @@ def test_matchmaker_routes_are_registered_and_require_authentication() -> None:
     assert "/api/v1/matchmaker/service-requests/{service_id}/contact" in paths
     assert "/api/v1/matchmaker/service-requests/{service_id}/contact-exchanges" in paths
     assert "/api/v1/matchmaker/service-requests/contact-exchanges/{exchange_id}" in paths
+    assert "/api/v1/matchmaker/service-requests/contact-exchanges/{exchange_id}/contacts" in paths
     assert "/api/v1/admin/matchmaker/service-requests" in paths
     assert client.post(
         "/api/v1/matchmaker/service-requests",

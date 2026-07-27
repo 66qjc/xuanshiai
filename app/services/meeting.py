@@ -19,6 +19,7 @@ from app.schemas.meeting import (
     MeetingScheduleCreate,
     MeetingStatusUpdate,
 )
+from app.services.social import ensure_users_can_interact
 
 
 def _dt(value: Any) -> datetime:
@@ -54,6 +55,8 @@ async def create_matchmaker_meeting_request(
     target = await db.execute(text("SELECT id FROM users WHERE id = :id AND status = 1"), {"id": request.target_user_id})
     if not target.scalar():
         raise HTTPException(404, detail="约见对象不存在或不可用")
+    await ensure_users_can_interact(db, int(service["user_id"]), request.target_user_id)
+    await ensure_users_can_interact(db, current.id, request.target_user_id)
     duplicate = await db.execute(text("""SELECT id FROM meeting_request
         WHERE user_id = :user_id AND target_user_id = :target_id
           AND status IN ('SUBMITTED', 'CONTACTED', 'ACCEPTED') LIMIT 1"""), {

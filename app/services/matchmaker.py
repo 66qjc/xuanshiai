@@ -19,6 +19,7 @@ from app.schemas.matchmaker import (
     MatchmakerPage,
     MatchmakerContactResponse,
     MatchmakerContactExchangeCreate,
+    MatchmakerContactExchangeContactsResponse,
     MatchmakerContactExchangeResponse,
     MatchmakerContactExchangeUpdate,
     MatchmakerContactUpdate,
@@ -32,6 +33,7 @@ from app.schemas.matchmaker import (
     MatchmakerServiceRequestResponse,
     MatchmakerServiceRequestUpdate,
 )
+from app.services.social import ensure_users_can_interact
 
 
 def _datetime(value: Any) -> datetime:
@@ -239,6 +241,7 @@ async def create_service_order(
           AND app.status = 1"""), {"matchmaker_id": request.matchmaker_id})
     if not target.scalar():
         raise HTTPException(404, detail="服务红娘不存在或暂不可用")
+    await ensure_users_can_interact(db, current.id, request.matchmaker_id)
     product = await db.execute(text("""SELECT id, name, service_type, price FROM matchmaker_service_product
         WHERE id = :id AND status = 1 AND service_type IN (1, 3)"""), {"id": request.product_id})
     product_row = product.mappings().first()
@@ -337,12 +340,18 @@ async def activate_paid_service_order(db: AsyncSession, order_id: int) -> int:
 async def create_service_request(
     db: AsyncSession, current: CurrentUser, request: MatchmakerServiceRequestCreate
 ) -> MatchmakerServiceRequestResponse:
-    order_result = await db.execute(text("SELECT id, user_id, status, service_request_id FROM payment_order WHERE order_no = :order_no FOR UPDATE"), {"order_no": request.order_no})
+    order_result = await db.execute(text("""SELECT id, user_id, status, service_request_id,
+        service_requirement FROM payment_order WHERE order_no = :order_no FOR UPDATE"""), {"order_no": request.order_no})
     order = order_result.mappings().first()
     if not order or int(order["user_id"]) != current.id:
         raise HTTPException(404, detail="红娘服务订单不存在")
     if order["status"] != 1:
         raise HTTPException(409, detail="红娘服务订单尚未支付成功")
+    if order["service_requirement"] and order["service_requirement"] != request.requirement:
+        raise HTTPException(409, detail="服务需求与订单需求不一致，请重新提交")
+    if not order["service_requirement"]:
+        await db.execute(text("""UPDATE payment_order SET service_requirement = :requirement
+            WHERE id = :id"""), {"requirement": request.requirement, "id": order["id"]})
     await activate_paid_service_order(db, int(order["id"]))
     await db.commit()
     created = await db.execute(text(f"{SERVICE_SELECT} WHERE order_id = :order_id"), {"order_id": order["id"]})
@@ -416,6 +425,8 @@ async def create_contact_exchange(
         raise HTTPException(409, detail="当前服务状态不能发起联系方式交换")
     if request.target_user_id == service["user_id"]:
         raise HTTPException(422, detail="不能将服务用户作为联系方式交换对象")
+    await ensure_users_can_interact(db, int(service["user_id"]), request.target_user_id)
+    await ensure_users_can_interact(db, current.id, request.target_user_id)
     target = await db.execute(text("SELECT id FROM users WHERE id = :id AND status = 1"), {"id": request.target_user_id})
     if not target.scalar():
         raise HTTPException(404, detail="联系方式交换对象不存在或不可用")
@@ -459,9 +470,18 @@ async def update_contact_exchange(
     else:
         column = "source_consented_at" if current.id == row["source_user_id"] else "target_consented_at"
         await db.execute(text(f"""UPDATE matchmaker_contact_exchange SET {column} = COALESCE({column}, UTC_TIMESTAMP()),
-            status = CASE WHEN source_consented_at IS NOT NULL AND target_consented_at IS NOT NULL
-                THEN 'APPROVED' ELSE 'ONE_SIDE_CONSENT' END, updated_at = UTC_TIMESTAMP()
-            WHERE id = :id AND status NOT IN ('REVOKED', 'HIDDEN')"""), {"id": exchange_id})
+            updated_at = UTC_TIMESTAMP()
+            WHERE id = :id AND status NOT IN ('REVOKED', 'HIDDEN', 'DELIVERED')"""), {"id": exchange_id})
+        consented = await db.execute(text("""SELECT source_consented_at, target_consented_at
+            FROM matchmaker_contact_exchange WHERE id = :id FOR UPDATE"""), {"id": exchange_id})
+        consented_row = consented.mappings().one()
+        if consented_row["source_consented_at"] and consented_row["target_consented_at"]:
+            await db.execute(text("""UPDATE matchmaker_contact_exchange SET status = 'DELIVERED',
+                delivered_at = COALESCE(delivered_at, UTC_TIMESTAMP()), updated_at = UTC_TIMESTAMP()
+                WHERE id = :id"""), {"id": exchange_id})
+        else:
+            await db.execute(text("""UPDATE matchmaker_contact_exchange SET status = 'ONE_SIDE_CONSENT',
+                updated_at = UTC_TIMESTAMP() WHERE id = :id AND status NOT IN ('REVOKED', 'HIDDEN')"""), {"id": exchange_id})
     await db.commit()
     result = await db.execute(text("""SELECT id, service_id, source_user_id, target_user_id,
         status, source_consented_at, target_consented_at, delivered_at, hidden_at, hidden_reason,
@@ -482,6 +502,34 @@ async def get_contact_exchange(
     if not row:
         raise HTTPException(404, detail="联系方式交换不存在或无权查看")
     return _exchange_response(row)
+
+
+async def get_contact_exchange_contacts(
+    db: AsyncSession, current: CurrentUser, exchange_id: int
+) -> MatchmakerContactExchangeContactsResponse:
+    result = await db.execute(text("""SELECT e.id, e.source_user_id, e.target_user_id, e.status,
+        e.delivered_at, source.phone AS source_phone, target.phone AS target_phone
+        FROM matchmaker_contact_exchange e
+        JOIN users source ON source.id = e.source_user_id
+        JOIN users target ON target.id = e.target_user_id
+        WHERE e.id = :id AND (e.source_user_id = :user_id OR e.target_user_id = :user_id)"""), {
+        "id": exchange_id, "user_id": current.id,
+    })
+    row = result.mappings().first()
+    if not row:
+        raise HTTPException(404, detail="联系方式交换不存在或无权查看")
+    if row["status"] != "DELIVERED" or not row["delivered_at"]:
+        raise HTTPException(409, detail="双方尚未完成联系方式授权")
+    await db.execute(text("""INSERT INTO business_audit_log
+        (actor_user_id, action, resource_type, resource_id, reason)
+        VALUES (:actor_id, 'matchmaker_contact_exchange.view', 'matchmaker_contact_exchange', :exchange_id,
+            '用户查看已授权联系方式')"""), {"actor_id": current.id, "exchange_id": exchange_id})
+    await db.commit()
+    return MatchmakerContactExchangeContactsResponse(
+        exchange_id=int(row["id"]), source_user_id=int(row["source_user_id"]),
+        target_user_id=int(row["target_user_id"]), source_phone=row["source_phone"],
+        target_phone=row["target_phone"], delivered_at=_datetime(row["delivered_at"]),
+    )
 
 
 async def list_service_requests(
@@ -511,7 +559,8 @@ async def update_service_request(
         raise HTTPException(404, detail="牵线申请不存在")
     if row["matchmaker_id"] != current.id:
         raise HTTPException(403, detail="只有被分配的服务红娘可以处理申请")
-    if row["status"] not in (0, 1):
+    allowed_transitions = {0: {1, 3}, 1: {2, 3}}
+    if request.status not in allowed_transitions.get(int(row["status"]), set()):
         raise HTTPException(409, detail="当前牵线申请状态不能继续处理")
     start_at = "start_at = COALESCE(start_at, UTC_TIMESTAMP())," if request.status == 1 else ""
     end_at = "end_at = UTC_TIMESTAMP()," if request.status in (2, 3) else ""
@@ -553,6 +602,9 @@ async def admin_update_service_request(db: AsyncSession, admin_id: int, service_
         updates.append("matchmaker_id = :matchmaker_id")
         params["matchmaker_id"] = request.matchmaker_id
     if request.status is not None:
+        allowed_transitions = {0: {1, 3}, 1: {2, 3}}
+        if request.status not in allowed_transitions.get(int(row["status"]), set()):
+            raise HTTPException(409, detail="当前牵线申请状态不能继续变更")
         updates.append("status = :status")
         params["status"] = request.status
         if request.status == 1:
