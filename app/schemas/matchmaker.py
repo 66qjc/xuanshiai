@@ -152,6 +152,15 @@ class MatchmakerContactExchangeResponse(BaseModel):
     updated_at: datetime
 
 
+class MatchmakerContactExchangeContactsResponse(BaseModel):
+    exchange_id: int
+    source_user_id: int
+    target_user_id: int
+    source_phone: str
+    target_phone: str
+    delivered_at: datetime
+
+
 class MatchmakerServiceRequestPage(BaseModel):
     items: list[MatchmakerServiceRequestResponse]
     page: int

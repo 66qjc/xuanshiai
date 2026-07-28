@@ -321,12 +321,51 @@ class RegistrationIntentUpdate(BaseModel):
     source: Literal["register", "profile"] = "register"
 
 
+class MatchmakerSuccessCase(BaseModel):
+    description: str = Field(min_length=1, max_length=1000)
+    images: list[str] = Field(default_factory=list, max_length=3)
+
+
+class MatchmakerApplicationDetails(BaseModel):
+    """审核资料；仅返回给申请人本人或管理员，不用于公开红娘资料。"""
+
+    wechat: str | None = Field(default=None, max_length=128)
+    avatar: str | None = Field(default=None, max_length=512)
+    specialties: list[str] = Field(default_factory=list, max_length=5)
+    expected_price: float | None = Field(default=None, ge=0, le=1000000)
+    success_cases: list[MatchmakerSuccessCase] = Field(default_factory=list, max_length=3)
+
+    @field_validator("specialties")
+    @classmethod
+    def validate_specialties(cls, value: list[str]) -> list[str]:
+        cleaned = [item.strip() for item in value if item.strip()]
+        if len(set(cleaned)) != len(cleaned):
+            raise ValueError("擅长领域不能重复")
+        return cleaned
+
+
 class MatchmakerApplicationCreate(BaseModel):
     application_type: Literal["promoter", "partner", "service_matchmaker"]
     real_name: str = Field(min_length=2, max_length=64)
     phone: str = Field(pattern=r"^1[3-9]\d{9}$")
     intro: str = Field(min_length=10, max_length=2000)
     cert_images: list[str] = Field(default_factory=list, max_length=6)
+    application_details: MatchmakerApplicationDetails = Field(default_factory=MatchmakerApplicationDetails)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_details(cls, value):
+        """Accept the existing top-level frontend fields during migration."""
+        if not isinstance(value, dict):
+            return value
+        normalized = dict(value)
+        details = dict(normalized.get("application_details") or {})
+        legacy_fields = ("wechat", "avatar", "specialties", "expected_price", "success_cases")
+        for field_name in legacy_fields:
+            if field_name not in details and field_name in normalized:
+                details[field_name] = normalized[field_name]
+        normalized["application_details"] = details
+        return normalized
 
 
 class MatchmakerApplicationResponse(BaseModel):
@@ -337,6 +376,7 @@ class MatchmakerApplicationResponse(BaseModel):
     phone_masked: str
     intro: str
     cert_images: list[str]
+    application_details: MatchmakerApplicationDetails
     fail_reason: str | None
     created_at: str
     reviewed_at: str | None

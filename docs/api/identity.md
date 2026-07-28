@@ -111,6 +111,19 @@ null
 | `phone` | body | string | 是 | 11 位大陆手机号 | 联系电话 |
 | `intro` | body | string | 是 | 10~2000 字符 | 申请说明 |
 | `cert_images` | body | array[string] | 否 | 最多 6 个地址 | 资质材料地址 |
+| `application_details` | body | object | 否 | 见下方结构；默认空对象 | 审核扩展资料 |
+
+`application_details` 字段：
+
+| 字段 | 类型 | 必填 | 规则 | 含义 |
+| --- | --- | --- | --- | --- |
+| `wechat` | string/null | 否 | 最长 128 字符 | 红娘服务微信号，仅供审核和后续服务交付 |
+| `avatar` | string/null | 否 | 最长 512 字符 | 申请头像地址 |
+| `specialties` | array[string] | 否 | 最多 5 项，不可重复 | 擅长领域 |
+| `expected_price` | number/null | 否 | 0~1000000 | 期望服务价格 |
+| `success_cases` | array[object] | 否 | 最多 3 条 | 脱敏成功案例 |
+| `success_cases[].description` | string | 是（案例存在时） | 1~1000 字符 | 案例说明 |
+| `success_cases[].images` | array[string] | 否 | 最多 3 个地址 | 案例图片 |
 
 请求：
 
@@ -120,7 +133,14 @@ null
   "real_name":"张三",
   "phone":"13800138000",
   "intro":"有多年婚恋咨询和沟通经验",
-  "cert_images":["/storage/application/cert-1.jpg"]
+  "cert_images":["/storage/application/cert-1.jpg"],
+  "application_details": {
+    "wechat":"matchmaker_demo",
+    "avatar":"/storage/application/avatar.jpg",
+    "specialties":["高知青年","同城牵线"],
+    "expected_price":199,
+    "success_cases":[{"description":"已完成脱敏案例说明","images":[]}]
+  }
 }
 ```
 
@@ -135,6 +155,7 @@ null
 | `phone_masked` | string | 脱敏手机号 |
 | `intro` | string | 申请说明 |
 | `cert_images` | array[string] | 材料地址 |
+| `application_details` | object | 本人或管理员可见的审核扩展资料；公开红娘接口不会返回 |
 | `fail_reason` | string/null | 驳回/暂停原因 |
 | `created_at` | string | ISO 时间 |
 | `reviewed_at` | string/null | 审核时间 |
@@ -200,3 +221,9 @@ null
 
 - 修改 `PATCH /api/v1/admin/matchmaker/applications/{application_id}`：审核通过、驳回或暂停后新增申请人站内通知。
 - 影响范围：申请人通知列表；原有申请响应结构和状态枚举保持兼容。
+
+### 2026-07-27
+
+- 修改 `POST /api/v1/matchmaker/applications`：新增 `application_details`，保存微信号、头像、擅长领域、期望价格和脱敏成功案例。
+- 兼容旧客户端：仍接受旧版顶层字段 `wechat`、`avatar`、`specialties`、`expected_price`、`success_cases`，服务端会归一化到 `application_details`。
+- 修改申请响应：新增 `application_details`；该字段只对申请人本人和管理员返回，不进入公开红娘列表或详情。
