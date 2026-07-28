@@ -39,6 +39,7 @@ from app.schemas.community import (
     PaperPlaneReplyCreate,
     PaperPlaneReplyResponse,
     PaperPlaneResponse,
+    CommunityPostUpdate,
 )
 from app.services.community_media import (
     assert_owned_media_urls,
@@ -77,11 +78,72 @@ REPORT_REASONS = [
 ]
 
 
-def _post_select_sql(extra_where: str = "") -> str:
+async def _record_moderation_task(
+    db: AsyncSession,
+    target_type: str,
+    target_id: int,
+    user_id: int,
+    decision: Any,
+    *,
+    raw_content: str,
+    status: str,
+) -> None:
+    expires_at = datetime.now(UTC).replace(tzinfo=None) + timedelta(days=365)
+    notice_title = "内容已提交审核" if status == "pending" else "内容已完成安全处理"
+    notice_content = "你的内容正在审核中，审核完成后会通知你" if status == "pending" else "你的内容已完成敏感词处理"
+    await db.execute(
+        text("""INSERT INTO community_moderation_task
+            (target_type, target_id, user_id, status, risk_level, matched_words,
+             raw_content, display_content, expires_at)
+            VALUES (:target_type, :target_id, :user_id, :status, :risk_level,
+                    :matched_words, :raw_content, :display_content, :expires_at)
+            ON DUPLICATE KEY UPDATE status = VALUES(status), risk_level = VALUES(risk_level),
+                matched_words = VALUES(matched_words), raw_content = VALUES(raw_content),
+                display_content = VALUES(display_content), reason = NULL, reviewed_by = NULL,
+                reviewed_at = NULL, expires_at = VALUES(expires_at)"""),
+        {
+            "target_type": target_type,
+            "target_id": target_id,
+            "user_id": user_id,
+            "status": status,
+            "risk_level": decision.max_level,
+            "matched_words": json.dumps(list(decision.matched_words), ensure_ascii=False),
+            "raw_content": raw_content,
+            "display_content": decision.display_content,
+            "expires_at": expires_at,
+        },
+    )
+    await db.execute(
+        text("""INSERT INTO user_notification
+            (user_id, notification_type, title, content, payload, related_id)
+            VALUES (:user_id, 'community_moderation_submitted', :notice_title,
+                    :notice_content, :payload, :related_id)"""),
+        {
+            "user_id": user_id,
+            "payload": json.dumps({"target_type": target_type, "target_id": target_id}, ensure_ascii=False),
+            "related_id": target_id,
+            "notice_title": notice_title,
+            "notice_content": notice_content,
+        },
+    )
+
+
+async def _notify_moderation_rejected(db: AsyncSession, user_id: int, target_type: str) -> None:
+    await db.execute(
+        text("""INSERT INTO user_notification
+            (user_id, notification_type, title, content, payload)
+            VALUES (:user_id, 'community_moderation_result', '内容未通过审核',
+                    '你的内容未通过审核，请修改后重新提交', :payload)"""),
+        {"user_id": user_id, "payload": json.dumps({"target_type": target_type, "status": "rejected"}, ensure_ascii=False)},
+    )
+
+
+def _post_select_sql(extra_where: str = "", *, include_pending: bool = False) -> str:
     # school 在 user_auth，不在 user_profile（实测 Unknown column up.school）
+    moderation_clause = "" if include_pending else "AND COALESCE(p.moderation_status, 'approved') = 'approved'"
     return f"""SELECT p.id, p.user_id, u.nickname, u.avatar, u.gender, u.birthday,
         p.content, p.images, p.video, p.location, p.visibility, p.declaration, p.topic_id, t.name AS topic_name,
-        p.like_count, p.comment_count, p.created_at,
+        p.like_count, p.comment_count, p.created_at, COALESCE(p.moderation_status, 'approved') AS moderation_status,
         up.mbti, ua.school, up.hometown, up.residence, COALESCE(ua.realname_status, 0) AS realname_status,
         EXISTS (SELECT 1 FROM community_like l WHERE l.user_id = :user_id AND l.target_id = p.id AND l.type = 1) AS is_liked,
         EXISTS (SELECT 1 FROM community_like c WHERE c.user_id = :user_id AND c.target_id = p.id AND c.type = 3) AS is_collected,
@@ -94,6 +156,7 @@ def _post_select_sql(extra_where: str = "") -> str:
         LEFT JOIN user_auth ua ON ua.user_id = p.user_id
         LEFT JOIN user_privacy pr ON pr.user_id = p.user_id
         WHERE p.status = 1
+          {moderation_clause}
           AND NOT EXISTS (
             SELECT 1 FROM user_block b
             WHERE (b.user_id = :user_id AND b.target_user_id = p.user_id)
@@ -152,6 +215,7 @@ def _post_response(row: dict[str, Any]) -> CommunityPostResponse:
         hometown=row.get("hometown"),
         residence=row.get("residence"),
         realname_status=int(row.get("realname_status") or 0),
+        moderation_status=row.get("moderation_status") or "approved",
         created_at=row["created_at"],
     )
 
@@ -163,11 +227,19 @@ async def create_post(
     *,
     commit: bool = True,
 ) -> CommunityPostResponse:
-    from app.services.content_filter import assert_text_allowed
+    from app.services.content_filter import assert_text_allowed, decide_text
 
     content = (request.content or "").strip()
     if content:
         await assert_text_allowed(db, content, field="动态内容")
+    decision = await decide_text(db, content)
+    if decision.action == "reject":
+        await _notify_moderation_rejected(db, user_id, "post")
+        if commit:
+            await db.commit()
+        raise HTTPException(422, detail="动态内容含高风险违规词，请修改后重试")
+    content = decision.display_content
+    moderation_status = "pending" if decision.action == "manual_review" else "approved"
 
     image_urls: list[str] = []
     video_url: str | None = None
@@ -229,8 +301,8 @@ async def create_post(
     result = await db.execute(
         text(
             """INSERT INTO community_post
-            (user_id, topic_id, content, images, video, location, visibility, declaration, status)
-            VALUES (:user_id, :topic_id, :content, :images, :video, :location, :visibility, :declaration, 1)"""
+            (user_id, topic_id, content, images, video, location, visibility, declaration, status, moderation_status)
+            VALUES (:user_id, :topic_id, :content, :images, :video, :location, :visibility, :declaration, 1, :moderation_status)"""
         ),
         {
             "user_id": user_id,
@@ -241,9 +313,15 @@ async def create_post(
             "location": request.location,
             "visibility": request.visibility,
             "declaration": request.declaration,
+            "moderation_status": moderation_status,
         },
     )
     post_id = int(result.lastrowid)
+    if decision.action != "allow":
+        await _record_moderation_task(
+            db, "post", post_id, user_id, decision, raw_content=(request.content or "").strip(),
+            status="pending" if decision.action == "manual_review" else "replaced",
+        )
     if bind_ids:
         await bind_media(
             db,
@@ -261,13 +339,58 @@ async def create_post(
         )
     if commit:
         await db.commit()
-    return await get_post(db, user_id, post_id)
+    try:
+        return await get_post(db, user_id, post_id, include_pending=True)
+    except TypeError:
+        return await get_post(db, user_id, post_id)
 
 
-async def get_post(db: AsyncSession, user_id: int, post_id: int) -> CommunityPostResponse:
+async def update_post(
+    db: AsyncSession,
+    user_id: int,
+    post_id: int,
+    request: CommunityPostUpdate,
+    *,
+    commit: bool = True,
+) -> CommunityPostResponse:
+    from app.services.content_filter import assert_text_allowed, decide_text
+
+    result = await db.execute(text("SELECT id FROM community_post WHERE id = :id AND user_id = :user_id AND status <> 3 FOR UPDATE"), {"id": post_id, "user_id": user_id})
+    if not result.scalar():
+        raise HTTPException(404, detail="动态不存在或无权修改")
+    content = (request.content or "").strip()
+    if content:
+        await assert_text_allowed(db, content, field="动态内容")
+    decision = await decide_text(db, content)
+    if decision.action == "reject":
+        await _notify_moderation_rejected(db, user_id, "post")
+        if commit:
+            await db.commit()
+        raise HTTPException(422, detail="动态内容含高风险违规词，请修改后重试")
+    moderation_status = "pending" if decision.action == "manual_review" else "approved"
+    await db.execute(text("""UPDATE community_post SET content = :content,
+        visibility = :visibility, declaration = :declaration,
+        moderation_status = :moderation_status, moderation_reason = NULL,
+        moderated_by = NULL, moderated_at = NULL, updated_at = UTC_TIMESTAMP()
+        WHERE id = :id AND user_id = :user_id"""), {
+        "content": decision.display_content, "visibility": request.visibility,
+        "declaration": request.declaration, "moderation_status": moderation_status,
+        "id": post_id, "user_id": user_id,
+    })
+    if decision.action != "allow":
+        await _record_moderation_task(db, "post", post_id, user_id, decision, raw_content=content, status="pending" if decision.action == "manual_review" else "replaced")
+    if commit:
+        await db.commit()
+    try:
+        return await get_post(db, user_id, post_id, include_pending=True)
+    except TypeError:
+        return await get_post(db, user_id, post_id)
+
+
+async def get_post(db: AsyncSession, user_id: int, post_id: int, *, include_pending: bool = False) -> CommunityPostResponse:
     visibility = f"{_post_visibility_clause()} AND p.id = :post_id"
     result = await db.execute(
-        text(_post_select_sql(visibility)),
+        text(_post_select_sql(visibility, include_pending=include_pending)),
         {"user_id": user_id, "post_id": post_id},
     )
     row = result.mappings().first()
@@ -522,7 +645,7 @@ async def list_posts(
         LEFT JOIN user_profile up ON up.user_id = p.user_id
         LEFT JOIN user_auth ua ON ua.user_id = p.user_id
         LEFT JOIN user_privacy pr ON pr.user_id = p.user_id
-        WHERE p.status = 1
+        WHERE p.status = 1 AND COALESCE(p.moderation_status, 'approved') = 'approved'
           AND NOT EXISTS (
             SELECT 1 FROM user_block b
             WHERE (b.user_id = :user_id AND b.target_user_id = p.user_id)
@@ -627,7 +750,7 @@ async def collect_post(db: AsyncSession, user_id: int, post_id: int, enabled: bo
 
 
 _COMMENT_SELECT = """SELECT c.id, c.post_id, c.user_id, u.nickname, u.avatar, c.parent_id,
-            c.content, c.like_count, c.created_at,
+            c.content, c.like_count, c.created_at, COALESCE(c.moderation_status, 'approved') AS moderation_status,
             EXISTS (
               SELECT 1 FROM community_like l
               WHERE l.user_id = :user_id AND l.target_id = c.id AND l.type = 2
@@ -647,6 +770,7 @@ def _comment_response(row: dict[str, Any]) -> CommunityCommentResponse:
         like_count=int(row.get("like_count") or 0),
         is_liked=bool(row.get("is_liked")),
         created_at=row["created_at"],
+        moderation_status=row.get("moderation_status") or "approved",
     )
 
 
@@ -654,7 +778,7 @@ async def _get_comment(
     db: AsyncSession, user_id: int, comment_id: int
 ) -> CommunityCommentResponse:
     result = await db.execute(
-        text(_COMMENT_SELECT + " WHERE c.id = :comment_id AND c.status = 1"),
+        text(_COMMENT_SELECT + " WHERE c.id = :comment_id AND c.status = 1 AND COALESCE(c.moderation_status, 'approved') = 'approved'"),
         {"user_id": user_id, "comment_id": comment_id},
     )
     row = result.mappings().first()
@@ -671,7 +795,7 @@ async def list_comments(
     result = await db.execute(
         text(
             _COMMENT_SELECT
-            + " WHERE c.post_id = :post_id AND c.status = 1 ORDER BY c.created_at ASC LIMIT :limit OFFSET :offset"
+            + " WHERE c.post_id = :post_id AND c.status = 1 AND COALESCE(c.moderation_status, 'approved') = 'approved' ORDER BY c.created_at ASC LIMIT :limit OFFSET :offset"
         ),
         {
             "user_id": user_id,
@@ -691,9 +815,16 @@ async def create_comment(
     *,
     commit: bool = True,
 ) -> CommunityCommentResponse:
-    from app.services.content_filter import assert_text_allowed
+    from app.services.content_filter import assert_text_allowed, decide_text
 
     await assert_text_allowed(db, request.content, field="评论内容")
+    decision = await decide_text(db, request.content)
+    if decision.action == "reject":
+        await _notify_moderation_rejected(db, user_id, "comment")
+        if commit:
+            await db.commit()
+        raise HTTPException(422, detail="评论内容含高风险违规词，请修改后重试")
+    moderation_status = "pending" if decision.action == "manual_review" else "approved"
     await get_post(db, user_id, post_id)
     if request.parent_id:
         parent = await db.execute(
@@ -704,15 +835,18 @@ async def create_comment(
             raise HTTPException(404, detail="父评论不存在")
     result = await db.execute(
         text(
-            "INSERT INTO community_comment (post_id, user_id, parent_id, content) VALUES (:post_id, :user_id, :parent_id, :content)"
+            "INSERT INTO community_comment (post_id, user_id, parent_id, content, moderation_status) VALUES (:post_id, :user_id, :parent_id, :content, :moderation_status)"
         ),
         {
             "post_id": post_id,
             "user_id": user_id,
             "parent_id": request.parent_id,
-            "content": request.content,
+            "content": decision.display_content,
+            "moderation_status": moderation_status,
         },
     )
+    if decision.action != "allow":
+        await _record_moderation_task(db, "comment", int(result.lastrowid), user_id, decision, raw_content=request.content, status="pending" if decision.action == "manual_review" else "replaced")
     # 与 like_count 一致采用重算而非增量，避免并发/回滚下计数永久漂移
     await db.execute(
         text(
@@ -1356,11 +1490,18 @@ async def create_paper_plane(
     quota_key: str | None = None,
 ) -> PaperPlaneResponse:
     from app.core.redis import daily_quota_key
-    from app.services.content_filter import assert_text_allowed
+    from app.services.content_filter import assert_text_allowed, decide_text
 
     content = (request.content or "").strip()
     if content:
         await assert_text_allowed(db, content, field="纸飞机内容")
+    decision = await decide_text(db, content)
+    if decision.action == "reject":
+        await _notify_moderation_rejected(db, user_id, "paper_plane")
+        if commit:
+            await db.commit()
+        raise HTTPException(422, detail="纸飞机内容含高风险违规词，请修改后重试")
+    content = decision.display_content
 
     image_urls: list[str] = []
     bind_ids: list[int] = []
@@ -1396,10 +1537,10 @@ async def create_paper_plane(
             text(
                 """INSERT INTO paper_plane (
                     user_id, content, images, city, tags, is_anonymous,
-                    voice_url, voice_duration_sec, expire_at
+                    voice_url, voice_duration_sec, expire_at, moderation_status
                 ) VALUES (
                     :user_id, :content, :images, :city, :tags, :is_anonymous,
-                    :voice_url, :voice_duration_sec, :expire_at
+                    :voice_url, :voice_duration_sec, :expire_at, :moderation_status
                 )"""
             ),
             {
@@ -1412,9 +1553,12 @@ async def create_paper_plane(
                 "voice_url": request.voice_url,
                 "voice_duration_sec": request.voice_duration_sec,
                 "expire_at": datetime.now(UTC).replace(tzinfo=None) + timedelta(hours=24),
+                "moderation_status": 1 if decision.action != "manual_review" else 2,
             },
         )
         plane_id = int(result.lastrowid)
+        if decision.action != "allow":
+            await _record_moderation_task(db, "paper_plane", plane_id, user_id, decision, raw_content=(request.content or "").strip(), status="pending" if decision.action == "manual_review" else "replaced")
         if bind_ids:
             await bind_media(
                 db,
@@ -1494,6 +1638,7 @@ async def _get_or_create_plane_conversation(
     replier_id: int,
     first_message: str,
     reply_id: int | None = None,
+    message_moderation_status: str = "approved",
 ) -> int:
     existing = await db.execute(
         text(
@@ -1527,9 +1672,9 @@ async def _get_or_create_plane_conversation(
     await db.execute(
         text(
             """INSERT INTO paper_plane_message (
-                conversation_id, from_user_id, content, type, reply_id
+                conversation_id, from_user_id, content, type, reply_id, moderation_status
             ) VALUES (
-                :conversation_id, :from_user_id, :content, 1, :reply_id
+                :conversation_id, :from_user_id, :content, 1, :reply_id, :moderation_status
             )"""
         ),
         {
@@ -1537,6 +1682,7 @@ async def _get_or_create_plane_conversation(
             "from_user_id": replier_id,
             "content": first_message,
             "reply_id": reply_id,
+            "moderation_status": message_moderation_status,
         },
     )
     if row:
@@ -1562,9 +1708,15 @@ async def reply_paper_plane(
     *,
     commit: bool = True,
 ) -> PaperPlaneReplyResponse:
-    from app.services.content_filter import assert_text_allowed
+    from app.services.content_filter import assert_text_allowed, decide_text
 
     await assert_text_allowed(db, request.content, field="纸飞机回复")
+    decision = await decide_text(db, request.content)
+    if decision.action == "reject":
+        await _notify_moderation_rejected(db, user_id, "paper_plane_reply")
+        if commit:
+            await db.commit()
+        raise HTTPException(422, detail="纸飞机回复含高风险违规词，请修改后重试")
     result = await db.execute(
         text(
             """SELECT id, user_id FROM paper_plane
@@ -1582,16 +1734,19 @@ async def reply_paper_plane(
         raise HTTPException(422, detail="不能回复自己的纸飞机")
     result = await db.execute(
         text(
-            "INSERT INTO paper_plane_reply (plane_id, user_id, content, is_anonymous) VALUES (:plane_id, :user_id, :content, :is_anonymous)"
+            "INSERT INTO paper_plane_reply (plane_id, user_id, content, is_anonymous, moderation_status) VALUES (:plane_id, :user_id, :content, :is_anonymous, :moderation_status)"
         ),
         {
             "plane_id": plane_id,
             "user_id": user_id,
-            "content": request.content,
+            "content": decision.display_content,
             "is_anonymous": int(request.is_anonymous),
+            "moderation_status": "pending" if decision.action == "manual_review" else "approved",
         },
     )
     reply_id = int(result.lastrowid)
+    if decision.action != "allow":
+        await _record_moderation_task(db, "paper_plane_reply", reply_id, user_id, decision, raw_content=request.content, status="pending" if decision.action == "manual_review" else "replaced")
     await db.execute(
         text(
             "UPDATE paper_plane SET reply_count = reply_count + 1, status = CASE WHEN reply_count + 1 >= 5 THEN 2 ELSE 1 END WHERE id = :plane_id"
@@ -1603,8 +1758,9 @@ async def reply_paper_plane(
         plane_id=plane_id,
         owner_id=int(plane["user_id"]),
         replier_id=user_id,
-        first_message=request.content,
+        first_message="[内容审核中]" if decision.action == "manual_review" else decision.display_content,
         reply_id=reply_id,
+        message_moderation_status="pending" if decision.action == "manual_review" else "approved",
     )
     if commit:
         await db.commit()
@@ -1634,7 +1790,8 @@ async def list_paper_plane_conversations(
             c.created_at, p.content AS plane_content
             FROM paper_plane_conversation c
             JOIN paper_plane p ON p.id = c.plane_id
-            WHERE c.owner_id = :user_id OR c.replier_id = :user_id
+            WHERE (c.owner_id = :user_id OR c.replier_id = :user_id)
+              AND COALESCE(p.moderation_status, 1) = 1
             ORDER BY COALESCE(c.last_message_at, c.created_at) DESC, c.id DESC
             LIMIT :limit OFFSET :offset"""
         ),
@@ -1672,6 +1829,7 @@ async def list_paper_plane_messages(
             voice_duration_sec, created_at
             FROM paper_plane_message
             WHERE conversation_id = :conversation_id
+              AND COALESCE(moderation_status, 'approved') = 'approved'
             ORDER BY created_at DESC, id DESC
             LIMIT :limit OFFSET :offset"""
         ),
@@ -1707,11 +1865,19 @@ async def send_paper_plane_message(
     *,
     commit: bool = True,
 ) -> PaperPlaneMessageResponse:
-    from app.services.content_filter import assert_text_allowed
+    from app.services.content_filter import assert_text_allowed, decide_text
 
     # 文本消息过滤敏感词；语音消息（type=3）content 为空，无需过滤
     if request.type == 1 and (request.content or "").strip():
         await assert_text_allowed(db, request.content, field="会话消息")
+        decision = await decide_text(db, request.content)
+        if decision.action == "reject":
+            await _notify_moderation_rejected(db, user_id, "paper_plane_message")
+            if commit:
+                await db.commit()
+            raise HTTPException(422, detail="会话消息含高风险违规词，请修改后重试")
+    else:
+        decision = None
 
     conv = await _require_plane_conversation(db, user_id, conversation_id)
     if int(conv["status"]) != 1:
@@ -1720,20 +1886,23 @@ async def send_paper_plane_message(
     result = await db.execute(
         text(
             """INSERT INTO paper_plane_message (
-                conversation_id, from_user_id, content, type, media_url, voice_duration_sec
+                conversation_id, from_user_id, content, type, media_url, voice_duration_sec, moderation_status
             ) VALUES (
-                :conversation_id, :from_user_id, :content, :type, :media_url, :voice_duration_sec
+                :conversation_id, :from_user_id, :content, :type, :media_url, :voice_duration_sec, :moderation_status
             )"""
         ),
         {
             "conversation_id": conversation_id,
             "from_user_id": user_id,
-            "content": request.content or "",
+            "content": decision.display_content if decision else (request.content or ""),
             "type": int(request.type),
             "media_url": request.media_url,
             "voice_duration_sec": request.voice_duration_sec,
+            "moderation_status": "pending" if decision and decision.action == "manual_review" else "approved",
         },
     )
+    if decision and decision.action != "allow":
+        await _record_moderation_task(db, "paper_plane_message", int(result.lastrowid), user_id, decision, raw_content=request.content or "", status="pending" if decision.action == "manual_review" else "replaced")
     if user_id == int(conv["owner_id"]):
         unread_sql = "replier_unread = replier_unread + 1"
     else:

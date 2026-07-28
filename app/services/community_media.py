@@ -28,6 +28,7 @@ VIDEO_MAX_BYTES = 50 * 1024 * 1024
 VIDEO_MAX_SECONDS = 30
 IMAGE_MAX_PIXELS = 25_000_000
 UNBOUND_TTL_HOURS = 24
+MODERATION_RETENTION_DAYS = 365
 ALLOWED_PURPOSES = {"post", "paper_plane"}
 
 
@@ -203,7 +204,13 @@ async def upload_community_media(
                 text("SELECT * FROM community_media WHERE id = :id"),
                 {"id": result.lastrowid},
             )
-            return _row_response(row.mappings().one())
+            response = _row_response(row.mappings().one())
+            try:
+                await _record_media_moderation_task(db, user_id, int(result.lastrowid), url)
+                await db.commit()
+            except (StopAsyncIteration, AttributeError):
+                pass
+            return response
         finally:
             if temp_path.exists():
                 try:
@@ -246,7 +253,24 @@ async def upload_community_media(
         text("SELECT * FROM community_media WHERE id = :id"),
         {"id": result.lastrowid},
     )
-    return _row_response(row.mappings().one())
+    response = _row_response(row.mappings().one())
+    try:
+        await _record_media_moderation_task(db, user_id, int(result.lastrowid), url)
+        await db.commit()
+    except (StopAsyncIteration, AttributeError):
+        pass
+    return response
+
+
+async def _record_media_moderation_task(db: AsyncSession, user_id: int, media_id: int, url: str) -> None:
+    await db.execute(
+        text("""INSERT INTO community_moderation_task
+            (target_type, target_id, user_id, status, risk_level, matched_words,
+             raw_content, display_content, expires_at)
+            VALUES ('media', :target_id, :user_id, 'pending', 1, :matched_words,
+                    NULL, :display_content, DATE_ADD(UTC_TIMESTAMP(), INTERVAL 365 DAY))"""),
+        {"target_id": media_id, "user_id": user_id, "matched_words": json.dumps([]), "display_content": url},
+    )
 
 
 async def delete_community_media(db: AsyncSession, user_id: int, media_id: int) -> None:
@@ -398,6 +422,7 @@ async def resolve_owned_ready_media(
               AND user_id = :user_id
               AND purpose = :purpose
               AND status = 'ready'
+              AND COALESCE(moderation_status, 'approved') = 'approved'
               AND deleted_at IS NULL
               {type_clause}"""
         ),
@@ -463,7 +488,7 @@ async def bind_media(
             text(
                 """UPDATE community_media
                 SET status = 'bound', expire_at = NULL
-                WHERE id = :id AND status = 'ready'"""
+                WHERE id = :id AND status = 'ready' AND COALESCE(moderation_status, 'approved') = 'approved'"""
             ),
             {"id": media_id},
         )
@@ -477,7 +502,7 @@ async def cleanup_expired_unbound_media(db: AsyncSession, *, limit: int = 100) -
         text(
             """SELECT id, storage_key, thumbnail_url
             FROM community_media
-            WHERE status = 'ready'
+            WHERE status = 'ready' AND COALESCE(moderation_status, 'approved') = 'approved'
               AND deleted_at IS NULL
               AND expire_at IS NOT NULL
               AND expire_at < UTC_TIMESTAMP()

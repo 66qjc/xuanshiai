@@ -46,6 +46,10 @@ class CommunityPostCreate(BaseModel):
         return self
 
 
+class CommunityPostUpdate(CommunityPostCreate):
+    """修改后重新提交；服务端会重新执行完整审核流程。"""
+
+
 class CommunityPostResponse(BaseModel):
     id: int
     user_id: int
@@ -72,6 +76,7 @@ class CommunityPostResponse(BaseModel):
     hometown: str | None = None
     residence: str | None = None
     realname_status: int = 0
+    moderation_status: Literal["approved", "pending", "rejected", "deleted", "hidden"] = "approved"
     created_at: datetime
 
 
@@ -98,6 +103,7 @@ class CommunityCommentResponse(BaseModel):
     like_count: int
     is_liked: bool = False
     created_at: datetime
+    moderation_status: Literal["approved", "pending", "rejected", "deleted", "hidden"] = "approved"
 
 
 class CommunityTopicResponse(BaseModel):

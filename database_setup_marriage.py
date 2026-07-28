@@ -231,6 +231,10 @@ class DatabaseManager:
             'community_post': {
                 'visibility': "`visibility` tinyint NOT NULL DEFAULT '0' COMMENT '0公开 1仅好友 2仅自己'",
                 'declaration': "`declaration` varchar(32) NOT NULL DEFAULT '' COMMENT '内容声明'",
+                'moderation_status': "`moderation_status` varchar(24) NOT NULL DEFAULT 'approved' COMMENT 'pending/approved/rejected/deleted/hidden'",
+                'moderation_reason': "`moderation_reason` varchar(255) DEFAULT NULL",
+                'moderated_by': "`moderated_by` bigint unsigned DEFAULT NULL",
+                'moderated_at': "`moderated_at` datetime DEFAULT NULL",
             },
             'user_report': {
                 'target_type': "`target_type` varchar(32) NOT NULL DEFAULT 'user' COMMENT 'user|post|comment|paper_plane'",
@@ -240,6 +244,33 @@ class DatabaseManager:
                 'moderation_status': "`moderation_status` tinyint NOT NULL DEFAULT '1' COMMENT '1正常 2下架（与 lifecycle status 分离）'",
                 'voice_url': "`voice_url` varchar(500) DEFAULT NULL COMMENT '语音地址'",
                 'voice_duration_sec': "`voice_duration_sec` int DEFAULT NULL COMMENT '语音时长秒'",
+            },
+            'community_comment': {
+                'moderation_status': "`moderation_status` varchar(24) NOT NULL DEFAULT 'approved' COMMENT 'pending/approved/rejected/deleted/hidden'",
+                'moderation_reason': "`moderation_reason` varchar(255) DEFAULT NULL",
+                'moderated_by': "`moderated_by` bigint unsigned DEFAULT NULL",
+                'moderated_at': "`moderated_at` datetime DEFAULT NULL",
+            },
+            'community_media': {
+                'moderation_status': "`moderation_status` varchar(24) NOT NULL DEFAULT 'pending' COMMENT 'pending/approved/rejected/hidden'",
+                'moderation_reason': "`moderation_reason` varchar(255) DEFAULT NULL",
+                'moderated_by': "`moderated_by` bigint unsigned DEFAULT NULL",
+                'moderated_at': "`moderated_at` datetime DEFAULT NULL",
+            },
+            'paper_plane_reply': {
+                'moderation_status': "`moderation_status` varchar(24) NOT NULL DEFAULT 'approved' COMMENT 'pending/approved/rejected/hidden'",
+                'moderation_reason': "`moderation_reason` varchar(255) DEFAULT NULL",
+                'moderated_by': "`moderated_by` bigint unsigned DEFAULT NULL",
+                'moderated_at': "`moderated_at` datetime DEFAULT NULL",
+            },
+            'paper_plane_message': {
+                'moderation_status': "`moderation_status` varchar(24) NOT NULL DEFAULT 'approved' COMMENT 'pending/approved/rejected/hidden'",
+                'moderation_reason': "`moderation_reason` varchar(255) DEFAULT NULL",
+                'moderated_by': "`moderated_by` bigint unsigned DEFAULT NULL",
+                'moderated_at': "`moderated_at` datetime DEFAULT NULL",
+            },
+            'config_sensitive_word': {
+                'action': "`action` varchar(24) NOT NULL DEFAULT 'replace' COMMENT 'reject/replace/manual_review'",
             },
             'user_login_log': {
                 'login_status': "`login_status` tinyint NOT NULL DEFAULT '1' COMMENT '1成功 2失败'",
@@ -671,6 +702,18 @@ class DatabaseManager:
                     UNIQUE KEY `uk_user_role` (`user_id`,`role_code`),
                     KEY `idx_role_status` (`role_code`,`status`)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='用户平台角色'
+            """,
+            'admin_permission': """
+                CREATE TABLE IF NOT EXISTS `admin_permission` (
+                    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+                    `user_id` bigint unsigned NOT NULL,
+                    `permission_code` varchar(64) NOT NULL,
+                    `granted_by` bigint unsigned DEFAULT NULL,
+                    `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (`id`),
+                    UNIQUE KEY `uk_admin_permission` (`user_id`,`permission_code`),
+                    KEY `idx_admin_permission_user` (`user_id`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='管理员权限'
             """,
 
             # ============================================
@@ -1329,6 +1372,10 @@ class DatabaseManager:
                     `location` varchar(128) DEFAULT NULL COMMENT '位置信息',
                     `visibility` tinyint NOT NULL DEFAULT '0' COMMENT '0公开 1仅好友 2仅自己',
                     `declaration` varchar(32) NOT NULL DEFAULT '' COMMENT '内容声明',
+                    `moderation_status` varchar(24) NOT NULL DEFAULT 'approved' COMMENT 'pending/approved/rejected/deleted/hidden',
+                    `moderation_reason` varchar(255) DEFAULT NULL,
+                    `moderated_by` bigint unsigned DEFAULT NULL,
+                    `moderated_at` datetime DEFAULT NULL,
                     `view_count` int DEFAULT '0' COMMENT '浏览次数',
                     `like_count` int DEFAULT '0' COMMENT '点赞数',
                     `comment_count` int DEFAULT '0' COMMENT '评论数',
@@ -1355,6 +1402,10 @@ class DatabaseManager:
                     `user_id` bigint unsigned NOT NULL,
                     `parent_id` bigint unsigned DEFAULT NULL COMMENT '父评论ID（支持二级回复）',
                     `content` varchar(500) NOT NULL,
+                    `moderation_status` varchar(24) NOT NULL DEFAULT 'approved' COMMENT 'pending/approved/rejected/deleted/hidden',
+                    `moderation_reason` varchar(255) DEFAULT NULL,
+                    `moderated_by` bigint unsigned DEFAULT NULL,
+                    `moderated_at` datetime DEFAULT NULL,
                     `like_count` int DEFAULT '0',
                     `status` tinyint DEFAULT '1' COMMENT '1正常 2违规',
                     `created_at` datetime DEFAULT CURRENT_TIMESTAMP,
@@ -1428,6 +1479,10 @@ class DatabaseManager:
                     `mime_type` varchar(128) DEFAULT NULL,
                     `file_size` bigint unsigned DEFAULT NULL,
                     `duration_seconds` smallint unsigned DEFAULT NULL,
+                    `moderation_status` varchar(24) NOT NULL DEFAULT 'pending' COMMENT 'pending/approved/rejected/hidden',
+                    `moderation_reason` varchar(255) DEFAULT NULL,
+                    `moderated_by` bigint unsigned DEFAULT NULL,
+                    `moderated_at` datetime DEFAULT NULL,
                     `status` varchar(16) NOT NULL DEFAULT 'ready' COMMENT 'ready|bound|deleted',
                     `deleted_at` datetime DEFAULT NULL,
                     `expire_at` datetime DEFAULT NULL COMMENT '未绑定媒体过期时间',
@@ -1496,6 +1551,10 @@ class DatabaseManager:
                     `plane_id` bigint unsigned NOT NULL,
                     `user_id` bigint unsigned NOT NULL COMMENT '回复者',
                     `content` text NOT NULL,
+                    `moderation_status` varchar(24) NOT NULL DEFAULT 'approved' COMMENT 'pending/approved/rejected/hidden',
+                    `moderation_reason` varchar(255) DEFAULT NULL,
+                    `moderated_by` bigint unsigned DEFAULT NULL,
+                    `moderated_at` datetime DEFAULT NULL,
                     `is_anonymous` tinyint DEFAULT '1',
                     `created_at` datetime DEFAULT CURRENT_TIMESTAMP,
                     PRIMARY KEY (`id`),
@@ -1537,6 +1596,10 @@ class DatabaseManager:
                     `conversation_id` bigint unsigned NOT NULL,
                     `from_user_id` bigint unsigned NOT NULL,
                     `content` text,
+                    `moderation_status` varchar(24) NOT NULL DEFAULT 'approved' COMMENT 'pending/approved/rejected/hidden',
+                    `moderation_reason` varchar(255) DEFAULT NULL,
+                    `moderated_by` bigint unsigned DEFAULT NULL,
+                    `moderated_at` datetime DEFAULT NULL,
                     `type` tinyint DEFAULT '1' COMMENT '1文本 3语音',
                     `media_url` varchar(500) DEFAULT NULL,
                     `voice_duration_sec` int DEFAULT NULL,
@@ -1903,11 +1966,34 @@ class DatabaseManager:
                     `word` varchar(64) NOT NULL COMMENT '敏感词',
                     `category` varchar(32) DEFAULT NULL COMMENT '分类 政治/色情/暴力/诈骗等',
                     `level` tinyint DEFAULT '1' COMMENT '严重等级 1-3',
+                    `action` varchar(24) NOT NULL DEFAULT 'replace' COMMENT 'reject/replace/manual_review',
                     `is_active` tinyint DEFAULT '1',
                     `created_at` datetime DEFAULT CURRENT_TIMESTAMP,
                     PRIMARY KEY (`id`),
                     UNIQUE KEY `uk_word` (`word`)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='敏感词库'
+            """,
+            'community_moderation_task': """
+                CREATE TABLE IF NOT EXISTS `community_moderation_task` (
+                    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+                    `target_type` varchar(32) NOT NULL,
+                    `target_id` bigint unsigned NOT NULL,
+                    `user_id` bigint unsigned NOT NULL,
+                    `status` varchar(24) NOT NULL DEFAULT 'pending' COMMENT 'pending/approved/rejected/replaced/deleted/hidden',
+                    `risk_level` tinyint NOT NULL DEFAULT '1',
+                    `matched_words` json DEFAULT NULL,
+                    `raw_content` text,
+                    `display_content` text,
+                    `reason` varchar(255) DEFAULT NULL,
+                    `reviewed_by` bigint unsigned DEFAULT NULL,
+                    `reviewed_at` datetime DEFAULT NULL,
+                    `expires_at` datetime NOT NULL,
+                    `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (`id`),
+                    UNIQUE KEY `uk_moderation_target` (`target_type`,`target_id`),
+                    KEY `idx_moderation_queue` (`status`,`risk_level`,`created_at`),
+                    KEY `idx_moderation_expire` (`expires_at`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='社区内容审核任务'
             """,
 
             # ============================================

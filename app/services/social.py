@@ -25,7 +25,7 @@ from app.schemas.social import (
     ReportResponse,
     SocialUser,
 )
-from app.schemas.admin import ReportReviewRequest, ReportReviewResponse
+from app.schemas.admin import AdminReportPage, ReportReviewRequest, ReportReviewResponse
 from app.services.discovery import _ensure_target, _target_rows
 from app.services.profile import _calculate_age
 

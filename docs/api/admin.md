@@ -20,7 +20,31 @@ Content-Type: application/json
 {"detail":"错误原因"}
 ```
 
-当前管理模块提供媒体审核、举报列表/处理、社区内容下架恢复，以及红娘牵线服务申请管理接口。批量审核与完整操作日志查询仍可后续增强；内容处置会写入 `business_audit_log`。
+当前管理模块提供媒体审核、举报列表/处理、社区内容审核队列、社区内容下架恢复，以及红娘牵线服务申请管理接口。审核任务和内容处置会写入 `business_audit_log`。
+
+## 2.1 社区审核队列
+
+### `GET /api/v1/admin/community/moderation-items`
+
+需要有效管理员 Token。查询参数：`page`（默认 1）、`page_size`（1~100，默认 20）、`status`（默认 `pending`，可选 `pending/approved/rejected/replaced/deleted/hidden`）、`target_type`（可选 `post/comment/paper_plane/paper_plane_reply/paper_plane_message/media`）。返回 `items/page/page_size/total/has_more`。每个 item 包含 `id`、`target_type`、`target_id`、`user_id`、`status`、`risk_level`、`matched_words`、`raw_content`、`display_content`、`reason`、`created_at`、`expires_at`。
+
+### `PATCH /api/v1/admin/community/moderation-items/{task_id}/review`
+
+请求体：
+
+```json
+{"action":"approve","reason":"审核通过"}
+```
+
+`action` 可选 `approve/reject/replace/delete/hide`；`replace` 必须额外提供 `display_content`。只有 `pending` 任务允许处理，已完成任务返回 `409`。管理员处理后写入审核人、时间、前后状态、理由和业务审计日志，并向发布者发送站内通知。审核原文及命中词保存 1 年。
+
+审核结果：`approved` 发布，`rejected` 拒绝，`replaced` 使用管理员指定展示文本，`deleted` 删除，`hidden` 下架。删除和下架不可互相覆盖。
+
+## 2.2 管理员授权
+
+### `POST /api/v1/admin/users/grant`
+
+只有有效管理员可以调用。请求体为 `{"user_id":23,"permissions":["community:review","media:review"]}`。服务端为目标用户授予 `admin` 角色并覆盖其权限清单；目标用户必须存在且可用。权限记录保存在 `admin_permission`，当前接口为后续细粒度权限校验提供管理入口。
 
 ## 2. 媒体审核
 

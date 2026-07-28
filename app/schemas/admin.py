@@ -76,3 +76,51 @@ class CertificationReviewResponse(BaseModel):
     kind: Literal["education", "house", "marriage"]
     status: Literal[2, 3]
     reason: str | None
+
+
+class ModerationItem(BaseModel):
+    id: int
+    target_type: Literal["post", "comment", "paper_plane", "paper_plane_reply", "paper_plane_message", "media"]
+    target_id: int
+    user_id: int
+    status: Literal["pending", "approved", "rejected", "replaced", "deleted", "hidden"]
+    risk_level: int
+    matched_words: list[str]
+    raw_content: str | None
+    display_content: str | None
+    reason: str | None
+    created_at: datetime
+    expires_at: datetime
+
+
+class ModerationItemPage(BaseModel):
+    items: list[ModerationItem]
+    page: int
+    page_size: int
+    total: int
+    has_more: bool
+
+
+class ModerationReviewRequest(BaseModel):
+    action: Literal["approve", "reject", "replace", "delete", "hide"]
+    reason: str = Field(min_length=1, max_length=255)
+    display_content: str | None = Field(default=None, max_length=2000)
+
+
+class ModerationReviewResponse(BaseModel):
+    id: int
+    target_type: str
+    target_id: int
+    status: str
+    reason: str
+
+
+class AdminGrantRequest(BaseModel):
+    user_id: int = Field(ge=1)
+    permissions: list[str] = Field(default_factory=list, max_length=50)
+
+
+class AdminGrantResponse(BaseModel):
+    user_id: int
+    role_code: Literal["admin"]
+    permissions: list[str]
