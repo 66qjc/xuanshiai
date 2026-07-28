@@ -899,6 +899,7 @@ Content-Type: image/jpeg
 | `id` | int | 是 | 消息 ID |
 | `conversation_id` | int | 是 | 所属会话 |
 | `from_user_id` | int | 是 | 发送者 ID |
+| `mine` | bool | 是 | 是否为当前请求用户发送的消息 |
 | `content` | string | 是 | 文本内容，语音消息为空串 |
 | `type` | int | 是 | `1` 文本 / `3` 语音 |
 | `media_url` | string \| null | 是 | 语音文件地址，仅 `/storage/uploads/` 内部路径 |
@@ -1159,3 +1160,84 @@ records, not these request values.
 - 明确当前响应数组没有 `total` 的接口契约，后续改动需要兼容迁移。
 
 - 2026-07-25：同城 `city` 回落与「未设置」422；`set_current_city` 拒无效名；feed 匹配 TRIM 前缀。
+
+## 2026-07-28 评论线程、举报查询与申诉
+
+本节是兼容性增量。旧 `GET /api/v1/community/posts/{post_id}/comments` 保持分页数组响应，旧客户端无需迁移；新客户端应使用以下游标接口构建线程。
+
+### `GET /api/v1/community/posts/{post_id}/comments/page`
+
+- 权限：已登录且已绑定手机号；不要求实名。
+- 请求体：无。
+- Query：`cursor` 可选、不透明字符串、最长 128；`page_size` 默认 20，范围 1~50。
+- 只返回一级评论，按 `id` 正序。动态不可见时返回 `404`。
+
+### `GET /api/v1/community/comments/{comment_id}/replies`
+
+- 权限、Query 与根评论页相同。
+- `comment_id` 必须是一级评论；传入回复 ID 返回 `422`，不存在或被管理员下架返回 `404`。
+- 回复按 `id` 正序；回复回复时仍归入同一根线程。
+
+两条接口统一返回：
+
+| 字段 | 类型 | 必返 | 含义 |
+| --- | --- | --- | --- |
+| `items` | array | 是 | 评论或回复；无数据为 `[]` |
+| `items[].root_id` | integer/null | 是 | 线程根评论 ID；一级评论返回自身 ID |
+| `items[].target_comment_id` | integer/null | 是 | 直接回复目标；一级评论为 `null` |
+| `items[].target_user_id` | integer/null | 是 | 直接回复目标作者；一级评论为 `null` |
+| `items[].reply_to_user` | string/null | 是 | 直接回复目标的昵称；一级评论为 `null`，用于展示「回复 @用户」 |
+| `items[].reply_count` | integer | 是 | 一级评论的有效回复数；回复通常为 `0` |
+| `items[].replies` | array | 是 | 仅一级评论返回按时间升序的前 3 条回复预览；回复列表仍通过独立游标接口继续加载 |
+| `items[].is_deleted` | boolean | 是 | 是否为用户删除墓碑 |
+| `items[].can_delete` | boolean | 是 | 当前登录用户能否删除该有效评论 |
+| `items[].content` | string | 是 | 墓碑固定为「该评论已删除」 |
+| `next_cursor` | string/null | 是 | 还有下一页时返回；客户端必须原样回传 |
+| `has_more` | boolean | 是 | 是否还有下一页 |
+
+响应示例：
+
+```json
+{
+  "items":[{
+    "id":21,"post_id":4,"user_id":8,"nickname":"回复者","avatar":null,
+    "parent_id":20,"root_id":10,"target_comment_id":20,"target_user_id":7,
+    "content":"我也这样认为","like_count":0,"is_liked":false,
+    "reply_count":0,"is_deleted":false,"created_at":"2026-07-28T10:00:00"
+  }],
+  "next_cursor":"eyJpZCI6MjF9","has_more":true
+}
+```
+
+`POST /api/v1/community/posts/{post_id}/comments` 的 `parent_id` 仍向后兼容；响应新增上述线程字段。父评论必须属于同一动态、未被用户删除且未被管理员下架。评论目标作者与当前用户之间任一方向存在拉黑关系时返回 `403`。用户删除写 `deleted_at`；有有效后代时在线程页保留墓碑，不再与管理员 `moderation_status` 共用状态。
+
+### `GET /api/v1/community/reports/mine`
+
+Query：`page` 默认 1、范围 1~1000；`page_size` 默认 20、范围 1~50。返回 `{items,page,page_size,total,has_more}`。`items` 包含当前用户提交的举报，以及当前用户作为被举报人的已处理结论；待处理举报不会暴露给被举报人。
+
+每项返回 `id`、`target_user_id`、`target_type`、`target_id`、`viewer_role`、`type`、`description`、`status`、`result`、`action`、`reviewed_at`、时间字段与 `can_appeal`。`viewer_role` 为 `reporter` 或 `subject`：仅举报提交者可看到自己填写的 `description`；被举报人侧固定返回 `description=null`。用户态响应不返回 `reporter_user_id` 或 `reviewed_by`，不得据此识别举报人或内部审核人。
+
+```json
+{
+  "items":[{
+    "id":31,"target_user_id":23,"target_type":"post","target_id":88,
+    "viewer_role":"subject","type":"harassment","description":null,
+    "status":1,"result":"举报成立","action":"hide_content",
+    "reviewed_at":"2026-07-28T10:30:00","created_at":"2026-07-27T09:00:00",
+    "updated_at":"2026-07-28T10:30:00","can_appeal":true
+  }],
+  "page":1,"page_size":20,"total":1,"has_more":false
+}
+```
+
+### `POST /api/v1/community/reports/{report_id}/appeals`
+
+- 权限：当前用户必须是该举报的被举报人。
+- Body：`{"reason":"内容没有违规，请复核"}`；`reason` 1~1000 字符。
+- 资格：举报必须为 `status=1` 已处理，且同一举报尚未提交申诉。
+- 成功：`201 Created`，返回 `id`、`report_id`、`appellant_user_id`、`reason`、`status=0`、处理结果和时间字段；用户态响应不返回复审人 ID。
+- 错误：非被举报人 `403`；举报非已处理终态或重复申诉 `409`；举报不存在 `404`；格式错误 `422`。
+
+### `GET /api/v1/community/report-appeals/mine`
+
+Query 与举报列表相同。返回当前用户提交的申诉分页，状态为 `0` 待复审、`1` 申诉通过、`2` 申诉驳回。申诉通过仅在内容当前仍由该举报下架时恢复管理员 `moderation_status`；后续独立审核决定不会被覆盖，也不会撤销用户本人删除的 `deleted_at`。

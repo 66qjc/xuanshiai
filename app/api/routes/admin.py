@@ -8,7 +8,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.dependencies import CurrentUser, get_current_admin
 from app.db.session import get_db
 from app.schemas.admin import (
+    AdminReportItem,
     AdminReportPage,
+    AdminReportAppealPage,
     CertificationReviewRequest,
     CertificationReviewResponse,
     ContentModerationRequest,
@@ -18,9 +20,18 @@ from app.schemas.admin import (
     ReportReviewRequest,
     ReportReviewResponse,
     AdminGrantRequest, AdminGrantResponse, ModerationItemPage, ModerationReviewRequest, ModerationReviewResponse,
+    ReportAppealReviewRequest,
+    ReportAppealReviewResponse,
 )
 from app.services.profile import review_media
-from app.services.social import list_admin_reports, moderate_content, review_report
+from app.services.social import (
+    get_admin_report,
+    list_admin_report_appeals,
+    list_admin_reports,
+    moderate_content,
+    review_report,
+    review_report_appeal,
+)
 from app.services.certifications import review_certification
 from app.services.moderation import grant_admin, list_moderation_items, review_moderation_item
 
@@ -42,9 +53,7 @@ async def review_moderation_item_route(
     task_id: int = Path(..., ge=1), body: ModerationReviewRequest = Body(...),
     admin: CurrentUser = Depends(get_current_admin), db: AsyncSession = Depends(get_db),
 ) -> ModerationReviewResponse:
-    response = await review_moderation_item(db, task_id, body, admin_id=admin.id)
-    await db.commit()
-    return response
+    return await review_moderation_item(db, task_id, body, admin_id=admin.id)
 
 
 @router.post("/users/grant", response_model=AdminGrantResponse, summary="授予管理员及权限")
@@ -71,9 +80,47 @@ async def list_reports(
     return await list_admin_reports(db, page=page, page_size=page_size, status=status, target_type=target_type)
 
 
+@router.get("/reports/{report_id}", response_model=AdminReportItem, summary="举报详情")
+async def report_detail(
+    report_id: int = Path(..., ge=1),
+    admin: CurrentUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+) -> AdminReportItem:
+    return await get_admin_report(db, report_id)
+
+
 @router.patch("/reports/{report_id}/review", response_model=ReportReviewResponse, summary="处理用户举报")
 async def review_user_report(report_id: int = Path(..., ge=1), body: ReportReviewRequest = Body(...), admin: CurrentUser = Depends(get_current_admin), db: AsyncSession = Depends(get_db)) -> ReportReviewResponse:
     return await review_report(db, report_id, body, actor_id=admin.id)
+
+
+@router.get("/report-appeals", response_model=AdminReportAppealPage, summary="举报申诉列表")
+async def report_appeals(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    status: Literal[0, 1, 2] | None = Query(default=None),
+    admin: CurrentUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+) -> AdminReportAppealPage:
+    return await list_admin_report_appeals(
+        db, page=page, page_size=page_size, status=status
+    )
+
+
+@router.patch(
+    "/report-appeals/{appeal_id}/review",
+    response_model=ReportAppealReviewResponse,
+    summary="复审举报申诉",
+)
+async def review_appeal(
+    appeal_id: int = Path(..., ge=1),
+    body: ReportAppealReviewRequest = Body(...),
+    admin: CurrentUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+) -> ReportAppealReviewResponse:
+    return await review_report_appeal(
+        db, appeal_id=appeal_id, request=body, actor_id=admin.id
+    )
 
 
 @router.patch(

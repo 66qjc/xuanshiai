@@ -99,11 +99,28 @@ class CommunityCommentResponse(BaseModel):
     nickname: str | None
     avatar: str | None
     parent_id: int | None
+    root_id: int | None = None
+    target_comment_id: int | None = None
+    target_user_id: int | None = None
+    reply_to_user: str | None = None
     content: str
     like_count: int
     is_liked: bool = False
+    reply_count: int = 0
+    is_deleted: bool = False
+    can_delete: bool = False
+    replies: list["CommunityCommentResponse"] = Field(default_factory=list)
     created_at: datetime
     moderation_status: Literal["approved", "pending", "rejected", "deleted", "hidden"] = "approved"
+
+
+class CommentCursorPage(BaseModel):
+    items: list[CommunityCommentResponse]
+    next_cursor: str | None = None
+    has_more: bool = False
+
+
+CommunityCommentResponse.model_rebuild()
 
 
 class CommunityTopicResponse(BaseModel):
@@ -365,6 +382,7 @@ class PaperPlaneMessageResponse(BaseModel):
     id: int
     conversation_id: int
     from_user_id: int
+    mine: bool
     content: str
     type: int
     media_url: str | None = None

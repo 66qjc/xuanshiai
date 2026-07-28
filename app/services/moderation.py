@@ -17,6 +17,7 @@ from app.schemas.admin import (
     ModerationReviewRequest,
     ModerationReviewResponse,
 )
+from app.services.notifications import emit_notification
 
 TARGET_TABLES = {
     "post": ("community_post", "moderation_status", "content"),
@@ -26,6 +27,8 @@ TARGET_TABLES = {
     "paper_plane_message": ("paper_plane_message", "moderation_status", "content"),
     "media": ("community_media", "moderation_status", "file_url"),
 }
+
+_NUMERIC_MODERATION_TARGETS = {"post", "comment", "paper_plane"}
 
 
 async def list_moderation_items(db: AsyncSession, *, page: int, page_size: int, status: str = "pending", target_type: str | None = None) -> ModerationItemPage:
@@ -68,16 +71,23 @@ async def review_moderation_item(db: AsyncSession, task_id: int, request: Modera
     if task["target_type"] == "media" and request.action == "replace":
         raise HTTPException(422, detail="媒体不支持文本替换，请通过、下架或删除")
     table, status_column, content_column = TARGET_TABLES[task["target_type"]]
-    if task["target_type"] == "paper_plane":
+    if task["target_type"] in _NUMERIC_MODERATION_TARGETS:
+        # Community tables use 0=pending, 1=approved, 2=hidden.
         db_status = 1 if action_status in {"approved", "replaced"} else 2
     else:
         db_status = action_status
     params = {"id": task["target_id"], "status": db_status, "reason": request.reason, "admin_id": admin_id}
     content_sql = ""
+    lifecycle_sql = ""
+    if request.action == "delete":
+        if task["target_type"] in {"post", "comment", "media"}:
+            lifecycle_sql = ", deleted_at = UTC_TIMESTAMP()"
+        elif task["target_type"] == "paper_plane":
+            lifecycle_sql = ", status = 3"
     if request.action == "replace":
         content_sql = f", {content_column} = :display_content"
         params["display_content"] = request.display_content
-    await db.execute(text(f"UPDATE `{table}` SET `{status_column}` = :status, moderation_reason = :reason, moderated_by = :admin_id, moderated_at = UTC_TIMESTAMP(){content_sql} WHERE id = :id"), params)
+    await db.execute(text(f"UPDATE `{table}` SET `{status_column}` = :status, moderation_reason = :reason, moderated_by = :admin_id, moderated_at = UTC_TIMESTAMP(){lifecycle_sql}{content_sql} WHERE id = :id"), params)
     await db.execute(text("""UPDATE community_moderation_task
         SET status = :status, reason = :reason, reviewed_by = :admin_id, reviewed_at = UTC_TIMESTAMP(),
             display_content = COALESCE(:display_content, display_content)
@@ -88,12 +98,18 @@ async def review_moderation_item(db: AsyncSession, task_id: int, request: Modera
         "admin_id": admin_id, "target_type": task["target_type"], "target_id": task["target_id"],
         "before_json": json.dumps({"status": "pending"}), "after_json": json.dumps({"status": action_status}), "reason": request.reason,
     })
-    await db.execute(text("""INSERT INTO user_notification
-        (user_id, notification_type, title, content, payload, related_id)
-        VALUES (:user_id, 'community_moderation_result', '内容审核结果', :content, :payload, :related_id)"""), {
-        "user_id": task["user_id"], "content": f"你的内容审核结果：{action_status}",
-        "payload": json.dumps({"target_type": task["target_type"], "target_id": task["target_id"], "status": action_status}, ensure_ascii=False), "related_id": task["target_id"],
-    })
+    await emit_notification(
+        db,
+        recipient_user_id=int(task["user_id"]),
+        actor_user_id=None,
+        event_type="community_moderation_result",
+        title="内容审核结果",
+        content=f"你的内容审核结果：{action_status}",
+        target_type=task["target_type"],
+        target_id=int(task["target_id"]),
+        payload={"status": action_status},
+    )
+    await db.commit()
     return ModerationReviewResponse(id=task_id, target_type=task["target_type"], target_id=int(task["target_id"]), status=action_status, reason=request.reason)
 
 

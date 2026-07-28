@@ -23,10 +23,25 @@ from app.schemas.social import (
     RelationResponse,
     ReportRequest,
     ReportResponse,
+    ReportAppealCreate,
+    ReportAppealPage,
+    ReportAppealResponse,
+    ReportDetailResponse,
+    ReportPage,
     SocialUser,
 )
-from app.schemas.admin import AdminReportPage, ReportReviewRequest, ReportReviewResponse
+from app.schemas.admin import (
+    AdminReportAppealItem,
+    AdminReportAppealPage,
+    AdminReportItem,
+    AdminReportPage,
+    ReportAppealReviewRequest,
+    ReportAppealReviewResponse,
+    ReportReviewRequest,
+    ReportReviewResponse,
+)
 from app.services.discovery import _ensure_target, _target_rows
+from app.services.notifications import emit_notification
 from app.services.profile import _calculate_age
 
 
@@ -63,20 +78,6 @@ async def _match_exists(db: AsyncSession, user_id: int, target_id: int) -> bool:
     return bool(result.scalar())
 
 
-async def _notify(db: AsyncSession, user_id: int, notification_type: str, title: str, content: str, related_user_id: int, related_id: int | None = None) -> None:
-    await db.execute(text("""INSERT INTO user_notification
-        (user_id, notification_type, title, content, payload, related_user_id, related_id)
-        VALUES (:user_id, :notification_type, :title, :content, :payload, :related_user_id, :related_id)"""), {
-        "user_id": user_id,
-        "notification_type": notification_type,
-        "title": title,
-        "content": content,
-        "payload": json.dumps({"related_user_id": related_user_id}),
-        "related_user_id": related_user_id,
-        "related_id": related_id,
-    })
-
-
 async def set_like(db: AsyncSession, user_id: int, target_id: int, enabled: bool) -> RelationResponse:
     """用户级喜欢：私有列表，不因互喜欢建 match/会话。聊天仅经申请同意。"""
     await _ensure_target(db, user_id, target_id)
@@ -110,7 +111,18 @@ async def set_like(db: AsyncSession, user_id: int, target_id: int, enabled: bool
 async def set_follow(db: AsyncSession, user_id: int, target_id: int, enabled: bool) -> RelationResponse:
     await _ensure_target(db, user_id, target_id)
     if enabled:
-        await db.execute(text("INSERT IGNORE INTO user_favorite (user_id, target_user_id, type) VALUES (:user_id, :target_id, 3)"), {"user_id": user_id, "target_id": target_id})
+        result = await db.execute(text("INSERT IGNORE INTO user_favorite (user_id, target_user_id, type) VALUES (:user_id, :target_id, 3)"), {"user_id": user_id, "target_id": target_id})
+        if getattr(result, "rowcount", 1) > 0:
+            await emit_notification(
+                db,
+                recipient_user_id=target_id,
+                actor_user_id=user_id,
+                event_type="follow",
+                title="有人关注了你",
+                content="你收到了一条新的关注",
+                target_type="user",
+                target_id=user_id,
+            )
     else:
         await db.execute(text("DELETE FROM user_favorite WHERE user_id = :user_id AND target_user_id = :target_id AND type = 3"), {"user_id": user_id, "target_id": target_id})
     await db.commit()
@@ -228,7 +240,7 @@ async def revoke_message(db: AsyncSession, user_id: int, message_id: int) -> Non
 
 async def list_notifications(db: AsyncSession, user_id: int, page: int, page_size: int) -> NotificationPage:
     params = {"user_id": user_id, "limit": page_size, "offset": (page - 1) * page_size}
-    result = await db.execute(text("SELECT id, notification_type, title, content, payload, related_user_id, related_id, is_read, created_at FROM user_notification WHERE user_id = :user_id ORDER BY created_at DESC, id DESC LIMIT :limit OFFSET :offset"), params)
+    result = await db.execute(text("SELECT id, notification_type, title, content, payload, related_user_id, related_id, target_type, target_id, is_read, created_at FROM user_notification WHERE user_id = :user_id ORDER BY created_at DESC, id DESC LIMIT :limit OFFSET :offset"), params)
     items = []
     for row in result.mappings().all():
         payload = row["payload"]
@@ -237,14 +249,14 @@ async def list_notifications(db: AsyncSession, user_id: int, page: int, page_siz
                 payload = json.loads(payload)
             except json.JSONDecodeError:
                 payload = None
-        items.append(NotificationItem(id=int(row["id"]), notification_type=row["notification_type"], title=row["title"], content=row["content"] or "", payload=payload, related_user_id=row["related_user_id"], related_id=row["related_id"], is_read=bool(row["is_read"]), created_at=row["created_at"]))
+        items.append(NotificationItem(id=int(row["id"]), notification_type=row["notification_type"], title=row["title"], content=row["content"] or "", payload=payload, related_user_id=row["related_user_id"], related_id=row["related_id"], target_type=row.get("target_type"), target_id=row.get("target_id"), actor_user_id=row["related_user_id"], action=row["notification_type"], is_read=bool(row["is_read"]), created_at=row["created_at"]))
     total = int((await db.execute(text("SELECT COUNT(*) FROM user_notification WHERE user_id = :user_id"), {"user_id": user_id})).scalar() or 0)
     unread = int((await db.execute(text("SELECT COUNT(*) FROM user_notification WHERE user_id = :user_id AND is_read = 0"), {"user_id": user_id})).scalar() or 0)
     return NotificationPage(items=items, page=page, page_size=page_size, total=total, unread_count=unread)
 
 
 async def mark_notification_read(db: AsyncSession, user_id: int, notification_id: int | None) -> None:
-    condition = "notification_id = :notification_id" if notification_id is not None else "1 = 1"
+    condition = "id = :notification_id" if notification_id is not None else "1 = 1"
     params = {"user_id": user_id, "notification_id": notification_id}
     await db.execute(text(f"UPDATE user_notification SET is_read = 1, read_at = UTC_TIMESTAMP() WHERE user_id = :user_id AND {condition}"), params)
     await db.commit()
@@ -254,7 +266,7 @@ async def get_privacy(db: AsyncSession, user_id: int) -> PrivacyResponse:
     result = await db.execute(text("SELECT * FROM user_privacy WHERE user_id = :user_id"), {"user_id": user_id})
     row = result.mappings().first()
     values = dict(row) if row else {"user_id": user_id}
-    defaults = {"hide_phone": 0, "hide_school": 0, "hide_company": 0, "hide_distance": 0, "hide_online_status": 0, "only_auth_can_contact": 0, "only_vip_can_see_detail": 0, "who_can_see_me": 1, "match_status": 1, "anonymous_browse_enabled": 0, "show_profile": 1, "show_likes": 1, "show_posts": 1, "notify_like": 1, "notify_comment": 1, "notify_match": 1, "notify_apply": 1, "notify_system": 1, "notify_activity": 1}
+    defaults = {"hide_phone": 0, "hide_school": 0, "hide_company": 0, "hide_distance": 0, "hide_online_status": 0, "only_auth_can_contact": 0, "only_vip_can_see_detail": 0, "who_can_see_me": 1, "match_status": 1, "anonymous_browse_enabled": 0, "show_profile": 1, "show_likes": 1, "show_posts": 1, "notify_like": 1, "notify_comment": 1, "notify_follow": 1, "notify_message": 1, "notify_match": 1, "notify_apply": 1, "notify_system": 1, "notify_activity": 1}
     values = {**defaults, **values, "user_id": user_id}
     return PrivacyResponse(**{key: bool(value) if key not in ("user_id", "who_can_see_me", "match_status") else value for key, value in values.items() if key in PrivacyResponse.model_fields})
 
@@ -281,7 +293,7 @@ async def set_block(db: AsyncSession, user_id: int, target_id: int, request: Blo
     if enabled:
         await _ensure_target(db, user_id, target_id)
         await db.execute(text("INSERT IGNORE INTO user_block (user_id, target_user_id, reason) VALUES (:user_id, :target_id, :reason)"), {"user_id": user_id, "target_id": target_id, "reason": request.reason if request else None})
-        await db.execute(text("UPDATE user_match SET status = 3, updated_at = UTC_TIMESTAMP() WHERE (user_id = :user_id AND target_user_id = :target_id) OR (user_id = :target_id AND target_user_id = :user_id"), {"user_id": user_id, "target_id": target_id})
+        await db.execute(text("UPDATE user_match SET status = 3, updated_at = UTC_TIMESTAMP() WHERE (user_id = :user_id AND target_user_id = :target_id) OR (user_id = :target_id AND target_user_id = :user_id)"), {"user_id": user_id, "target_id": target_id})
         await db.execute(text("UPDATE match_apply SET status = 3, updated_at = UTC_TIMESTAMP() WHERE status = 0 AND ((from_user_id = :user_id AND to_user_id = :target_id) OR (from_user_id = :target_id AND to_user_id = :user_id))"), {"user_id": user_id, "target_id": target_id})
     else:
         result = await db.execute(text("SELECT 1 FROM users WHERE id = :target_id AND status = 1"), {"target_id": target_id})
@@ -448,9 +460,7 @@ async def list_admin_reports(
     page_size: int,
     status: int | None = None,
     target_type: str | None = None,
-) -> "AdminReportPage":
-    from app.schemas.admin import AdminReportItem, AdminReportPage
-
+) -> AdminReportPage:
     where = ["1=1"]
     params: dict[str, Any] = {"limit": page_size, "offset": (page - 1) * page_size}
     if status is not None:
@@ -469,7 +479,8 @@ async def list_admin_reports(
     result = await db.execute(
         text(
             f"""SELECT id, user_id AS reporter_user_id, target_user_id, target_type, target_id,
-            type, `desc` AS description, status, result, created_at, updated_at
+            type, `desc` AS description, status, result, COALESCE(action, 'none') AS action,
+            reviewed_by, reviewed_at, created_at, updated_at
             FROM user_report
             WHERE {where_sql}
             ORDER BY created_at DESC, id DESC
@@ -491,12 +502,218 @@ async def list_admin_reports(
                 description=data.get("description"),
                 status=int(data["status"]),
                 result=data.get("result"),
+                action=data.get("action") or "none",
+                reviewed_by=int(data["reviewed_by"]) if data.get("reviewed_by") is not None else None,
+                reviewed_at=data.get("reviewed_at"),
                 created_at=data["created_at"],
                 updated_at=data.get("updated_at"),
             )
         )
     return AdminReportPage(
         items=items,
+        page=page,
+        page_size=page_size,
+        total=total,
+        has_more=page * page_size < total,
+    )
+
+
+def _user_report_detail(row: dict[str, Any], *, viewer_id: int) -> ReportDetailResponse:
+    status = int(row["status"])
+    target_user_id = int(row["target_user_id"])
+    viewer_role = "reporter" if int(row["reporter_user_id"]) == viewer_id else "subject"
+    return ReportDetailResponse(
+        id=int(row["id"]),
+        target_user_id=target_user_id,
+        target_type=row.get("target_type") or "user",
+        target_id=int(row["target_id"]) if row.get("target_id") is not None else None,
+        viewer_role=viewer_role,
+        type=row.get("type"),
+        description=row.get("description") if viewer_role == "reporter" else None,
+        status=status,
+        result=row.get("result"),
+        action=row.get("action") or "none",
+        reviewed_at=row.get("reviewed_at"),
+        created_at=row["created_at"],
+        updated_at=row.get("updated_at"),
+        can_appeal=(
+            viewer_id is not None
+            and viewer_id == target_user_id
+            and status == 1
+            and not bool(row.get("has_appeal"))
+        ),
+    )
+
+
+async def list_my_reports(
+    db: AsyncSession, user_id: int, *, page: int, page_size: int
+) -> ReportPage:
+    where = "user_id = :user_id OR (target_user_id = :user_id AND status = 1)"
+    total = int(
+        (await db.execute(text(f"SELECT COUNT(*) FROM user_report WHERE {where}"), {"user_id": user_id})).scalar()
+        or 0
+    )
+    result = await db.execute(
+        text(
+            f"""SELECT r.id, r.user_id AS reporter_user_id, r.target_user_id,
+            r.target_type, r.target_id, r.type, r.`desc` AS description, r.status,
+            r.result, COALESCE(r.action, 'none') AS action, r.reviewed_by,
+            r.reviewed_at, r.created_at, r.updated_at,
+            EXISTS (SELECT 1 FROM report_appeal a WHERE a.report_id = r.id) AS has_appeal
+            FROM user_report r WHERE {where}
+            ORDER BY r.created_at DESC, r.id DESC LIMIT :limit OFFSET :offset"""
+        ),
+        {"user_id": user_id, "limit": page_size, "offset": (page - 1) * page_size},
+    )
+    return ReportPage(
+        items=[_user_report_detail(dict(row), viewer_id=user_id) for row in result.mappings().all()],
+        page=page,
+        page_size=page_size,
+        total=total,
+        has_more=page * page_size < total,
+    )
+
+
+async def get_admin_report(db: AsyncSession, report_id: int) -> AdminReportItem:
+    result = await db.execute(
+        text(
+            """SELECT r.id, r.user_id AS reporter_user_id, r.target_user_id,
+            r.target_type, r.target_id, r.type, r.`desc` AS description, r.status,
+            r.result, COALESCE(r.action, 'none') AS action, r.reviewed_by,
+            r.reviewed_at, r.created_at, r.updated_at,
+            EXISTS (SELECT 1 FROM report_appeal a WHERE a.report_id = r.id) AS has_appeal
+            FROM user_report r WHERE r.id = :report_id"""
+        ),
+        {"report_id": report_id},
+    )
+    row = result.mappings().first()
+    if not row:
+        raise HTTPException(404, detail="举报记录不存在")
+    return AdminReportItem(**dict(row))
+
+
+def _appeal_response(row: dict[str, Any]) -> ReportAppealResponse:
+    return ReportAppealResponse(
+        id=int(row["id"]),
+        report_id=int(row["report_id"]),
+        appellant_user_id=int(row["appellant_user_id"]),
+        reason=row["reason"],
+        status=int(row["status"]),
+        result=row.get("result"),
+        reviewed_at=row.get("reviewed_at"),
+        created_at=row["created_at"],
+        updated_at=row.get("updated_at"),
+    )
+
+
+async def create_report_appeal(
+    db: AsyncSession,
+    *,
+    user_id: int,
+    report_id: int,
+    request: ReportAppealCreate,
+) -> ReportAppealResponse:
+    report_result = await db.execute(
+        text(
+            """SELECT id, target_user_id, target_type, target_id, status, action, reviewed_by
+            FROM user_report WHERE id = :report_id FOR UPDATE"""
+        ),
+        {"report_id": report_id},
+    )
+    report = report_result.mappings().first()
+    if not report:
+        raise HTTPException(404, detail="举报记录不存在")
+    if int(report["target_user_id"]) != user_id:
+        raise HTTPException(403, detail="只有被举报人可以申诉")
+    if int(report["status"]) != 1:
+        raise HTTPException(409, detail="该举报结论不支持申诉")
+    duplicated = await db.execute(
+        text("SELECT 1 FROM report_appeal WHERE report_id = :report_id"),
+        {"report_id": report_id},
+    )
+    if duplicated.scalar():
+        raise HTTPException(409, detail="该举报已提交申诉")
+    inserted = await db.execute(
+        text(
+            """INSERT INTO report_appeal (report_id, appellant_user_id, reason)
+            VALUES (:report_id, :user_id, :reason)"""
+        ),
+        {"report_id": report_id, "user_id": user_id, "reason": request.reason},
+    )
+    await db.commit()
+    created = await db.execute(
+        text(
+            """SELECT id, report_id, appellant_user_id, reason, status, result,
+            reviewed_by, reviewed_at, created_at, updated_at
+            FROM report_appeal WHERE id = :appeal_id"""
+        ),
+        {"appeal_id": inserted.lastrowid},
+    )
+    return _appeal_response(dict(created.mappings().one()))
+
+
+async def list_my_report_appeals(
+    db: AsyncSession, user_id: int, *, page: int, page_size: int
+) -> ReportAppealPage:
+    total = int(
+        (
+            await db.execute(
+                text("SELECT COUNT(*) FROM report_appeal WHERE appellant_user_id = :user_id"),
+                {"user_id": user_id},
+            )
+        ).scalar()
+        or 0
+    )
+    result = await db.execute(
+        text(
+            """SELECT id, report_id, appellant_user_id, reason, status, result,
+            reviewed_by, reviewed_at, created_at, updated_at FROM report_appeal
+            WHERE appellant_user_id = :user_id
+            ORDER BY created_at DESC, id DESC LIMIT :limit OFFSET :offset"""
+        ),
+        {"user_id": user_id, "limit": page_size, "offset": (page - 1) * page_size},
+    )
+    return ReportAppealPage(
+        items=[_appeal_response(dict(row)) for row in result.mappings().all()],
+        page=page,
+        page_size=page_size,
+        total=total,
+        has_more=page * page_size < total,
+    )
+
+
+async def list_admin_report_appeals(
+    db: AsyncSession,
+    *,
+    page: int,
+    page_size: int,
+    status: int | None = None,
+) -> AdminReportAppealPage:
+    where = "1=1" if status is None else "a.status = :status"
+    params: dict[str, Any] = {
+        "limit": page_size,
+        "offset": (page - 1) * page_size,
+    }
+    if status is not None:
+        params["status"] = status
+    total = int(
+        (await db.execute(text(f"SELECT COUNT(*) FROM report_appeal a WHERE {where}"), params)).scalar()
+        or 0
+    )
+    result = await db.execute(
+        text(
+            f"""SELECT a.id, a.report_id, a.appellant_user_id, a.reason, a.status,
+            a.result, a.reviewed_by, a.reviewed_at, a.created_at, a.updated_at,
+            r.target_type, r.target_id, r.action AS original_action,
+            r.reviewed_by AS original_reviewer_id
+            FROM report_appeal a JOIN user_report r ON r.id = a.report_id
+            WHERE {where} ORDER BY a.created_at ASC, a.id ASC
+            LIMIT :limit OFFSET :offset"""
+        ),
+        params,
+    )
+    return AdminReportAppealPage(
+        items=[AdminReportAppealItem(**dict(row)) for row in result.mappings().all()],
         page=page,
         page_size=page_size,
         total=total,
@@ -512,32 +729,60 @@ async def moderate_content(
     hide: bool,
     reason: str | None = None,
     actor_id: int | None = None,
-) -> None:
+    source_report_id: int | None = None,
+    expected_report_id: int | None = None,
+) -> bool:
+    expected_clause = (
+        " AND moderation_status = 2 AND moderation_report_id = :expected_report_id"
+        if expected_report_id is not None
+        else ""
+    )
+    params = {
+        "status": 2 if hide else 1,
+        "target_id": target_id,
+        "source_report_id": source_report_id if hide else None,
+        "expected_report_id": expected_report_id,
+    }
     if target_type == "post":
-        # status: 1 正常 / 3 违规下架（与用户自删共用；本期文档约定不可见）
-        status = 3 if hide else 1
         result = await db.execute(
-            text("UPDATE community_post SET status = :status, updated_at = UTC_TIMESTAMP() WHERE id = :target_id"),
-            {"status": status, "target_id": target_id},
+            text(
+                "UPDATE community_post SET moderation_status = :status, "
+                "moderation_report_id = :source_report_id, updated_at = UTC_TIMESTAMP() "
+                f"WHERE id = :target_id{expected_clause}"
+            ),
+            params,
         )
         if result.rowcount == 0:
+            if expected_report_id is not None:
+                return False
             raise HTTPException(404, detail="动态不存在")
     elif target_type == "comment":
-        status = 2 if hide else 1
         result = await db.execute(
-            text("UPDATE community_comment SET status = :status WHERE id = :target_id"),
-            {"status": status, "target_id": target_id},
+            text(
+                "UPDATE community_comment SET moderation_status = :status, "
+                "moderation_report_id = :source_report_id "
+                f"WHERE id = :target_id{expected_clause}"
+            ),
+            params,
         )
         if result.rowcount == 0:
+            if expected_report_id is not None:
+                return False
             raise HTTPException(404, detail="评论不存在")
     elif target_type == "paper_plane":
         # lifecycle status 不动；仅改 moderation_status 1正常 2下架
         status = 2 if hide else 1
         result = await db.execute(
-            text("UPDATE paper_plane SET moderation_status = :status WHERE id = :target_id"),
-            {"status": status, "target_id": target_id},
+            text(
+                "UPDATE paper_plane SET moderation_status = :status, "
+                "moderation_report_id = :source_report_id "
+                f"WHERE id = :target_id{expected_clause}"
+            ),
+            {**params, "status": status},
         )
         if result.rowcount == 0:
+            if expected_report_id is not None:
+                return False
             raise HTTPException(404, detail="纸飞机不存在")
     else:
         raise HTTPException(422, detail="不支持的内容类型")
@@ -559,10 +804,20 @@ async def moderate_content(
         )
 
 
+    return True
+
+
 async def review_report(db: AsyncSession, report_id: int, request: ReportReviewRequest, *, actor_id: int | None = None) -> ReportReviewResponse:
+    action = request.action or "none"
+    if action in ("hide_content", "restore_content") and request.status != 1:
+        raise HTTPException(422, detail="内容处置只能用于成立的举报")
+    if action == "dismiss" and request.status != 2:
+        raise HTTPException(422, detail="dismiss 只能用于驳回的举报")
+
     result = await db.execute(
         text(
-            """SELECT id, target_type, target_id, status FROM user_report
+            """SELECT id, user_id, target_user_id, target_type, target_id, status
+            FROM user_report
             WHERE id = :report_id FOR UPDATE"""
         ),
         {"report_id": report_id},
@@ -570,13 +825,10 @@ async def review_report(db: AsyncSession, report_id: int, request: ReportReviewR
     row = result.mappings().first()
     if not row:
         raise HTTPException(404, detail="举报记录不存在")
+    if int(row["status"]) != 0:
+        raise HTTPException(409, detail="举报已进入终态，不能重复审核")
 
-    action = request.action or "none"
     status = request.status
-    if action == "dismiss":
-        status = 2
-    elif action in ("hide_content", "restore_content") and status not in (1, 2):
-        status = 1
 
     content_moderated = False
     target_type = row.get("target_type") or "user"
@@ -591,17 +843,47 @@ async def review_report(db: AsyncSession, report_id: int, request: ReportReviewR
             hide=(action == "hide_content"),
             reason=request.result,
             actor_id=actor_id,
+            source_report_id=report_id if action == "hide_content" else None,
         )
         content_moderated = True
 
     await db.execute(
         text(
             """UPDATE user_report
-            SET status = :status, result = :result, updated_at = UTC_TIMESTAMP()
+            SET status = :status, result = :result, action = :action,
+                reviewed_by = :reviewed_by, reviewed_at = UTC_TIMESTAMP(),
+                updated_at = UTC_TIMESTAMP()
             WHERE id = :report_id"""
         ),
-        {"report_id": report_id, "status": status, "result": request.result},
+        {
+            "report_id": report_id,
+            "status": status,
+            "result": request.result,
+            "action": action,
+            "reviewed_by": actor_id,
+        },
     )
+    await emit_notification(
+        db,
+        recipient_user_id=int(row["user_id"]),
+        actor_user_id=None,
+        event_type="report_result",
+        title="举报处理结果",
+        content=request.result,
+        target_type="report",
+        target_id=report_id,
+    )
+    if status == 1:
+        await emit_notification(
+            db,
+            recipient_user_id=int(row["target_user_id"]),
+            actor_user_id=None,
+            event_type="report_result",
+            title="内容治理通知",
+            content=request.result,
+            target_type="report",
+            target_id=report_id,
+        )
     await db.commit()
     return ReportReviewResponse(
         report_id=report_id,
@@ -609,4 +891,81 @@ async def review_report(db: AsyncSession, report_id: int, request: ReportReviewR
         result=request.result,
         action=action,
         content_moderated=content_moderated,
+    )
+
+
+async def review_report_appeal(
+    db: AsyncSession,
+    *,
+    appeal_id: int,
+    request: ReportAppealReviewRequest,
+    actor_id: int,
+) -> ReportAppealReviewResponse:
+    result = await db.execute(
+        text(
+            """SELECT a.id, a.report_id, a.appellant_user_id, a.status,
+            r.target_type, r.target_id, r.action AS original_action,
+            r.reviewed_by AS original_reviewer_id
+            FROM report_appeal a JOIN user_report r ON r.id = a.report_id
+            WHERE a.id = :appeal_id FOR UPDATE"""
+        ),
+        {"appeal_id": appeal_id},
+    )
+    row = result.mappings().first()
+    if not row:
+        raise HTTPException(404, detail="申诉记录不存在")
+    if int(row["status"]) != 0:
+        raise HTTPException(409, detail="申诉已进入终态，不能重复审核")
+    original_reviewer = row.get("original_reviewer_id")
+    if original_reviewer is not None and int(original_reviewer) == actor_id:
+        raise HTTPException(409, detail="申诉必须由不同于原举报审核人的管理员复审")
+
+    content_restored = False
+    target_type = row.get("target_type") or "user"
+    target_id = row.get("target_id")
+    if (
+        request.status == 1
+        and row.get("original_action") == "hide_content"
+        and target_type != "user"
+        and target_id is not None
+    ):
+        content_restored = await moderate_content(
+            db,
+            target_type=target_type,
+            target_id=int(target_id),
+            hide=False,
+            reason=request.result,
+            actor_id=actor_id,
+            expected_report_id=int(row["report_id"]),
+        )
+    await db.execute(
+        text(
+            """UPDATE report_appeal SET status = :status, result = :result,
+            reviewed_by = :reviewed_by, reviewed_at = UTC_TIMESTAMP(),
+            updated_at = UTC_TIMESTAMP() WHERE id = :appeal_id"""
+        ),
+        {
+            "appeal_id": appeal_id,
+            "status": request.status,
+            "result": request.result,
+            "reviewed_by": actor_id,
+        },
+    )
+    await emit_notification(
+        db,
+        recipient_user_id=int(row["appellant_user_id"]),
+        actor_user_id=None,
+        event_type="appeal_result",
+        title="申诉复审结果",
+        content=request.result,
+        target_type="report",
+        target_id=int(row["report_id"]),
+    )
+    await db.commit()
+    return ReportAppealReviewResponse(
+        appeal_id=appeal_id,
+        report_id=int(row["report_id"]),
+        status=request.status,
+        result=request.result,
+        content_restored=content_restored,
     )

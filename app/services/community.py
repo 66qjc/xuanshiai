@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import logging
 from datetime import UTC, datetime, timedelta
@@ -23,6 +25,7 @@ from app.schemas.community import (
     CommunityCollectResponse,
     CommunityCommentCreate,
     CommunityCommentResponse,
+    CommentCursorPage,
     CommunityPostCreate,
     CommunityPostPage,
     CommunityPostResponse,
@@ -47,6 +50,7 @@ from app.services.community_media import (
     resolve_owned_ready_media,
 )
 from app.services.profile import _calculate_age, _json_list
+from app.services.notifications import emit_notification, ensure_interaction_allowed
 
 logger = logging.getLogger(__name__)
 
@@ -113,37 +117,38 @@ async def _record_moderation_task(
             "expires_at": expires_at,
         },
     )
-    await db.execute(
-        text("""INSERT INTO user_notification
-            (user_id, notification_type, title, content, payload, related_id)
-            VALUES (:user_id, 'community_moderation_submitted', :notice_title,
-                    :notice_content, :payload, :related_id)"""),
-        {
-            "user_id": user_id,
-            "payload": json.dumps({"target_type": target_type, "target_id": target_id}, ensure_ascii=False),
-            "related_id": target_id,
-            "notice_title": notice_title,
-            "notice_content": notice_content,
-        },
+    await emit_notification(
+        db,
+        recipient_user_id=user_id,
+        actor_user_id=None,
+        event_type="community_moderation_submitted",
+        title=notice_title,
+        content=notice_content,
+        target_type=target_type,
+        target_id=target_id,
     )
 
 
 async def _notify_moderation_rejected(db: AsyncSession, user_id: int, target_type: str) -> None:
-    await db.execute(
-        text("""INSERT INTO user_notification
-            (user_id, notification_type, title, content, payload)
-            VALUES (:user_id, 'community_moderation_result', '内容未通过审核',
-                    '你的内容未通过审核，请修改后重新提交', :payload)"""),
-        {"user_id": user_id, "payload": json.dumps({"target_type": target_type, "status": "rejected"}, ensure_ascii=False)},
+    await emit_notification(
+        db,
+        recipient_user_id=user_id,
+        actor_user_id=None,
+        event_type="community_moderation_result",
+        title="内容未通过审核",
+        content="你的内容未通过审核，请修改后重新提交",
+        target_type=target_type,
+        payload={"status": "rejected"},
     )
 
 
 def _post_select_sql(extra_where: str = "", *, include_pending: bool = False) -> str:
     # school 在 user_auth，不在 user_profile（实测 Unknown column up.school）
-    moderation_clause = "" if include_pending else "AND COALESCE(p.moderation_status, 'approved') = 'approved'"
+    moderation_clause = "AND COALESCE(p.moderation_status, 1) IN (0, 1)" if include_pending else "AND COALESCE(p.moderation_status, 1) = 1"
     return f"""SELECT p.id, p.user_id, u.nickname, u.avatar, u.gender, u.birthday,
         p.content, p.images, p.video, p.location, p.visibility, p.declaration, p.topic_id, t.name AS topic_name,
-        p.like_count, p.comment_count, p.created_at, COALESCE(p.moderation_status, 'approved') AS moderation_status,
+        p.like_count, p.comment_count, p.created_at,
+        CASE COALESCE(p.moderation_status, 1) WHEN 1 THEN 'approved' WHEN 0 THEN 'pending' WHEN 2 THEN 'hidden' ELSE 'approved' END AS moderation_status,
         up.mbti, ua.school, up.hometown, up.residence, COALESCE(ua.realname_status, 0) AS realname_status,
         EXISTS (SELECT 1 FROM community_like l WHERE l.user_id = :user_id AND l.target_id = p.id AND l.type = 1) AS is_liked,
         EXISTS (SELECT 1 FROM community_like c WHERE c.user_id = :user_id AND c.target_id = p.id AND c.type = 3) AS is_collected,
@@ -157,6 +162,7 @@ def _post_select_sql(extra_where: str = "", *, include_pending: bool = False) ->
         LEFT JOIN user_privacy pr ON pr.user_id = p.user_id
         WHERE p.status = 1
           {moderation_clause}
+          AND p.deleted_at IS NULL
           AND NOT EXISTS (
             SELECT 1 FROM user_block b
             WHERE (b.user_id = :user_id AND b.target_user_id = p.user_id)
@@ -239,7 +245,8 @@ async def create_post(
             await db.commit()
         raise HTTPException(422, detail="动态内容含高风险违规词，请修改后重试")
     content = decision.display_content
-    moderation_status = "pending" if decision.action == "manual_review" else "approved"
+    # community_post uses 0=pending, 1=approved, 2=hidden.
+    moderation_status = 0 if decision.action == "manual_review" else 1
 
     image_urls: list[str] = []
     video_url: str | None = None
@@ -367,7 +374,7 @@ async def update_post(
         if commit:
             await db.commit()
         raise HTTPException(422, detail="动态内容含高风险违规词，请修改后重试")
-    moderation_status = "pending" if decision.action == "manual_review" else "approved"
+    moderation_status = 0 if decision.action == "manual_review" else 1
     await db.execute(text("""UPDATE community_post SET content = :content,
         visibility = :visibility, declaration = :declaration,
         moderation_status = :moderation_status, moderation_reason = NULL,
@@ -645,7 +652,8 @@ async def list_posts(
         LEFT JOIN user_profile up ON up.user_id = p.user_id
         LEFT JOIN user_auth ua ON ua.user_id = p.user_id
         LEFT JOIN user_privacy pr ON pr.user_id = p.user_id
-        WHERE p.status = 1 AND COALESCE(p.moderation_status, 'approved') = 'approved'
+        WHERE p.status = 1 AND COALESCE(p.moderation_status, 1) = 1
+          AND p.deleted_at IS NULL
           AND NOT EXISTS (
             SELECT 1 FROM user_block b
             WHERE (b.user_id = :user_id AND b.target_user_id = p.user_id)
@@ -665,8 +673,8 @@ async def list_posts(
 async def delete_post(db: AsyncSession, user_id: int, post_id: int) -> None:
     result = await db.execute(
         text(
-            "UPDATE community_post SET status = 3, updated_at = UTC_TIMESTAMP() "
-            "WHERE id = :post_id AND user_id = :user_id AND status = 1"
+            "UPDATE community_post SET deleted_at = UTC_TIMESTAMP(), updated_at = UTC_TIMESTAMP() "
+            "WHERE id = :post_id AND user_id = :user_id AND status = 1 AND deleted_at IS NULL"
         ),
         {"post_id": post_id, "user_id": user_id},
     )
@@ -697,12 +705,23 @@ async def delete_post(db: AsyncSession, user_id: int, post_id: int) -> None:
 
 
 async def like_post(db: AsyncSession, user_id: int, post_id: int, enabled: bool) -> CommunityPostResponse:
-    await get_post(db, user_id, post_id)
+    post = await get_post(db, user_id, post_id)
     if enabled:
-        await db.execute(
+        result = await db.execute(
             text("INSERT IGNORE INTO community_like (user_id, target_id, type) VALUES (:user_id, :post_id, 1)"),
             {"user_id": user_id, "post_id": post_id},
         )
+        if getattr(result, "rowcount", 1) > 0:
+            await emit_notification(
+                db,
+                recipient_user_id=int(post.user_id),
+                actor_user_id=user_id,
+                event_type="like",
+                title="有人点赞了你的动态",
+                content=post.content[:200],
+                target_type="post",
+                target_id=post_id,
+            )
     else:
         await db.execute(
             text("DELETE FROM community_like WHERE user_id = :user_id AND target_id = :post_id AND type = 1"),
@@ -750,15 +769,26 @@ async def collect_post(db: AsyncSession, user_id: int, post_id: int, enabled: bo
 
 
 _COMMENT_SELECT = """SELECT c.id, c.post_id, c.user_id, u.nickname, u.avatar, c.parent_id,
-            c.content, c.like_count, c.created_at, COALESCE(c.moderation_status, 'approved') AS moderation_status,
+            c.root_id, c.parent_id AS target_comment_id,
+            parent.user_id AS target_user_id, parent_user.nickname AS reply_to_user,
+            c.content, c.like_count, c.created_at, c.deleted_at,
+            CASE COALESCE(c.moderation_status, 1) WHEN 1 THEN 'approved' WHEN 0 THEN 'pending' WHEN 2 THEN 'hidden' ELSE 'approved' END AS moderation_status,
+            (SELECT COUNT(*) FROM community_comment reply
+             WHERE (reply.root_id = c.id OR (reply.root_id IS NULL AND reply.parent_id = c.id))
+               AND reply.status = 1
+               AND reply.deleted_at IS NULL AND reply.moderation_status = 1) AS reply_count,
             EXISTS (
               SELECT 1 FROM community_like l
               WHERE l.user_id = :user_id AND l.target_id = c.id AND l.type = 2
-            ) AS is_liked
-            FROM community_comment c JOIN users u ON u.id = c.user_id"""
+            ) AS is_liked,
+            (c.user_id = :user_id AND c.deleted_at IS NULL AND c.moderation_status = 1) AS can_delete
+            FROM community_comment c JOIN users u ON u.id = c.user_id
+            LEFT JOIN community_comment parent ON parent.id = c.parent_id
+            LEFT JOIN users parent_user ON parent_user.id = parent.user_id"""
 
 
 def _comment_response(row: dict[str, Any]) -> CommunityCommentResponse:
+    is_deleted = row.get("deleted_at") is not None
     return CommunityCommentResponse(
         id=int(row["id"]),
         post_id=int(row["post_id"]),
@@ -766,19 +796,45 @@ def _comment_response(row: dict[str, Any]) -> CommunityCommentResponse:
         nickname=row.get("nickname"),
         avatar=row.get("avatar"),
         parent_id=row.get("parent_id"),
-        content=row["content"],
+        root_id=int(row.get("root_id") or row.get("parent_id") or row["id"]),
+        target_comment_id=int(row["target_comment_id"]) if row.get("target_comment_id") is not None else None,
+        target_user_id=int(row["target_user_id"]) if row.get("target_user_id") is not None else None,
+        reply_to_user=row.get("reply_to_user"),
+        content="该评论已删除" if is_deleted else row["content"],
         like_count=int(row.get("like_count") or 0),
         is_liked=bool(row.get("is_liked")),
+        reply_count=int(row.get("reply_count") or 0),
+        is_deleted=is_deleted,
+        can_delete=bool(row.get("can_delete")) and not is_deleted,
         created_at=row["created_at"],
         moderation_status=row.get("moderation_status") or "approved",
     )
+
+
+def encode_comment_cursor(comment_id: int) -> str:
+    raw = json.dumps({"id": comment_id}, separators=(",", ":")).encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def decode_comment_cursor(cursor: str | None) -> int:
+    if cursor is None:
+        return 0
+    try:
+        padded = cursor + "=" * (-len(cursor) % 4)
+        data = json.loads(base64.urlsafe_b64decode(padded).decode())
+        comment_id = data["id"]
+        if not isinstance(comment_id, int) or isinstance(comment_id, bool) or comment_id < 1:
+            raise ValueError
+        return comment_id
+    except (binascii.Error, UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        raise HTTPException(422, detail="评论游标无效") from None
 
 
 async def _get_comment(
     db: AsyncSession, user_id: int, comment_id: int
 ) -> CommunityCommentResponse:
     result = await db.execute(
-        text(_COMMENT_SELECT + " WHERE c.id = :comment_id AND c.status = 1 AND COALESCE(c.moderation_status, 'approved') = 'approved'"),
+        text(_COMMENT_SELECT + " WHERE c.id = :comment_id AND c.status = 1 AND c.deleted_at IS NULL AND c.moderation_status = 1"),
         {"user_id": user_id, "comment_id": comment_id},
     )
     row = result.mappings().first()
@@ -795,7 +851,7 @@ async def list_comments(
     result = await db.execute(
         text(
             _COMMENT_SELECT
-            + " WHERE c.post_id = :post_id AND c.status = 1 AND COALESCE(c.moderation_status, 'approved') = 'approved' ORDER BY c.created_at ASC LIMIT :limit OFFSET :offset"
+            + " WHERE c.post_id = :post_id AND c.status = 1 AND c.deleted_at IS NULL AND c.moderation_status = 1 ORDER BY c.created_at ASC LIMIT :limit OFFSET :offset"
         ),
         {
             "user_id": user_id,
@@ -805,6 +861,112 @@ async def list_comments(
         },
     )
     return [_comment_response(dict(row)) for row in result.mappings().all()]
+
+
+async def list_root_comments(
+    db: AsyncSession,
+    user_id: int,
+    post_id: int,
+    *,
+    cursor: str | None,
+    page_size: int,
+) -> CommentCursorPage:
+    await get_post(db, user_id, post_id)
+    after_id = decode_comment_cursor(cursor)
+    result = await db.execute(
+        text(
+            _COMMENT_SELECT
+            + """ WHERE c.post_id = :post_id AND c.parent_id IS NULL
+            AND c.status = 1 AND c.moderation_status = 1 AND c.id > :after_id
+            AND (c.deleted_at IS NULL OR EXISTS (
+              SELECT 1 FROM community_comment child
+              WHERE (child.root_id = c.id OR (child.root_id IS NULL AND child.parent_id = c.id))
+                AND child.status = 1
+                AND child.deleted_at IS NULL AND child.moderation_status = 1
+            ))
+            ORDER BY c.id ASC LIMIT :limit"""
+        ),
+        {"user_id": user_id, "post_id": post_id, "after_id": after_id, "limit": page_size + 1},
+    )
+    rows = list(result.mappings().all())
+    has_more = len(rows) > page_size
+    visible = rows[:page_size]
+    items = [_comment_response(dict(row)) for row in visible]
+    for comment in items:
+        previews = await db.execute(
+            text(
+                _COMMENT_SELECT
+                + """ WHERE c.post_id = :post_id AND c.status = 1
+                AND c.moderation_status = 1
+                AND (c.root_id = :root_id OR (c.root_id IS NULL AND c.parent_id = :root_id))
+                AND (c.deleted_at IS NULL OR EXISTS (
+                  SELECT 1 FROM community_comment child
+                  WHERE child.parent_id = c.id AND child.status = 1
+                    AND child.deleted_at IS NULL AND child.moderation_status = 1
+                ))
+                ORDER BY c.id ASC LIMIT 3"""
+            ),
+            {"user_id": user_id, "post_id": post_id, "root_id": comment.id},
+        )
+        comment.replies = [_comment_response(dict(row)) for row in previews.mappings().all()]
+    return CommentCursorPage(
+        items=items,
+        next_cursor=encode_comment_cursor(int(visible[-1]["id"])) if has_more and visible else None,
+        has_more=has_more,
+    )
+
+
+async def list_comment_replies(
+    db: AsyncSession,
+    user_id: int,
+    comment_id: int,
+    *,
+    cursor: str | None,
+    page_size: int,
+) -> CommentCursorPage:
+    root_result = await db.execute(
+        text(
+            """SELECT id, post_id, parent_id, root_id, status, deleted_at, moderation_status
+            FROM community_comment WHERE id = :comment_id"""
+        ),
+        {"comment_id": comment_id},
+    )
+    root = root_result.mappings().first()
+    if not root or int(root["status"]) != 1 or int(root.get("moderation_status") or 1) != 1:
+        raise HTTPException(404, detail="评论不存在")
+    if root.get("parent_id") is not None or root.get("root_id") is not None:
+        raise HTTPException(422, detail="仅一级评论可以查询回复")
+    await get_post(db, user_id, int(root["post_id"]))
+    after_id = decode_comment_cursor(cursor)
+    result = await db.execute(
+        text(
+            _COMMENT_SELECT
+            + """ WHERE c.post_id = :post_id AND c.status = 1
+            AND c.moderation_status = 1 AND c.id > :after_id
+            AND (c.root_id = :root_id OR (c.root_id IS NULL AND c.parent_id = :root_id))
+            AND (c.deleted_at IS NULL OR EXISTS (
+              SELECT 1 FROM community_comment child
+              WHERE child.parent_id = c.id AND child.status = 1
+                AND child.deleted_at IS NULL AND child.moderation_status = 1
+            ))
+            ORDER BY c.id ASC LIMIT :limit"""
+        ),
+        {
+            "user_id": user_id,
+            "post_id": int(root["post_id"]),
+            "root_id": comment_id,
+            "after_id": after_id,
+            "limit": page_size + 1,
+        },
+    )
+    rows = list(result.mappings().all())
+    has_more = len(rows) > page_size
+    visible = rows[:page_size]
+    return CommentCursorPage(
+        items=[_comment_response(dict(row)) for row in visible],
+        next_cursor=encode_comment_cursor(int(visible[-1]["id"])) if has_more and visible else None,
+        has_more=has_more,
+    )
 
 
 async def create_comment(
@@ -824,25 +986,38 @@ async def create_comment(
         if commit:
             await db.commit()
         raise HTTPException(422, detail="评论内容含高风险违规词，请修改后重试")
-    moderation_status = "pending" if decision.action == "manual_review" else "approved"
-    await get_post(db, user_id, post_id)
+    post = await get_post(db, user_id, post_id)
+    root_id: int | None = None
+    target_user_id: int | None = None
     if request.parent_id:
         parent = await db.execute(
-            text("SELECT 1 FROM community_comment WHERE id = :parent_id AND post_id = :post_id AND status = 1"),
+            text(
+                """SELECT id, user_id, root_id FROM community_comment
+                WHERE id = :parent_id AND post_id = :post_id AND status = 1
+                  AND deleted_at IS NULL AND moderation_status = 1"""
+            ),
             {"parent_id": request.parent_id, "post_id": post_id},
         )
-        if not parent.scalar():
+        parent_row = parent.mappings().first()
+        if not parent_row:
             raise HTTPException(404, detail="父评论不存在")
+        root_id = int(parent_row.get("root_id") or parent_row["id"])
+        target_user_id = int(parent_row["user_id"])
+        await ensure_interaction_allowed(
+            db, actor_user_id=user_id, target_user_id=target_user_id
+        )
     result = await db.execute(
         text(
-            "INSERT INTO community_comment (post_id, user_id, parent_id, content, moderation_status) VALUES (:post_id, :user_id, :parent_id, :content, :moderation_status)"
+            """INSERT INTO community_comment (post_id, user_id, parent_id, root_id, content, moderation_status)
+            VALUES (:post_id, :user_id, :parent_id, :root_id, :content, :moderation_status)"""
         ),
         {
             "post_id": post_id,
             "user_id": user_id,
             "parent_id": request.parent_id,
+            "root_id": root_id,
             "content": decision.display_content,
-            "moderation_status": moderation_status,
+            "moderation_status": 0 if decision.action == "manual_review" else 1,
         },
     )
     if decision.action != "allow":
@@ -854,31 +1029,60 @@ async def create_comment(
             SET comment_count = (
               SELECT COUNT(*) FROM community_comment
               WHERE post_id = :post_id AND status = 1
+                AND deleted_at IS NULL AND moderation_status = 1
             )
             WHERE id = :post_id"""
         ),
         {"post_id": post_id},
     )
-    if commit:
-        await db.commit()
     created = await db.execute(
         text(_COMMENT_SELECT + " WHERE c.id = :id"),
         {"user_id": user_id, "id": result.lastrowid},
     )
-    return _comment_response(dict(created.mappings().one()))
+    response = _comment_response(dict(created.mappings().one()))
+    recipient_id = target_user_id if target_user_id is not None else int(post.user_id)
+    await emit_notification(
+        db,
+        recipient_user_id=recipient_id,
+        actor_user_id=user_id,
+        event_type="reply" if request.parent_id else "comment",
+        title="有人回复了你" if request.parent_id else "有人评论了你的动态",
+        content=request.content,
+        target_type="post",
+        target_id=post_id,
+        payload={"comment_id": response.id, "root_comment_id": response.root_id},
+    )
+    if commit:
+        await db.commit()
+    return response
 
 
 async def like_comment(
     db: AsyncSession, user_id: int, comment_id: int, enabled: bool
 ) -> CommunityCommentResponse:
-    await _get_comment(db, user_id, comment_id)
+    comment = await _get_comment(db, user_id, comment_id)
+    await ensure_interaction_allowed(
+        db, actor_user_id=user_id, target_user_id=comment.user_id
+    )
     if enabled:
-        await db.execute(
+        result = await db.execute(
             text(
                 "INSERT IGNORE INTO community_like (user_id, target_id, type) VALUES (:user_id, :comment_id, 2)"
             ),
             {"user_id": user_id, "comment_id": comment_id},
         )
+        if getattr(result, "rowcount", 1) > 0:
+            await emit_notification(
+                db,
+                recipient_user_id=comment.user_id,
+                actor_user_id=user_id,
+                event_type="like",
+                title="有人点赞了你的评论",
+                content=comment.content[:200],
+                target_type="post",
+                target_id=comment.post_id,
+                payload={"comment_id": comment_id},
+            )
     else:
         await db.execute(
             text(
@@ -902,13 +1106,13 @@ async def like_comment(
 
 async def delete_comment(db: AsyncSession, user_id: int, comment_id: int) -> None:
     result = await db.execute(
-        text("SELECT post_id FROM community_comment WHERE id = :comment_id AND user_id = :user_id AND status = 1"),
+        text("SELECT post_id FROM community_comment WHERE id = :comment_id AND user_id = :user_id AND status = 1 AND deleted_at IS NULL"),
         {"comment_id": comment_id, "user_id": user_id},
     )
     row = result.mappings().first()
     if not row:
         raise HTTPException(404, detail="评论不存在或无权删除")
-    await db.execute(text("UPDATE community_comment SET status = 2 WHERE id = :comment_id"), {"comment_id": comment_id})
+    await db.execute(text("UPDATE community_comment SET deleted_at = UTC_TIMESTAMP() WHERE id = :comment_id"), {"comment_id": comment_id})
     # 与 create_comment 一致采用重算，避免增量式计数漂移
     await db.execute(
         text(
@@ -916,6 +1120,7 @@ async def delete_comment(db: AsyncSession, user_id: int, comment_id: int) -> Non
             SET comment_count = (
               SELECT COUNT(*) FROM community_comment
               WHERE post_id = :post_id AND status = 1
+                AND deleted_at IS NULL AND moderation_status = 1
             )
             WHERE id = :post_id"""
         ),
@@ -942,7 +1147,8 @@ def _topic_response(row: dict[str, Any]) -> CommunityTopicResponse:
 
 
 _TOPIC_SELECT = """SELECT t.id, t.name, t.icon, t.sort, t.created_at,
-    (SELECT COUNT(*) FROM community_post p WHERE p.topic_id = t.id AND p.status = 1) AS post_count,
+    (SELECT COUNT(*) FROM community_post p WHERE p.topic_id = t.id AND p.status = 1
+       AND p.deleted_at IS NULL AND p.moderation_status = 1) AS post_count,
     (SELECT COUNT(*) FROM community_topic_participant tp WHERE tp.topic_id = t.id) AS participant_count,
     EXISTS (
       SELECT 1 FROM community_topic_participant tp
@@ -1847,6 +2053,7 @@ async def list_paper_plane_messages(
                 id=int(row["id"]),
                 conversation_id=int(row["conversation_id"]),
                 from_user_id=int(row["from_user_id"]),
+                mine=int(row["from_user_id"]) == user_id,
                 content=row["content"] or "",
                 type=int(row["type"]),
                 media_url=row.get("media_url"),
@@ -1930,6 +2137,7 @@ async def send_paper_plane_message(
         id=int(row["id"]),
         conversation_id=int(row["conversation_id"]),
         from_user_id=int(row["from_user_id"]),
+        mine=int(row["from_user_id"]) == user_id,
         content=row["content"] or "",
         type=int(row["type"]),
         media_url=row.get("media_url"),

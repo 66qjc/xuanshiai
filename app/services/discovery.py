@@ -35,6 +35,7 @@ from app.schemas.discovery import (
     SuperLikeResponse,
     VisitorPage,
 )
+from app.services.notifications import emit_notification
 from app.services.profile import _calculate_age, _json_dict, _json_list, get_profile
 
 logger = logging.getLogger(__name__)
@@ -633,13 +634,17 @@ async def list_favorites(db: AsyncSession, viewer_id: int, page: int, page_size:
 
 
 async def _notify(db: AsyncSession, user_id: int, notification_type: str, title: str, content: str, related_user_id: int, related_id: int | None = None) -> None:
-    await db.execute(text("""INSERT INTO user_notification
-        (user_id, notification_type, title, content, payload, related_user_id, related_id)
-        VALUES (:user_id, :notification_type, :title, :content, :payload, :related_user_id, :related_id)"""), {
-        "user_id": user_id, "notification_type": notification_type, "title": title,
-        "content": content, "payload": json.dumps({"related_user_id": related_user_id}),
-        "related_user_id": related_user_id, "related_id": related_id,
-    })
+    target_type = "message" if notification_type.startswith("match_application") else "user"
+    await emit_notification(
+        db,
+        recipient_user_id=user_id,
+        actor_user_id=related_user_id,
+        event_type=notification_type,
+        title=title,
+        content=content,
+        target_type=target_type,
+        target_id=related_id if related_id is not None else related_user_id,
+    )
 
 
 async def _consume_apply_quota(viewer_id: int, vip: bool) -> None:

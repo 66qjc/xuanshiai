@@ -28,6 +28,7 @@ from app.schemas.community import (
     CommunityCollectResponse,
     CommunityCommentCreate,
     CommunityCommentResponse,
+    CommentCursorPage,
     CommunityMediaResponse,
     CommunityPostCreate,
     CommunityPostUpdate,
@@ -48,6 +49,12 @@ from app.schemas.community import (
     PaperPlaneReplyCreate,
     PaperPlaneReplyResponse,
     PaperPlaneResponse,
+)
+from app.schemas.social import (
+    ReportAppealCreate,
+    ReportAppealPage,
+    ReportAppealResponse,
+    ReportPage,
 )
 from app.services.community_media import delete_community_media, upload_community_media
 from app.services.community import (
@@ -72,6 +79,8 @@ from app.services.community import (
     list_activities,
     list_banners,
     list_comments,
+    list_comment_replies,
+    list_root_comments,
     list_my_activities,
     list_paper_plane_conversations,
     list_paper_plane_messages,
@@ -86,7 +95,12 @@ from app.services.community import (
     signup_activity,
 )
 from app.services.idempotency import abort, complete, reserve_or_replay
-from app.services.social import create_content_report
+from app.services.social import (
+    create_content_report,
+    create_report_appeal,
+    list_my_report_appeals,
+    list_my_reports,
+)
 
 router = APIRouter(dependencies=[Depends(get_verified_user)])
 ResponseModelT = TypeVar("ResponseModelT", bound=BaseModel)
@@ -294,6 +308,36 @@ async def comments(
     db: AsyncSession = Depends(get_db),
 ) -> list[CommunityCommentResponse]:
     return await list_comments(db, current.id, post_id, page, page_size)
+
+
+@router.get(
+    "/community/posts/{post_id}/comments/page",
+    response_model=CommentCursorPage,
+    summary="游标查询一级评论",
+)
+async def comment_page(
+    post_id: int = Path(..., ge=1),
+    cursor: str | None = Query(default=None, max_length=128),
+    page_size: int = Query(20, ge=1, le=50),
+    current: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> CommentCursorPage:
+    return await list_root_comments(db, current.id, post_id, cursor=cursor, page_size=page_size)
+
+
+@router.get(
+    "/community/comments/{comment_id}/replies",
+    response_model=CommentCursorPage,
+    summary="游标查询评论回复",
+)
+async def comment_replies(
+    comment_id: int = Path(..., ge=1),
+    cursor: str | None = Query(default=None, max_length=128),
+    page_size: int = Query(20, ge=1, le=50),
+    current: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> CommentCursorPage:
+    return await list_comment_replies(db, current.id, comment_id, cursor=cursor, page_size=page_size)
 
 
 @router.post(
@@ -550,6 +594,49 @@ async def create_community_report(
         type=report.type,
         status=report.status,
         created_at=report.created_at,
+    )
+
+
+@router.get("/community/reports/mine", response_model=ReportPage, summary="我的举报与被举报结论")
+async def my_community_reports(
+    page: int = Query(1, ge=1, le=1000),
+    page_size: int = Query(20, ge=1, le=50),
+    current: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> ReportPage:
+    return await list_my_reports(db, current.id, page=page, page_size=page_size)
+
+
+@router.post(
+    "/community/reports/{report_id}/appeals",
+    response_model=ReportAppealResponse,
+    status_code=201,
+    summary="提交举报申诉",
+)
+async def appeal_community_report(
+    report_id: int = Path(..., ge=1),
+    body: ReportAppealCreate = Body(...),
+    current: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> ReportAppealResponse:
+    return await create_report_appeal(
+        db, user_id=current.id, report_id=report_id, request=body
+    )
+
+
+@router.get(
+    "/community/report-appeals/mine",
+    response_model=ReportAppealPage,
+    summary="我的举报申诉",
+)
+async def my_report_appeals(
+    page: int = Query(1, ge=1, le=1000),
+    page_size: int = Query(20, ge=1, le=50),
+    current: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> ReportAppealPage:
+    return await list_my_report_appeals(
+        db, current.id, page=page, page_size=page_size
     )
 
 

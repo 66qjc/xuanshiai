@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class MediaReviewRequest(BaseModel):
@@ -22,6 +22,14 @@ class ReportReviewRequest(BaseModel):
     status: Literal[1, 2]
     result: str = Field(min_length=1, max_length=255)
     action: Literal["none", "hide_content", "restore_content", "dismiss"] = "none"
+
+    @model_validator(mode="after")
+    def validate_status_action(self) -> "ReportReviewRequest":
+        if self.action in ("hide_content", "restore_content") and self.status != 1:
+            raise ValueError("内容处置只能用于成立的举报")
+        if self.action == "dismiss" and self.status != 2:
+            raise ValueError("dismiss 只能用于驳回的举报")
+        return self
 
 
 class ReportReviewResponse(BaseModel):
@@ -42,6 +50,9 @@ class AdminReportItem(BaseModel):
     description: str | None
     status: Literal[0, 1, 2]
     result: str | None
+    action: Literal["none", "hide_content", "restore_content", "dismiss"] = "none"
+    reviewed_by: int | None = None
+    reviewed_at: datetime | None = None
     created_at: datetime
     updated_at: datetime | None = None
 
@@ -52,6 +63,43 @@ class AdminReportPage(BaseModel):
     page_size: int
     total: int
     has_more: bool
+
+
+class AdminReportAppealItem(BaseModel):
+    id: int
+    report_id: int
+    appellant_user_id: int
+    reason: str
+    status: Literal[0, 1, 2]
+    result: str | None = None
+    reviewed_by: int | None = None
+    reviewed_at: datetime | None = None
+    created_at: datetime
+    updated_at: datetime | None = None
+    target_type: Literal["user", "post", "comment", "paper_plane"]
+    target_id: int | None
+    original_reviewer_id: int | None = None
+
+
+class AdminReportAppealPage(BaseModel):
+    items: list[AdminReportAppealItem]
+    page: int
+    page_size: int
+    total: int
+    has_more: bool
+
+
+class ReportAppealReviewRequest(BaseModel):
+    status: Literal[1, 2]
+    result: str = Field(min_length=1, max_length=255)
+
+
+class ReportAppealReviewResponse(BaseModel):
+    appeal_id: int
+    report_id: int
+    status: Literal[1, 2]
+    result: str
+    content_restored: bool = False
 
 
 class ContentModerationRequest(BaseModel):
