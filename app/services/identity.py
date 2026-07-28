@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies import CurrentUser
 from app.schemas.auth import MatchmakerApplicationCreate, MatchmakerReviewRequest, RegistrationIntentUpdate
+from app.services.notifications import emit_notification
 
 INTENT_OPTIONS = {
     "self_match": ("自己找", "以本人交友和婚恋匹配为主要目的"),
@@ -61,15 +62,16 @@ async def _notify_matchmaker_review(
         2: f"你的服务红娘申请未通过审核：{reason or '请补充材料后重新提交'}",
         3: f"你的红娘服务已暂停：{reason or '请联系平台客服'}",
     }[status]
-    await db.execute(text("""INSERT INTO user_notification
-        (user_id, notification_type, title, content, related_id, is_read)
-        VALUES (:user_id, :notification_type, :title, :content, :related_id, 0)"""), {
-        "user_id": user_id,
-        "notification_type": "matchmaker_application_reviewed",
-        "title": title,
-        "content": content,
-        "related_id": application_id,
-    })
+    await emit_notification(
+        db,
+        recipient_user_id=user_id,
+        actor_user_id=None,
+        event_type="matchmaker_application_reviewed",
+        title=title,
+        content=content,
+        target_type="matchmaker_application",
+        target_id=application_id,
+    )
 
 
 def mask_phone(phone: str) -> str:

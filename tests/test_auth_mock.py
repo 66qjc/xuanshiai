@@ -5,7 +5,7 @@ from fastapi import HTTPException
 from pydantic import ValidationError
 
 from app.core.config import Settings, settings
-from app.services.auth import SmsStore
+from app.services.auth import SmsStore, normalize_user_agent
 from app.services.sms.providers import MockSmsProvider
 from app.services.wechat.providers import MockWechatProvider
 
@@ -71,3 +71,12 @@ def test_production_rejects_mock_providers() -> None:
             environment="production",
             wechat_provider="mock",
         )
+
+
+def test_normalize_user_agent_fits_login_log_device_column() -> None:
+    user_agent = "wechat-devtools/" + ("x" * 400)
+
+    normalized = normalize_user_agent(user_agent)
+
+    assert len(normalized) == 255
+    assert normalized == user_agent[:255]

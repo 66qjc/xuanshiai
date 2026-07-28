@@ -316,6 +316,10 @@ Authorization: Bearer <access_token>
 | `items[].payload` | object/null | 是 | 无附加数据时 `null` | 结构化附加数据 |
 | `items[].related_user_id` | integer/null | 是 | 无关联用户时 `null` | 关联用户 ID |
 | `items[].related_id` | integer/null | 是 | 无关联业务记录时 `null` | 关联记录 ID |
+| `items[].target_type` | string/null | 是 | 旧通知可能为 `null` | 导航目标类型，如 `post`、`comment`、`user`、`report`、`activity` |
+| `items[].target_id` | integer/null | 是 | 无目标或目标已失效时 `null` | 导航目标 ID |
+| `items[].actor_user_id` | integer/null | 是 | 治理系统通知可为 `null` | 触发事件的用户 ID；兼容别名，等同于 `related_user_id` |
+| `items[].action` | string | 是 | 不为空 | 触发动作，当前等同于 `notification_type`，如 `comment`、`follow`、`activity` |
 | `items[].is_read` | boolean | 是 | 不为空 | 是否已读 |
 | `items[].created_at` | datetime | 是 | 不为空 | 创建时间 |
 | `page` | integer | 是 | 不为空 | 当前页 |
@@ -327,7 +331,7 @@ Authorization: Bearer <access_token>
 
 ```json
 {
-  "items":[{"id":10,"notification_type":"match","title":"你们互相喜欢了","content":"恭喜匹配成功，可以开始聊天了","payload":{"related_user_id":23},"related_user_id":23,"related_id":null,"is_read":false,"created_at":"2026-07-20T10:30:00"}],
+  "items":[{"id":10,"notification_type":"comment","title":"有人评论了你的动态","content":"很喜欢这张照片","payload":{"post_id":4},"related_user_id":23,"related_id":4,"target_type":"post","target_id":4,"actor_user_id":23,"action":"comment","is_read":false,"created_at":"2026-07-20T10:30:00"}],
   "page":1,"page_size":20,"total":1,"unread_count":1
 }
 ```
@@ -375,6 +379,8 @@ Authorization: Bearer <access_token>
 | `show_posts` | boolean/null | 否 | `true` | 布尔值 | 是否允许自己的动态出现在动态流 |
 | `notify_like` | boolean/null | 否 | `true` | 布尔值 | 喜欢通知开关 |
 | `notify_comment` | boolean/null | 否 | `true` | 布尔值 | 评论通知开关 |
+| `notify_follow` | boolean/null | 否 | `true` | 布尔值 | 关注通知开关 |
+| `notify_message` | boolean/null | 否 | `true` | 布尔值 | 新消息通知开关 |
 | `notify_match` | boolean/null | 否 | `true` | 布尔值 | 匹配通知开关 |
 | `notify_apply` | boolean/null | 否 | `true` | 布尔值 | 认识申请通知开关 |
 | `notify_system` | boolean/null | 否 | `true` | 布尔值 | 系统通知开关 |
@@ -491,3 +497,15 @@ Authorization: Bearer <access_token>
 - 明确登录 Token 中的内部会话 `sid` 与聊天 `session_id` 的区别。
 - 明确匹配、聊天权限、黑名单、隐私枚举、通知和举报状态。
 - 明确当前未提供消息幂等键、媒体上传和自动审核的边界。
+
+### 2026-07-28（中央通知事件）
+
+- `GET /api/v1/notifications` 的 `items[]` 新增向后兼容字段：`target_type: string|null` 与 `target_id: integer|null`。新事件使用这两个字段导航；`related_user_id`、`related_id` 继续保留给旧客户端。
+- `items[]` 同时新增 `actor_user_id` 与 `action`：分别是 `related_user_id` 的标准别名和事件动作；旧客户端可继续使用原字段。
+- 通知成功示例：`{"id":12,"notification_type":"comment","title":"有人评论了你的动态","content":"很喜欢这张照片","payload":{"comment_id":31},"related_user_id":8,"related_id":4,"target_type":"post","target_id":4,"is_read":false,"created_at":"2026-07-28T10:00:00"}`。
+- `GET/PUT /api/v1/users/me/privacy` 新增 `notify_follow: boolean` 与 `notify_message: boolean`，默认均为 `true`；请求可只提交其中任一个字段。
+- 互动与普通系统通知统一检查接收人的事件偏好；`reply` 复用 `notify_comment`，未知系统事件复用 `notify_system`。`report_result`（举报处理结果与内容治理通知）和 `appeal_result`（申诉复审结果）属于必达治理站内信，始终写入，不受 `notify_system` 关闭影响。
+- 操作者与接收人相同不写通知；双方任一方向存在 `user_block` 时不写互动通知。关注、回复评论和点赞评论在动作层同样执行拉黑检查，返回 `403`。
+- 关注只在首次写入关系时产生 `follow` 通知；重复 `PUT`、取消关注不产生通知。动态/评论点赞同样只在首次点赞时通知。
+- 兼容性：旧通知行的目标字段可为 `null`；旧客户端继续读取 `related_id`。新客户端不得假定所有通知都可导航。
+- 通知标题和正文预览由中央写入器分别限制为 128 和 255 字符；长评论仍可正常发布，通知仅保存截断预览。
