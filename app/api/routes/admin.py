@@ -19,6 +19,7 @@ from app.schemas.admin import (
     MediaReviewResponse,
     ReportReviewRequest,
     ReportReviewResponse,
+    AdminGrantRequest, AdminGrantResponse, ModerationItemPage, ModerationReviewRequest, ModerationReviewResponse,
     ReportAppealReviewRequest,
     ReportAppealReviewResponse,
 )
@@ -32,8 +33,34 @@ from app.services.social import (
     review_report_appeal,
 )
 from app.services.certifications import review_certification
+from app.services.moderation import grant_admin, list_moderation_items, review_moderation_item
 
 router = APIRouter(prefix="/admin")
+
+
+@router.get("/community/moderation-items", response_model=ModerationItemPage, summary="查看社区待审核内容")
+async def moderation_items(
+    page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100),
+    status: Literal["pending", "approved", "rejected", "replaced", "deleted", "hidden"] = Query("pending"),
+    target_type: Literal["post", "comment", "paper_plane", "paper_plane_reply", "paper_plane_message", "media"] | None = Query(None),
+    admin: CurrentUser = Depends(get_current_admin), db: AsyncSession = Depends(get_db),
+) -> ModerationItemPage:
+    return await list_moderation_items(db, page=page, page_size=page_size, status=status, target_type=target_type)
+
+
+@router.patch("/community/moderation-items/{task_id}/review", response_model=ModerationReviewResponse, summary="审核社区内容")
+async def review_moderation_item_route(
+    task_id: int = Path(..., ge=1), body: ModerationReviewRequest = Body(...),
+    admin: CurrentUser = Depends(get_current_admin), db: AsyncSession = Depends(get_db),
+) -> ModerationReviewResponse:
+    return await review_moderation_item(db, task_id, body, admin_id=admin.id)
+
+
+@router.post("/users/grant", response_model=AdminGrantResponse, summary="授予管理员及权限")
+async def grant_admin_route(
+    body: AdminGrantRequest = Body(...), admin: CurrentUser = Depends(get_current_admin), db: AsyncSession = Depends(get_db),
+) -> AdminGrantResponse:
+    return await grant_admin(db, body, granted_by=admin.id)
 
 
 @router.patch("/media/{media_id}/review", response_model=MediaReviewResponse, summary="审核用户媒体")

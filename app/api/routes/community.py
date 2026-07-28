@@ -31,6 +31,7 @@ from app.schemas.community import (
     CommentCursorPage,
     CommunityMediaResponse,
     CommunityPostCreate,
+    CommunityPostUpdate,
     CommunityPostPage,
     CommunityPostResponse,
     CommunityQuotasResponse,
@@ -61,6 +62,7 @@ from app.services.community import (
     create_comment,
     create_paper_plane,
     create_post,
+    update_post,
     delete_comment,
     delete_post,
     end_paper_plane_conversation,
@@ -233,6 +235,14 @@ async def feed(
         filter_key=filter_key,
         sort=sort_key,
     )
+
+
+@router.put("/community/posts/{post_id}", response_model=CommunityPostResponse, summary="修改动态并重新提交审核")
+async def update_post_route(
+    post_id: int = Path(..., ge=1), body: CommunityPostUpdate = Body(...),
+    current: CurrentUser = Depends(get_realname_verified_user), db: AsyncSession = Depends(get_db),
+) -> CommunityPostResponse:
+    return await update_post(db, current.id, post_id, body)
 
 
 @router.get("/community/posts/{post_id}", response_model=CommunityPostResponse, summary="查看动态详情")

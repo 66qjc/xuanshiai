@@ -25,7 +25,12 @@ _PREFERENCE_BY_EVENT = {
     "activity": "notify_activity",
     "system": "notify_system",
 }
-_MANDATORY_EVENT_TYPES = frozenset({"report_result", "appeal_result"})
+_MANDATORY_EVENT_TYPES = frozenset({
+    "report_result",
+    "appeal_result",
+    "community_moderation_submitted",
+    "community_moderation_result",
+})
 
 
 def _bounded(value: str | None, length: int) -> str | None:
