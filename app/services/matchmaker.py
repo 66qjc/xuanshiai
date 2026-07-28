@@ -33,6 +33,7 @@ from app.schemas.matchmaker import (
     MatchmakerServiceRequestResponse,
     MatchmakerServiceRequestUpdate,
 )
+from app.services.notifications import emit_notification
 from app.services.social import ensure_users_can_interact
 
 
@@ -138,12 +139,16 @@ SERVICE_SELECT = """SELECT id, user_id, matchmaker_id, service_type, status, req
 
 
 async def _notify(db: AsyncSession, user_id: int, notification_type: str, title: str, content: str, related_id: int) -> None:
-    await db.execute(text("""INSERT INTO user_notification
-        (user_id, notification_type, title, content, related_id, is_read)
-        VALUES (:user_id, :notification_type, :title, :content, :related_id, 0)"""), {
-        "user_id": user_id, "notification_type": notification_type,
-        "title": title, "content": content, "related_id": related_id,
-    })
+    await emit_notification(
+        db,
+        recipient_user_id=user_id,
+        actor_user_id=None,
+        event_type=notification_type,
+        title=title,
+        content=content,
+        target_type="matchmaker_service",
+        target_id=related_id,
+    )
 
 
 def _product_response(row: Any) -> MatchmakerServiceProductResponse:

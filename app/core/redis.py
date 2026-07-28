@@ -11,6 +11,7 @@ from redis.exceptions import RedisError
 from app.core.config import settings
 
 redis_client = Redis.from_url(settings.redis_url, decode_responses=True)
+_local_quota_counts: dict[str, int] = {}
 
 CONSUME_DAILY_LUA = """
 local value = redis.call('INCR', KEYS[1])
@@ -26,6 +27,18 @@ def daily_quota_key(prefix: str, user_id: int) -> str:
     return f"{prefix}:{user_id}:{day}"
 
 
+def _local_fallback_enabled() -> bool:
+    return settings.environment in {"development", "testing"}
+
+
+def _consume_local(key: str, limit: int) -> bool:
+    used = _local_quota_counts.get(key, 0)
+    if used >= limit:
+        return False
+    _local_quota_counts[key] = used + 1
+    return True
+
+
 async def consume_daily(key: str, limit: int) -> bool:
     """Atomically consume one daily quota item, failing closed if Redis is unavailable."""
     try:
@@ -35,6 +48,8 @@ async def consume_daily(key: str, limit: int) -> bool:
         consumed = await redis_client.eval(CONSUME_DAILY_LUA, 1, key, limit, ttl)
         return bool(consumed)
     except RedisError as exc:
+        if _local_fallback_enabled():
+            return _consume_local(key, limit)
         raise HTTPException(503, detail="Redis服务未配置或暂时不可用") from exc
 
 async def refund_daily(key: str) -> None:
@@ -43,6 +58,11 @@ async def refund_daily(key: str) -> None:
         if value and int(value) > 0:
             await redis_client.decr(key)
     except RedisError as exc:
+        if _local_fallback_enabled():
+            used = _local_quota_counts.get(key, 0)
+            if used > 0:
+                _local_quota_counts[key] = used - 1
+            return
         raise HTTPException(503, detail="Redis服务未配置或暂时不可用") from exc
 
 
@@ -52,4 +72,6 @@ async def get_daily_used(key: str) -> int:
         value = await redis_client.get(key)
         return int(value or 0)
     except RedisError as exc:
+        if _local_fallback_enabled():
+            return _local_quota_counts.get(key, 0)
         raise HTTPException(503, detail="Redis服务未配置或暂时不可用") from exc

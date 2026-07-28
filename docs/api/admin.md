@@ -118,9 +118,9 @@ Content-Type: application/json
 | `action` | body | string | 否 | `none` | `none` / `hide_content` / `restore_content` / `dismiss` | 显式副作用；默认只改工单 |
 
 - `none`：仅更新 `status`/`result`（兼容旧客户端）
-- `hide_content` / `restore_content`：仅当 `target_type` 为内容时下架/恢复；用户举报返回 `422`
-- `dismiss`：强制 `status=2`，不动内容
-- **不会**自动封禁账号或通知举报人
+- `hide_content` / `restore_content`：必须搭配 `status=1`，且仅当 `target_type` 为内容时下架/恢复；用户举报或矛盾状态返回 `422`
+- `dismiss`：必须搭配 `status=2`，不动内容；矛盾状态返回 `422`
+- **不会**自动封禁账号；完成审核后会向举报人发送系统通知，举报成立时也会通知被举报人
 
 请求示例：
 
@@ -136,8 +136,8 @@ Content-Type: application/json
 
 | 方法 | 路径 | 后端效果 |
 | --- | --- | --- |
-| `PATCH` | `/api/v1/admin/community/posts/{post_id}/moderation` | 动态 `status`：下架=3，恢复=1（与用户自删共用 3，列表均不可见） |
-| `PATCH` | `/api/v1/admin/community/comments/{comment_id}/moderation` | 评论 `status`：下架=2，恢复=1 |
+| `PATCH` | `/api/v1/admin/community/posts/{post_id}/moderation` | 动态 `moderation_status`：下架=2，恢复=1；不改用户删除 `deleted_at` |
+| `PATCH` | `/api/v1/admin/community/comments/{comment_id}/moderation` | 评论 `moderation_status`：下架=2，恢复=1；不改用户删除 `deleted_at` |
 | `PATCH` | `/api/v1/admin/community/paper-planes/{plane_id}/moderation` | 纸飞机 `moderation_status`：下架=2，恢复=1（不动 lifecycle `status`） |
 
 成功返回：`target_type`、`target_id`、`status`、`reason`。不存在 → `404`。
@@ -170,7 +170,7 @@ Content-Type: application/json
 - 媒体状态：`0` 待审核，`1` 通过，`2` 拒绝，`3` 隐藏。管理员请求只允许写入 `1/2/3`。
 - 举报状态：`0` 待处理，`1` 已处理，`2` 已驳回。管理员请求只允许写入 `1/2`。
 - 媒体审核在读取记录时使用行锁，避免同一媒体同时被两个请求读取后覆盖；当前没有审核人、审核批次和审计日志字段。
-- 举报处理在读取记录时使用行锁，但当前重复处理仍会覆盖前一次结论；如要禁止终态修改，需要新增状态流转校验并同步文档。
+- 举报处理在读取记录时使用行锁；`status=1/2` 均为不可覆盖终态，重复处理返回 `409`。
 - 本模块复用已有 `get_current_admin`、Pydantic Schema、SQLAlchemy AsyncSession 和资料/举报服务，不重复实现认证和数据库连接。
 - 新增审核列表、批量操作、操作日志或自动处罚前，必须先定义分页、权限、状态流转、审计字段和幂等方案。
 
@@ -180,7 +180,7 @@ Content-Type: application/json
 
 - 补充管理员身份校验、路径参数、请求字段和响应字段契约。
 - 明确媒体和举报状态枚举、空值含义、错误示例与当前副作用。
-- 明确媒体/举报接口当前没有审核列表、批量审核、操作日志、自动封禁和自动通知能力。
+- 明确媒体接口与举报接口的现有边界；举报审核已具备结果通知与内容处置审计，但仍没有批量审核或自动封禁能力。
 
 ### 2026-07-22
 
@@ -190,3 +190,34 @@ Content-Type: application/json
 
 - 新增红娘牵线服务申请查询、分配和处理接口，详见 `docs/api/matchmaker.md`。
 - 红娘申请审核结果新增申请人站内通知，详见 `docs/api/identity.md`。
+
+### 2026-07-28（举报终态与独立申诉复审）
+
+#### `GET /api/v1/admin/reports/{report_id}`
+
+路径参数 `report_id>=1`，无请求体。返回举报双方、目标、描述、`status`、`result`、`action`、`reviewed_by`、`reviewed_at` 与时间字段；不存在返回 `404`。
+
+#### `GET /api/v1/admin/report-appeals`
+
+Query：`page>=1`（默认 1）、`page_size=1..100`（默认 20）、`status` 可选 `0|1|2`。返回 `{items,page,page_size,total,has_more}`；每项包含申诉、原举报目标和 `original_reviewer_id`，便于前端禁用同审核人复审。
+
+#### `PATCH /api/v1/admin/report-appeals/{appeal_id}/review`
+
+请求体：
+
+```json
+{"status":1,"result":"复核后确认内容未违规"}
+```
+
+`status=1` 申诉通过，`status=2` 申诉驳回；`result` 1~255 字符。成功返回 `appeal_id`、`report_id`、`status`、`result`、`content_restored`。`content_restored=true` 仅表示该内容当时仍由原举报的 `hide_content` 处置下架，且本次复审成功撤销了这次下架；若内容后来被独立审核下架则返回 `false`，不会覆盖后续决定。原举报审核人复审同一申诉返回 `409`；已进入 `1/2` 终态的申诉再次处理返回 `409`；不存在返回 `404`。
+
+#### 状态与处置边界
+
+- `PATCH /api/v1/admin/reports/{report_id}/review` 只允许把 `status=0` 处理一次；已处理/已驳回均为终态，再次调用返回 `409`，不会覆盖原结论。
+- 举报记录持久化 `action`、`reviewed_by`、`reviewed_at`。申诉记录独立保存原因、结论、复审人和时间，不回写或删除原举报结论。
+- 动态、评论和纸飞机的管理员下架统一写 `moderation_status=2`，并用 `moderation_report_id` 记录举报处置来源；恢复写 `1` 并清空来源。用户删除只写 `deleted_at`。申诉通过仅撤销当前仍归因于原举报的下架，因此不会复活用户自行删除的内容，也不会覆盖后续独立审核。
+- 纸飞机继续使用既有独立 `moderation_status`，不改变生命周期 `status`。
+- 内容处置继续写 `business_audit_log`。举报审核和申诉复审均使用行锁，避免并发覆盖终态。
+- 举报审核组合必须一致：`hide_content` / `restore_content` 只能搭配 `status=1`，`dismiss` 只能搭配 `status=2`；矛盾请求返回 `422`。
+
+错误补充：状态冲突或审核人冲突为 `409`；前端应刷新举报/申诉详情，不得自动重试审核写请求。
