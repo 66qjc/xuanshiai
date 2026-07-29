@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.redis import redis_client
 from app.schemas.presence import PresenceResponse, PresenceStatusRequest
+from app.services.location import remove_online_location
 
 HEARTBEAT_INTERVAL_SECONDS = 30
 PRESENCE_TTL_SECONDS = 90
@@ -85,6 +86,7 @@ async def mark_session_offline(db: AsyncSession, user_id: int, session_id: int) 
     active = await db.execute(text("SELECT COUNT(*) FROM user_session WHERE user_id=:id AND status=1 AND access_expire_at>UTC_TIMESTAMP()"), {"id": user_id})
     if not active.scalar():
         await db.execute(text("UPDATE user_profile SET online_status=0 WHERE user_id=:id"), {"id": user_id})
+        await remove_online_location(user_id)
 
 
 async def mark_user_offline(db: AsyncSession, user_id: int) -> None:
@@ -94,3 +96,4 @@ async def mark_user_offline(db: AsyncSession, user_id: int) -> None:
     except RedisError:
         pass
     await db.execute(text("UPDATE user_profile SET online_status=0 WHERE user_id=:id"), {"id": user_id})
+    await remove_online_location(user_id)

@@ -4,6 +4,8 @@ from pydantic import ValidationError
 
 from app.main import app
 from app.schemas.matchmaker import (
+    MatchmakerContactExchangeCreate,
+    MatchmakerContactExchangeUpdate,
     MatchmakerServiceOrderCreate,
     MatchmakerServiceProductCreate,
     MatchmakerServiceProductUpdate,
@@ -54,6 +56,9 @@ def test_matchmaker_routes_are_registered_and_require_authentication() -> None:
     assert "/api/v1/matchmaker/service-products/{product_id}" in paths
     assert "/api/v1/matchmaker/service-requests/orders" in paths
     assert "/api/v1/matchmaker/service-requests/{service_id}/contact" in paths
+    assert "/api/v1/matchmaker/service-requests/{service_id}/contact-exchanges" in paths
+    assert "/api/v1/matchmaker/service-requests/contact-exchanges/{exchange_id}" in paths
+    assert "/api/v1/matchmaker/service-requests/contact-exchanges/{exchange_id}/contacts" in paths
     assert "/api/v1/admin/matchmaker/service-requests" in paths
     assert client.post(
         "/api/v1/matchmaker/service-requests",
@@ -65,3 +70,10 @@ def test_matchmaker_public_list_does_not_require_authentication() -> None:
     operation = client.get("/openapi.json").json()["paths"]["/api/v1/matchmakers"]["get"]
     security = operation.get("security", [])
     assert security == []
+
+
+def test_contact_exchange_schema_requires_explicit_consent_action() -> None:
+    assert MatchmakerContactExchangeCreate(target_user_id=2).target_user_id == 2
+    assert MatchmakerContactExchangeUpdate(action="CONSENT").action == "CONSENT"
+    with pytest.raises(ValidationError):
+        MatchmakerContactExchangeUpdate(action="DELIVER")

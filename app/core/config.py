@@ -57,7 +57,9 @@ class Settings(BaseSettings):
     browse_daily_limit: int = 8
     browse_high_match_bonus: int = 5
     apply_daily_free_limit: int = 3
-    apply_daily_vip_limit: int = 3
+    apply_daily_vip_limit: int = 10
+    # 社区同城浏览偏好变更冷却（天）；对齐 PRD 居住城市一周更新一次精神
+    community_city_cooldown_days: int = Field(default=7, ge=0)
     # 红娘服务只能通过现金订单获得，不为新用户自动发放免费次数。
     matchmaker_service_default_quota: int = 0
     superlike_daily_free_limit: int = 1

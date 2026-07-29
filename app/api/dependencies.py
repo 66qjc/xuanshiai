@@ -65,6 +65,14 @@ async def get_verified_user(current: CurrentUser = Depends(get_current_user)) ->
     return current
 
 
+async def get_realname_verified_user(
+    current: CurrentUser = Depends(get_verified_user),
+) -> CurrentUser:
+    if current.realname_status != 2:
+        raise HTTPException(status_code=403, detail="请先完成实名认证")
+    return current
+
+
 async def get_browsable_user(
     current: CurrentUser = Depends(get_verified_user),
     db: AsyncSession = Depends(get_db),

@@ -162,6 +162,26 @@ BUSINESS_TABLES = {
             KEY `idx_matchmaker_contact_matchmaker` (`matchmaker_id`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='红娘服务联系方式交付记录'
     """,
+    "matchmaker_contact_exchange": """
+        CREATE TABLE IF NOT EXISTS `matchmaker_contact_exchange` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `service_id` bigint unsigned NOT NULL,
+            `source_user_id` bigint unsigned NOT NULL,
+            `target_user_id` bigint unsigned NOT NULL,
+            `source_consented_at` datetime DEFAULT NULL,
+            `target_consented_at` datetime DEFAULT NULL,
+            `status` varchar(32) NOT NULL DEFAULT 'PENDING' COMMENT 'PENDING/ONE_SIDE_CONSENT/APPROVED/DELIVERED/REVOKED/HIDDEN',
+            `delivered_at` datetime DEFAULT NULL,
+            `hidden_at` datetime DEFAULT NULL,
+            `hidden_reason` varchar(255) DEFAULT NULL,
+            `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`),
+            UNIQUE KEY `uk_matchmaker_contact_exchange_service_target` (`service_id`, `source_user_id`, `target_user_id`),
+            KEY `idx_matchmaker_contact_exchange_source` (`source_user_id`, `status`),
+            KEY `idx_matchmaker_contact_exchange_target` (`target_user_id`, `status`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='用户双方联系方式授权交换'
+    """,
     "matchmaker_service_quota": """
         CREATE TABLE IF NOT EXISTS `matchmaker_service_quota` (
             `id` bigint unsigned NOT NULL AUTO_INCREMENT,
@@ -254,6 +274,23 @@ BUSINESS_TABLES = {
             PRIMARY KEY (`id`),
             KEY `idx_commission_rule_scope` (`beneficiary_type`, `status`, `priority`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='分成规则版本'
+    """,
+    "product_commission_config": """
+        CREATE TABLE IF NOT EXISTS `product_commission_config` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `product_id` bigint unsigned NOT NULL,
+            `beneficiary_type` varchar(32) NOT NULL,
+            `mode` varchar(16) NOT NULL COMMENT 'fixed/rate',
+            `fixed_amount` decimal(12,2) DEFAULT NULL,
+            `rate_percent` decimal(7,4) DEFAULT NULL,
+            `version` int unsigned NOT NULL DEFAULT '1',
+            `status` tinyint NOT NULL DEFAULT '1' COMMENT '1生效 2停用',
+            `created_by` bigint unsigned DEFAULT NULL,
+            `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`),
+            UNIQUE KEY `uk_product_commission_active` (`product_id`, `beneficiary_type`, `status`),
+            KEY `idx_product_commission_product` (`product_id`, `status`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='商品分成对象配置'
     """,
     "commission_entry": """
         CREATE TABLE IF NOT EXISTS `commission_entry` (

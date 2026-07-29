@@ -244,6 +244,7 @@ GET http://127.0.0.1:8000/api/v1/matchmakers/ranking?page=1&page_size=10
 - Content-Type：`application/json`。
 - 前置条件：用户账号正常、实名认证通过、订单支付成功、目标红娘有效。
 - 该接口用于支付成功后的幂等开通，不是免费申请入口。
+- `requirement` 必须与创建订单时保存的服务需求完全一致；历史订单未保存需求时，首次开通会补写该字段。
 
 请求字段：
 
@@ -298,7 +299,7 @@ Content-Type: application/json
 | `401` | 未登录或 Token 失效 | `请先登录` |
 | `403` | 未实名认证、账号受限 | `提交牵线申请前必须完成实名认证` |
 | `404` | 订单、商品或红娘不存在 | `红娘服务订单不存在` |
-| `409` | 订单未支付或服务已开通 | `红娘服务订单尚未支付成功` |
+| `409` | 订单未支付、服务已开通或需求与订单不一致 | `红娘服务订单尚未支付成功` / `服务需求与订单需求不一致，请重新提交` |
 | `422` | 订单不是红娘服务订单或参数非法 | `订单不是红娘服务订单` |
 
 ## 10. 红娘微信交付
@@ -326,6 +327,34 @@ Content-Type: application/json
   "wechat_contact": "matchmaker_wechat",
   "delivered_at": "2026-07-24T10:30:00"
 }
+```
+
+### `GET /api/v1/matchmaker/service-requests/contact-exchanges/{exchange_id}/contacts`
+
+- 权限：联系方式交换双方。
+- 前置条件：交换状态必须为 `DELIVERED`，即双方都已明确同意。
+- 作用：查看双方已授权的手机号；访问行为写入业务审计日志。
+- 未完成双方授权时返回 `409`；非交换参与方返回 `404`。
+
+成功响应 `200`：
+
+```json
+{
+  "exchange_id": 8,
+  "source_user_id": 23,
+  "target_user_id": 41,
+  "source_phone": "13800138000",
+  "target_phone": "13900139000",
+  "delivered_at": "2026-07-27T10:30:00"
+}
+```
+
+联系方式交换状态流：
+
+```text
+PENDING -> ONE_SIDE_CONSENT -> DELIVERED
+PENDING/ONE_SIDE_CONSENT -> REVOKED
+已退款服务 -> HIDDEN
 ```
 
 ## 11. 查询我的牵线申请
@@ -365,7 +394,7 @@ Authorization: Bearer <user_access_token>
 
 - 权限：登录用户且必须是该申请被分配的服务红娘。
 - Path 参数：`service_id`，正整数。
-- 只有 `0待接单`、`1服务中` 可以继续处理。
+- 状态只能按 `0待接单 -> 1服务中 -> 2服务完成` 或 `0/1 -> 3已取消/退款` 流转。
 - `status=1` 自动写入 `start_at`。
 - `status=2/3` 自动写入 `end_at`。
 - `status=2/3` 必须填写 `feedback`。
@@ -454,7 +483,19 @@ Content-Type: application/json
 | 分配红娘 | 否 | 否 | 是 |
 | 查看申请人联系方式 | 一期不返回 | 按业务授权 | 后台按治理需要 |
 
-## 12. 现有模糊点
+## 12. 联系方式授权交换
+
+红娘微信交付和用户双方联系方式交换是两条不同流程。`PATCH /matchmaker/service-requests/{service_id}/contact` 只交付红娘自己的微信，不代表双方用户已经同意交换联系方式。
+
+| 方法 | 路径 | 权限 | 用途 |
+| --- | --- | --- | --- |
+| `POST` | `/matchmaker/service-requests/{service_id}/contact-exchanges` | 被分配的服务红娘 | 创建双方联系方式授权申请 |
+| `GET` | `/matchmaker/service-requests/contact-exchanges/{exchange_id}` | 交换双方 | 查询授权状态 |
+| `PATCH` | `/matchmaker/service-requests/contact-exchanges/{exchange_id}` | 交换双方 | `CONSENT` 同意或 `REVOKE` 撤回 |
+
+授权状态为 `PENDING`、`ONE_SIDE_CONSENT`、`APPROVED`、`DELIVERED`、`REVOKED`、`HIDDEN`。只有双方都同意后才能进入 `APPROVED`，退款、拉黑、账号注销或风控处理会进入 `HIDDEN`。已交付记录不删除，只停止后续展示并保留审计记录。
+
+## 13. 现有模糊点
 
 - 具体哪些功能必须实名认证仍待产品确认；本模块当前提交牵线申请先要求实名认证。
 - 一期是否允许收费红娘、会员、积分和爆灯尚未实现，当前 `service_type=2` 固定为基础/免费牵线。
@@ -465,7 +506,7 @@ Content-Type: application/json
 - 超级管理员查看敏感材料、导出证据和聊天原文的二次确认及留存期限仍待确认。
 - 申请认识次数、推荐算法、会员曝光和爆灯规则不在本期红娘服务接口中实现。
 
-## 13. Swagger 手动测试前置条件
+## 14. Swagger 手动测试前置条件
 
 1. 启动后端：
 
@@ -489,7 +530,7 @@ Bearer <对应账号的 access_token>
    - 对应用户一条 `user_role.role_code='service_matchmaker'` 且 `status=1` 的角色。
    - 一个已完成实名认证的普通测试用户。
 
-## 14. Swagger 手动测试顺序
+## 15. Swagger 手动测试顺序
 
 ### 场景 A：公开查看红娘
 
@@ -548,7 +589,7 @@ Bearer <对应账号的 access_token>
 - `status=2` 但不填写 `feedback`。
 - `service_id` 非正整数。
 
-## 15. 运行检查
+## 16. 运行检查
 
 ```powershell
 .\.venv\Scripts\python.exe -m compileall -q app

@@ -2,6 +2,8 @@
 
 from fastapi import APIRouter
 
+from app.api.routes import location
+
 from app.api.routes import (
     admin,
     auth,
@@ -12,6 +14,7 @@ from app.api.routes import (
     health,
     identity,
     matchmaker,
+    media,
     meeting,
     membership,
     organization,
@@ -25,6 +28,8 @@ from app.api.routes import (
 
 
 api_router = APIRouter()
+api_router.include_router(location.router, tags=["位置服务"])
+api_router.include_router(location.users_router, tags=["位置服务"])
 api_router.include_router(health.router, tags=["系统"])
 api_router.include_router(auth.router, tags=["账号与认证"])
 api_router.include_router(users.router, tags=["账号与认证"])
@@ -43,6 +48,7 @@ api_router.include_router(matchmaker.requests_router, tags=["红娘"])
 api_router.include_router(meeting.router, tags=["红娘"])
 api_router.include_router(social.router, tags=["消息"])
 api_router.include_router(community.router, tags=["社区"])
+api_router.include_router(media.router, tags=["社区"])
 api_router.include_router(admin.router, tags=["管理后台"])
 api_router.include_router(matchmaker.admin_router, tags=["管理后台"])
 api_router.include_router(meeting.admin_router, tags=["管理后台"])

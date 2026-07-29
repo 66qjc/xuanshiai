@@ -129,6 +129,38 @@ class MatchmakerContactResponse(BaseModel):
     delivered_at: datetime
 
 
+class MatchmakerContactExchangeCreate(BaseModel):
+    target_user_id: int = Field(ge=1)
+
+
+class MatchmakerContactExchangeUpdate(BaseModel):
+    action: Literal["CONSENT", "REVOKE"]
+
+
+class MatchmakerContactExchangeResponse(BaseModel):
+    id: int
+    service_id: int
+    source_user_id: int
+    target_user_id: int
+    status: Literal["PENDING", "ONE_SIDE_CONSENT", "APPROVED", "DELIVERED", "REVOKED", "HIDDEN"]
+    source_consented_at: datetime | None
+    target_consented_at: datetime | None
+    delivered_at: datetime | None
+    hidden_at: datetime | None
+    hidden_reason: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class MatchmakerContactExchangeContactsResponse(BaseModel):
+    exchange_id: int
+    source_user_id: int
+    target_user_id: int
+    source_phone: str
+    target_phone: str
+    delivered_at: datetime
+
+
 class MatchmakerServiceRequestPage(BaseModel):
     items: list[MatchmakerServiceRequestResponse]
     page: int

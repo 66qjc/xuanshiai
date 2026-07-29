@@ -3,7 +3,13 @@
 from fastapi import APIRouter, Body, Depends, Header, Path, Query, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.dependencies import CurrentUser, get_browsable_user, get_current_user, get_verified_user
+from app.api.dependencies import (
+    CurrentUser,
+    get_browsable_user,
+    get_current_user,
+    get_realname_verified_user,
+    get_verified_user,
+)
 from app.db.session import get_db
 from app.schemas.discovery import (
     ApplicationCreateRequest,
@@ -100,7 +106,7 @@ async def remove_favorite(target_id: int = Path(..., ge=1), current: CurrentUser
 
 
 @router.post("/applications/{target_id}", response_model=ApplicationResponse, status_code=201, summary="申请认识")
-async def apply_to_user(target_id: int = Path(..., ge=1), body: ApplicationCreateRequest = Body(...), current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> ApplicationResponse:
+async def apply_to_user(target_id: int = Path(..., ge=1), body: ApplicationCreateRequest = Body(...), current: CurrentUser = Depends(get_realname_verified_user), db: AsyncSession = Depends(get_db)) -> ApplicationResponse:
     return await create_application(db, current.id, target_id, body)
 
 
@@ -115,12 +121,12 @@ async def outgoing_applications(page: int = Query(1, ge=1, le=1000), page_size: 
 
 
 @router.post("/applications/{application_id}/accept", response_model=ApplicationResponse, summary="同意认识申请")
-async def accept_application(application_id: int = Path(..., ge=1), current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> ApplicationResponse:
+async def accept_application(application_id: int = Path(..., ge=1), current: CurrentUser = Depends(get_realname_verified_user), db: AsyncSession = Depends(get_db)) -> ApplicationResponse:
     return await respond_application(db, current.id, application_id, True)
 
 
 @router.post("/applications/{application_id}/reject", response_model=ApplicationResponse, summary="拒绝认识申请")
-async def reject_application(application_id: int = Path(..., ge=1), body: ApplicationRejectRequest | None = None, current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> ApplicationResponse:
+async def reject_application(application_id: int = Path(..., ge=1), body: ApplicationRejectRequest | None = None, current: CurrentUser = Depends(get_realname_verified_user), db: AsyncSession = Depends(get_db)) -> ApplicationResponse:
     return await respond_application(db, current.id, application_id, False, body)
 
 

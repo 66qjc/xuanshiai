@@ -32,6 +32,11 @@ from app.services.wechat.providers import get_wechat_provider
 from app.services.presence import mark_session_online
 
 
+def normalize_user_agent(user_agent: str | None) -> str | None:
+    """Keep request metadata within the database column size used by login records."""
+    return user_agent[:255] if user_agent else user_agent
+
+
 class SmsStore:
     """Process-local fallback for development; production must use Redis."""
 
@@ -191,6 +196,7 @@ async def login_phone(db: AsyncSession, request: PhoneLoginRequest, ip: str | No
     if request.purpose != "login":
         raise HTTPException(422, detail="手机号登录验证码用途必须为login")
     await sms_store.verify(request.phone, request.purpose, request.code)
+    user_agent = normalize_user_agent(user_agent)
     async with db.begin():
         user_id = await get_or_create_user_by_phone(db, request.phone, ip)
         await db.execute(text("UPDATE users SET phone_verified_at = UTC_TIMESTAMP(), last_login_at = UTC_TIMESTAMP() WHERE id = :id"), {"id": user_id})
@@ -202,6 +208,7 @@ async def login_phone(db: AsyncSession, request: PhoneLoginRequest, ip: str | No
 
 async def login_wechat(db: AsyncSession, request: WechatLoginRequest, ip: str | None, user_agent: str | None) -> dict[str, Any]:
     identity = await exchange_wechat_code(request.code)
+    user_agent = normalize_user_agent(user_agent)
     async with db.begin():
         result = await db.execute(text("SELECT id, phone, status FROM users WHERE openid = :openid FOR UPDATE"), {"openid": identity["openid"]})
         row = result.mappings().first()

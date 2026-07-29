@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies import CurrentUser
 from app.schemas.auth import MatchmakerApplicationCreate, MatchmakerReviewRequest, RegistrationIntentUpdate
+from app.services.notifications import emit_notification
 
 INTENT_OPTIONS = {
     "self_match": ("自己找", "以本人交友和婚恋匹配为主要目的"),
@@ -61,15 +62,16 @@ async def _notify_matchmaker_review(
         2: f"你的服务红娘申请未通过审核：{reason or '请补充材料后重新提交'}",
         3: f"你的红娘服务已暂停：{reason or '请联系平台客服'}",
     }[status]
-    await db.execute(text("""INSERT INTO user_notification
-        (user_id, notification_type, title, content, related_id, is_read)
-        VALUES (:user_id, :notification_type, :title, :content, :related_id, 0)"""), {
-        "user_id": user_id,
-        "notification_type": "matchmaker_application_reviewed",
-        "title": title,
-        "content": content,
-        "related_id": application_id,
-    })
+    await emit_notification(
+        db,
+        recipient_user_id=user_id,
+        actor_user_id=None,
+        event_type="matchmaker_application_reviewed",
+        title=title,
+        content=content,
+        target_type="matchmaker_application",
+        target_id=application_id,
+    )
 
 
 def mask_phone(phone: str) -> str:
@@ -83,6 +85,12 @@ def application_response(row: Any) -> dict[str, Any]:
             cert_images = json.loads(cert_images)
         except json.JSONDecodeError:
             cert_images = []
+    application_details = row.get("application_details") or {}
+    if isinstance(application_details, str):
+        try:
+            application_details = json.loads(application_details)
+        except json.JSONDecodeError:
+            application_details = {}
     return {
         "id": row["id"],
         "application_type": row["application_type"],
@@ -91,6 +99,7 @@ def application_response(row: Any) -> dict[str, Any]:
         "phone_masked": mask_phone(row["phone"]),
         "intro": row["intro"],
         "cert_images": cert_images,
+        "application_details": application_details,
         "fail_reason": row["fail_reason"],
         "created_at": row["created_at"].isoformat() if isinstance(row["created_at"], datetime) else str(row["created_at"]),
         "reviewed_at": row["reviewed_at"].isoformat() if row["reviewed_at"] else None,
@@ -111,17 +120,27 @@ async def create_matchmaker_application(
         raise HTTPException(409, detail="该类型申请已存在或正在生效")
     if existing and existing["status"] == 2:
         await db.execute(text("""UPDATE user_matchmaker_apply SET real_name = :real_name, phone = :phone,
-            intro = :intro, cert_images = :cert_images, status = 0, fail_reason = NULL,
+            intro = :intro, cert_images = :cert_images, application_details = :application_details,
+            status = 0, fail_reason = NULL,
             reviewed_by = NULL, reviewed_at = NULL, suspended_at = NULL, suspension_reason = NULL,
-            updated_at = UTC_TIMESTAMP() WHERE id = :id"""), {**request.model_dump(), "cert_images": request.cert_images, "id": existing["id"]})
+            updated_at = UTC_TIMESTAMP() WHERE id = :id"""), {
+                **request.model_dump(exclude={"application_details"}),
+                "cert_images": json.dumps(request.cert_images, ensure_ascii=False),
+                "application_details": request.application_details.model_dump_json(),
+                "id": existing["id"],
+            })
     else:
         await db.execute(text("""INSERT INTO user_matchmaker_apply
-            (user_id, application_type, real_name, phone, intro, cert_images, status)
-            VALUES (:user_id, :application_type, :real_name, :phone, :intro, :cert_images, 0)"""),
-            {"user_id": current.id, **request.model_dump(), "cert_images": request.cert_images})
+            (user_id, application_type, real_name, phone, intro, cert_images, application_details, status)
+            VALUES (:user_id, :application_type, :real_name, :phone, :intro, :cert_images, :application_details, 0)"""), {
+                "user_id": current.id,
+                **request.model_dump(exclude={"application_details"}),
+                "cert_images": json.dumps(request.cert_images, ensure_ascii=False),
+                "application_details": request.application_details.model_dump_json(),
+            })
     await db.commit()
     result = await db.execute(text("""SELECT id, application_type, status, real_name, phone, intro,
-        cert_images, fail_reason, created_at, reviewed_at FROM user_matchmaker_apply
+        cert_images, application_details, fail_reason, created_at, reviewed_at FROM user_matchmaker_apply
         WHERE user_id = :user_id AND application_type = :application_type"""),
         {"user_id": current.id, "application_type": request.application_type})
     return application_response(result.mappings().one())
@@ -129,7 +148,7 @@ async def create_matchmaker_application(
 
 async def list_my_applications(db: AsyncSession, user_id: int) -> list[dict[str, Any]]:
     result = await db.execute(text("""SELECT id, application_type, status, real_name, phone, intro,
-        cert_images, fail_reason, created_at, reviewed_at FROM user_matchmaker_apply
+        cert_images, application_details, fail_reason, created_at, reviewed_at FROM user_matchmaker_apply
         WHERE user_id = :user_id ORDER BY created_at DESC"""), {"user_id": user_id})
     return [application_response(row) for row in result.mappings().all()]
 
@@ -163,5 +182,5 @@ async def review_matchmaker_application(
     await _notify_matchmaker_review(db, int(row["user_id"]), application_id, request.status, request.fail_reason)
     await db.commit()
     result = await db.execute(text("""SELECT id, application_type, status, real_name, phone, intro,
-        cert_images, fail_reason, created_at, reviewed_at FROM user_matchmaker_apply WHERE id = :id"""), {"id": application_id})
+        cert_images, application_details, fail_reason, created_at, reviewed_at FROM user_matchmaker_apply WHERE id = :id"""), {"id": application_id})
     return application_response(result.mappings().one())

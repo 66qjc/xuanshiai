@@ -88,6 +88,10 @@ class NotificationItem(BaseModel):
     payload: dict | None
     related_user_id: int | None
     related_id: int | None
+    target_type: str | None = None
+    target_id: int | None = None
+    actor_user_id: int | None = None
+    action: str = ""
     is_read: bool
     created_at: datetime
 
@@ -116,6 +120,8 @@ class PrivacyUpdateRequest(BaseModel):
     show_posts: bool | None = None
     notify_like: bool | None = None
     notify_comment: bool | None = None
+    notify_follow: bool | None = None
+    notify_message: bool | None = None
     notify_match: bool | None = None
     notify_apply: bool | None = None
     notify_system: bool | None = None
@@ -139,6 +145,8 @@ class PrivacyResponse(BaseModel):
     show_posts: bool
     notify_like: bool
     notify_comment: bool
+    notify_follow: bool
+    notify_message: bool
     notify_match: bool
     notify_apply: bool
     notify_system: bool
@@ -158,6 +166,57 @@ class ReportRequest(BaseModel):
 class ReportResponse(BaseModel):
     id: int
     target_user_id: int
+    target_type: Literal["user", "post", "comment", "paper_plane"] = "user"
+    target_id: int | None = None
     type: str
     status: Literal[0, 1, 2]
     created_at: datetime
+
+
+class ReportDetailResponse(BaseModel):
+    id: int
+    target_user_id: int
+    target_type: Literal["user", "post", "comment", "paper_plane"]
+    target_id: int | None
+    viewer_role: Literal["reporter", "subject"]
+    type: str | None
+    description: str | None
+    status: Literal[0, 1, 2]
+    result: str | None
+    action: Literal["none", "hide_content", "restore_content", "dismiss"] = "none"
+    reviewed_at: datetime | None = None
+    created_at: datetime
+    updated_at: datetime | None = None
+    can_appeal: bool = False
+
+
+class ReportPage(BaseModel):
+    items: list[ReportDetailResponse]
+    page: int
+    page_size: int
+    total: int
+    has_more: bool
+
+
+class ReportAppealCreate(BaseModel):
+    reason: str = Field(min_length=1, max_length=1000)
+
+
+class ReportAppealResponse(BaseModel):
+    id: int
+    report_id: int
+    appellant_user_id: int
+    reason: str
+    status: Literal[0, 1, 2]
+    result: str | None = None
+    reviewed_at: datetime | None = None
+    created_at: datetime
+    updated_at: datetime | None = None
+
+
+class ReportAppealPage(BaseModel):
+    items: list[ReportAppealResponse]
+    page: int
+    page_size: int
+    total: int
+    has_more: bool

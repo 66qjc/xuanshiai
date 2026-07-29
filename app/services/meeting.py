@@ -19,6 +19,7 @@ from app.schemas.meeting import (
     MeetingScheduleCreate,
     MeetingStatusUpdate,
 )
+from app.services.social import ensure_users_can_interact
 
 
 def _dt(value: Any) -> datetime:
@@ -47,13 +48,15 @@ async def create_matchmaker_meeting_request(
     service = service_result.mappings().first()
     if not service:
         raise HTTPException(404, detail="服务单不存在或不属于当前红娘")
-    if service["status"] not in (1,):
-        raise HTTPException(409, detail="只有服务中的红娘服务才能发起约见")
+    if service["status"] not in (1, 2):
+        raise HTTPException(409, detail="只有服务中或服务完成的红娘服务才能发起约见")
     if request.target_user_id == service["user_id"]:
         raise HTTPException(422, detail="不能将服务用户作为约见对象")
     target = await db.execute(text("SELECT id FROM users WHERE id = :id AND status = 1"), {"id": request.target_user_id})
     if not target.scalar():
         raise HTTPException(404, detail="约见对象不存在或不可用")
+    await ensure_users_can_interact(db, int(service["user_id"]), request.target_user_id)
+    await ensure_users_can_interact(db, current.id, request.target_user_id)
     duplicate = await db.execute(text("""SELECT id FROM meeting_request
         WHERE user_id = :user_id AND target_user_id = :target_id
           AND status IN ('SUBMITTED', 'CONTACTED', 'ACCEPTED') LIMIT 1"""), {

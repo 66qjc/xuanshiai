@@ -24,6 +24,8 @@ Content-Type: application/json
 - 关系、聊天、社区和安全接口要求账号存在有效手机号。
 - 目标用户必须处于公开交友状态，不能是当前用户本人，也不能与当前用户互相拉黑。
 - 聊天要求双方存在有效匹配关系（匹配状态 `1` 或 `2`）。
+- 喜欢、取消喜欢、关注、取消关注，以及发现模块的认识申请创建/同意/拒绝，要求当前用户 `realname_status == 2`；未通过返回 `403` 和 `{"detail":"请先完成实名认证"}`。
+- 关系列表读取、举报和拉黑/解除拉黑继续允许已登录、已绑定手机号的非实名用户使用。
 - 关系写入使用数据库唯一约束和 `INSERT IGNORE`，重复喜欢/关注通常会返回当前状态，不会新增重复记录。
 - 当前发送消息、发布内容、举报没有 `Idempotency-Key` 机制；网络超时后不要盲目重试写请求，应先查询结果。
 
@@ -33,7 +35,7 @@ Content-Type: application/json
 
 #### `PUT /api/v1/users/{target_id}/like`
 
-权限：已登录且已绑定手机号。成功状态：`200 OK`。
+权限：已登录、已绑定手机号且实名认证通过（`realname_status == 2`）；未通过返回 `403`。成功状态：`200 OK`。
 
 路径参数：
 
@@ -57,7 +59,7 @@ Authorization: Bearer <access_token>
 | `target_user_id` | integer | 是 | 不为空 | 目标用户 ID |
 | `relation_type` | string | 是 | 不为空 | 固定为 `like` |
 | `enabled` | boolean | 是 | 不为空 | 本次操作后是否喜欢 |
-| `matched` | boolean | 是 | 不为空 | 双方是否已互相喜欢并建立匹配 |
+| `matched` | boolean | 是 | 不为空 | 是否仍存在有效 match（通常来自申请同意；**喜欢本身不再创建匹配**） |
 
 成功响应：
 
@@ -65,23 +67,23 @@ Authorization: Bearer <access_token>
 {"target_user_id":23,"relation_type":"like","enabled":true,"matched":false}
 ```
 
-当对方已经喜欢当前用户时，服务端会创建双方匹配记录和聊天会话，并写入匹配通知，此时 `matched=true`。
+定版产品规则：**喜欢为私有列表操作**，互喜欢**不会**创建 `user_match`、**不会**创建 `chat_session`、**不会**发送「可以开始聊天了」类匹配通知。聊天会话仅在认识申请被同意等既有路径建立。`matched` 仅反映当前是否仍有有效匹配（例如双方此前已通过申请）。
 
 #### `DELETE /api/v1/users/{target_id}/like`
 
-路径参数和权限与喜欢接口相同，请求体无，成功状态 `200 OK`。响应示例：
+权限：已登录、已绑定手机号且实名认证通过（`realname_status == 2`）；未通过返回 `403`。路径参数与喜欢接口相同，请求体无，成功状态 `200 OK`。响应示例：
 
 ```json
 {"target_user_id":23,"relation_type":"like","enabled":false,"matched":false}
 ```
 
-取消喜欢会把双方匹配记录状态更新为 `3`（已取消）；不会删除聊天历史。目标用户不存在、不可见或已拉黑时返回 `404` 或 `403`。
+取消喜欢只删除当前用户的私有喜欢记录。它不会修改任何 `user_match` 状态，也不会撤销或删除由认识申请同意等流程创建的匹配与聊天。目标用户不存在、不可见或已拉黑时返回 `404` 或 `403`。
 
 ### 2.2 关注用户
 
 #### `PUT /api/v1/users/{target_id}/follow`
 
-请求体无，成功状态 `200 OK`。返回格式与喜欢接口相同，但 `relation_type` 固定为 `follow`，`matched` 固定为 `false`：
+权限：已登录、已绑定手机号且实名认证通过（`realname_status == 2`）；未通过返回 `403`。请求体无，成功状态 `200 OK`。返回格式与喜欢接口相同，但 `relation_type` 固定为 `follow`，`matched` 固定为 `false`：
 
 ```json
 {"target_user_id":23,"relation_type":"follow","enabled":true,"matched":false}
@@ -89,7 +91,7 @@ Authorization: Bearer <access_token>
 
 #### `DELETE /api/v1/users/{target_id}/follow`
 
-请求体无，成功状态 `200 OK`。返回 `enabled=false`。关注不会触发匹配，也不会建立聊天会话。
+权限：已登录、已绑定手机号且实名认证通过（`realname_status == 2`）；未通过返回 `403`。请求体无，成功状态 `200 OK`。返回 `enabled=false`。关注不会触发匹配，也不会建立聊天会话。
 
 ### 2.3 关系列表
 
@@ -98,7 +100,7 @@ Authorization: Bearer <access_token>
 | 方法和路径 | 关系方向 | 结果 |
 | --- | --- | --- |
 | `GET /api/v1/relations/likes` | 当前用户 -> 他人 | 我喜欢的人 |
-| `GET /api/v1/relations/liked-by` | 他人 -> 当前用户 | 喜欢我的人 |
+| `GET /api/v1/relations/liked-by` | 不再提供 | 已废弃，固定返回 `410` 且不查询/返回发送者身份 |
 | `GET /api/v1/relations/following` | 当前用户 -> 他人 | 我关注的人 |
 | `GET /api/v1/relations/followers` | 他人 -> 当前用户 | 我的粉丝 |
 | `GET /api/v1/relations/matches` | 当前用户的有效匹配 | 我的匹配 |
@@ -147,7 +149,27 @@ Authorization: Bearer <access_token>
 {"items":[],"page":1,"page_size":20,"total":0}
 ```
 
-### 2.4 取消匹配
+喜欢是私有数据。唯一受支持的喜欢列表接口是 `GET /api/v1/relations/likes`，仅返回当前用户主动喜欢的人。`GET /api/v1/relations/liked-by` 已废弃，所有已认证调用固定返回：
+
+```http
+HTTP/1.1 410 Gone
+```
+
+```json
+{"detail":"鍠滄鍒楄〃浠呮湰浜哄彲瑙?"}
+```
+
+该废弃接口不会查询或返回喜欢发送者身份。旧客户端必须移除“喜欢我的人”入口，并迁移到仅展示 `GET /relations/likes` 的本人私有喜欢列表。
+
+### 2.4 认识申请的实名要求（发现模块）
+
+以下写接口要求 `realname_status == 2`，未通过返回上述 `403`；收到/发出的申请列表读取仍对已登录非实名用户开放：
+
+- `POST /api/v1/discovery/applications/{target_id}`
+- `POST /api/v1/discovery/applications/{application_id}/accept`
+- `POST /api/v1/discovery/applications/{application_id}/reject`
+
+### 2.5 取消匹配
 
 #### `DELETE /api/v1/relations/matches/{target_id}`
 
@@ -294,6 +316,10 @@ Authorization: Bearer <access_token>
 | `items[].payload` | object/null | 是 | 无附加数据时 `null` | 结构化附加数据 |
 | `items[].related_user_id` | integer/null | 是 | 无关联用户时 `null` | 关联用户 ID |
 | `items[].related_id` | integer/null | 是 | 无关联业务记录时 `null` | 关联记录 ID |
+| `items[].target_type` | string/null | 是 | 旧通知可能为 `null` | 导航目标类型，如 `post`、`comment`、`user`、`report`、`activity` |
+| `items[].target_id` | integer/null | 是 | 无目标或目标已失效时 `null` | 导航目标 ID |
+| `items[].actor_user_id` | integer/null | 是 | 治理系统通知可为 `null` | 触发事件的用户 ID；兼容别名，等同于 `related_user_id` |
+| `items[].action` | string | 是 | 不为空 | 触发动作，当前等同于 `notification_type`，如 `comment`、`follow`、`activity` |
 | `items[].is_read` | boolean | 是 | 不为空 | 是否已读 |
 | `items[].created_at` | datetime | 是 | 不为空 | 创建时间 |
 | `page` | integer | 是 | 不为空 | 当前页 |
@@ -305,7 +331,7 @@ Authorization: Bearer <access_token>
 
 ```json
 {
-  "items":[{"id":10,"notification_type":"match","title":"你们互相喜欢了","content":"恭喜匹配成功，可以开始聊天了","payload":{"related_user_id":23},"related_user_id":23,"related_id":null,"is_read":false,"created_at":"2026-07-20T10:30:00"}],
+  "items":[{"id":10,"notification_type":"comment","title":"有人评论了你的动态","content":"很喜欢这张照片","payload":{"post_id":4},"related_user_id":23,"related_id":4,"target_type":"post","target_id":4,"actor_user_id":23,"action":"comment","is_read":false,"created_at":"2026-07-20T10:30:00"}],
   "page":1,"page_size":20,"total":1,"unread_count":1
 }
 ```
@@ -353,6 +379,8 @@ Authorization: Bearer <access_token>
 | `show_posts` | boolean/null | 否 | `true` | 布尔值 | 是否允许自己的动态出现在动态流 |
 | `notify_like` | boolean/null | 否 | `true` | 布尔值 | 喜欢通知开关 |
 | `notify_comment` | boolean/null | 否 | `true` | 布尔值 | 评论通知开关 |
+| `notify_follow` | boolean/null | 否 | `true` | 布尔值 | 关注通知开关 |
+| `notify_message` | boolean/null | 否 | `true` | 布尔值 | 新消息通知开关 |
 | `notify_match` | boolean/null | 否 | `true` | 布尔值 | 匹配通知开关 |
 | `notify_apply` | boolean/null | 否 | `true` | 布尔值 | 认识申请通知开关 |
 | `notify_system` | boolean/null | 否 | `true` | 布尔值 | 系统通知开关 |
@@ -419,6 +447,8 @@ Authorization: Bearer <access_token>
 | --- | --- | --- | --- |
 | `id` | integer | 是 | 举报记录 ID |
 | `target_user_id` | integer | 是 | 被举报用户 ID |
+| `target_type` | string | 是 | 固定 `user`（用户举报轨） |
+| `target_id` | integer/null | 是 | 与 `target_user_id` 相同 |
 | `type` | string | 是 | 举报类型 |
 | `status` | integer | 是 | `0` 待处理，`1` 已处理，`2` 已驳回 |
 | `created_at` | datetime | 是 | 创建时间 |
@@ -426,10 +456,10 @@ Authorization: Bearer <access_token>
 成功响应：
 
 ```json
-{"id":31,"target_user_id":23,"type":"骚扰","status":0,"created_at":"2026-07-20T11:00:00"}
+{"id":31,"target_user_id":23,"target_type":"user","target_id":23,"type":"骚扰","status":0,"created_at":"2026-07-20T11:00:00"}
 ```
 
-当前接口只保存举报记录，不会自动封禁目标用户；后台处理见 `docs/api/admin.md`。
+当前接口只保存**用户**举报记录（`target_type=user`），不会自动封禁目标用户。社区帖子/评论/纸飞机请使用 `POST /api/v1/community/reports`（见 `docs/api/community.md`）。后台处理见 `docs/api/admin.md`。
 
 ## 8. 错误响应
 
@@ -437,18 +467,29 @@ Authorization: Bearer <access_token>
 | --- | --- | --- | --- |
 | `401` | 未登录、Token 无效或会话失效 | `请先登录` | 清理 Token 并重新登录 |
 | `403` | 未绑定手机号、未匹配、已拉黑或无权限 | `当前没有聊天权限` | 展示绑定/匹配/权限提示 |
+| `403` | 喜欢/关注或认识申请写操作未通过实名认证 | `请先完成实名认证` | 引导实名认证；举报、拉黑和读取仍可用 |
 | `404` | 用户、会话、消息、关系或举报目标不存在 | `聊天会话不存在` | 刷新列表并移除失效项 |
 | `409` | 业务状态冲突 | `关系状态冲突` | 重新查询当前状态 |
+| `410` | 调用已废弃的 `GET /relations/liked-by` | `鍠滄鍒楄〃浠呮湰浜哄彲瑙?` | 移除该入口；仅使用 `GET /relations/likes` |
 | `422` | 类型、长度、范围或枚举不合法 | `文本消息内容不能为空` | 修正请求参数 |
 
 ## 9. 状态、兼容性与现有能力复用
 
 - 关系状态：喜欢/关注通过 `user_favorite.type` 区分，匹配状态 `1/2` 表示有效，`3` 表示取消。
-- 聊天会话由互相喜欢或申请同意时创建；会话 ID 稳定对应 `chat_session.id`。
+- 聊天会话由**申请同意**等匹配路径创建，**不由**互相喜欢创建；会话 ID 稳定对应 `chat_session.id`。
 - 本组接口复用 FastAPI 的 `HTTPBearer`、Pydantic Schema、SQLAlchemy AsyncSession 和已有关系/通知/Redis 能力，不新增重复的认证、分页或缓存实现。
 - 当前分页列表响应格式已上线，后续如要增加 `has_more` 或改成统一 `{items,...}` 包装，属于响应契约变更，必须先增加兼容版本或同步前端迁移。
 
 ## 10. 变更记录
+
+### 2026-07-25
+
+- **喜欢与关注实名门禁：** 变更前，公共权限章节已有实名要求，但喜欢和关注主端点未逐条写明。变更后，like/unlike/follow/unfollow 四条写接口均明确要求已登录、已绑定手机号且 `realname_status == 2`，未通过返回 `403`。影响：读取关系、举报和拉黑/解除拉黑仍只需手机号已绑定；未实名客户端应先完成实名认证再发起关系写入。
+- **喜欢不再自动匹配：** `PUT /users/{id}/like` 仅维护 `user_favorite`；互喜欢不创建 match/chat_session、不发匹配通知。聊天入口以申请同意等路径为准（定版：喜欢私有 + 先申请再聊）。
+- **取消喜欢不影响申请匹配：** `DELETE /users/{id}/like` 仅删除私有喜欢记录，永不修改申请创建的 match 或 chat。
+- **喜欢列表收口：** 仅 `GET /relations/likes` 受支持；`GET /relations/liked-by` 废弃并固定返回不含身份的 `410`。
+- **实名权限：** 喜欢/关注和认识申请创建/同意/拒绝要求 `realname_status == 2`；举报、拉黑与读取保持可用。
+- 本地 HTTP 冒烟：互喜欢后 `chat_session`/`active_match` 仍为 0；`POST /discovery/applications/{id}/accept` 后才出现会话（对照验证）。
 
 ### 2026-07-20
 
@@ -456,3 +497,15 @@ Authorization: Bearer <access_token>
 - 明确登录 Token 中的内部会话 `sid` 与聊天 `session_id` 的区别。
 - 明确匹配、聊天权限、黑名单、隐私枚举、通知和举报状态。
 - 明确当前未提供消息幂等键、媒体上传和自动审核的边界。
+
+### 2026-07-28（中央通知事件）
+
+- `GET /api/v1/notifications` 的 `items[]` 新增向后兼容字段：`target_type: string|null` 与 `target_id: integer|null`。新事件使用这两个字段导航；`related_user_id`、`related_id` 继续保留给旧客户端。
+- `items[]` 同时新增 `actor_user_id` 与 `action`：分别是 `related_user_id` 的标准别名和事件动作；旧客户端可继续使用原字段。
+- 通知成功示例：`{"id":12,"notification_type":"comment","title":"有人评论了你的动态","content":"很喜欢这张照片","payload":{"comment_id":31},"related_user_id":8,"related_id":4,"target_type":"post","target_id":4,"is_read":false,"created_at":"2026-07-28T10:00:00"}`。
+- `GET/PUT /api/v1/users/me/privacy` 新增 `notify_follow: boolean` 与 `notify_message: boolean`，默认均为 `true`；请求可只提交其中任一个字段。
+- 互动与普通系统通知统一检查接收人的事件偏好；`reply` 复用 `notify_comment`，未知系统事件复用 `notify_system`。`report_result`（举报处理结果与内容治理通知）和 `appeal_result`（申诉复审结果）属于必达治理站内信，始终写入，不受 `notify_system` 关闭影响。
+- 操作者与接收人相同不写通知；双方任一方向存在 `user_block` 时不写互动通知。关注、回复评论和点赞评论在动作层同样执行拉黑检查，返回 `403`。
+- 关注只在首次写入关系时产生 `follow` 通知；重复 `PUT`、取消关注不产生通知。动态/评论点赞同样只在首次点赞时通知。
+- 兼容性：旧通知行的目标字段可为 `null`；旧客户端继续读取 `related_id`。新客户端不得假定所有通知都可导航。
+- 通知标题和正文预览由中央写入器分别限制为 128 和 255 字符；长评论仍可正常发布，通知仅保存截断预览。

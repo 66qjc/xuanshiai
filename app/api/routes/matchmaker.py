@@ -9,6 +9,10 @@ from app.schemas.matchmaker import (
     MatchmakerAdminServiceRequestUpdate,
     MatchmakerCard,
     MatchmakerContactResponse,
+    MatchmakerContactExchangeCreate,
+    MatchmakerContactExchangeContactsResponse,
+    MatchmakerContactExchangeResponse,
+    MatchmakerContactExchangeUpdate,
     MatchmakerContactUpdate,
     MatchmakerPage,
     MatchmakerServiceOrderCreate,
@@ -28,12 +32,16 @@ from app.services.matchmaker import (
     create_service_request,
     create_service_order,
     get_matchmaker_contact,
+    get_contact_exchange_contacts,
     get_service_order,
     get_matchmaker,
     list_service_products,
     list_matchmakers,
     list_service_requests,
     set_matchmaker_contact,
+    create_contact_exchange,
+    update_contact_exchange,
+    get_contact_exchange,
     admin_update_service_product,
     update_service_request,
 )
@@ -169,6 +177,44 @@ async def contact(
     db: AsyncSession = Depends(get_db),
 ) -> MatchmakerContactResponse:
     return await get_matchmaker_contact(db, current, service_id)
+
+
+@requests_router.post("/{service_id}/contact-exchanges", response_model=MatchmakerContactExchangeResponse, status_code=201, summary="发起双方联系方式授权")
+async def create_exchange(
+    service_id: int = Path(..., ge=1),
+    body: MatchmakerContactExchangeCreate = ...,
+    current: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> MatchmakerContactExchangeResponse:
+    return await create_contact_exchange(db, current, service_id, body)
+
+
+@requests_router.patch("/contact-exchanges/{exchange_id}", response_model=MatchmakerContactExchangeResponse, summary="同意或撤回联系方式授权")
+async def update_exchange(
+    exchange_id: int = Path(..., ge=1),
+    body: MatchmakerContactExchangeUpdate = ...,
+    current: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> MatchmakerContactExchangeResponse:
+    return await update_contact_exchange(db, current, exchange_id, body)
+
+
+@requests_router.get("/contact-exchanges/{exchange_id}", response_model=MatchmakerContactExchangeResponse, summary="查询联系方式授权状态")
+async def get_exchange(
+    exchange_id: int = Path(..., ge=1),
+    current: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> MatchmakerContactExchangeResponse:
+    return await get_contact_exchange(db, current, exchange_id)
+
+
+@requests_router.get("/contact-exchanges/{exchange_id}/contacts", response_model=MatchmakerContactExchangeContactsResponse, summary="查看已授权双方联系方式")
+async def exchange_contacts(
+    exchange_id: int = Path(..., ge=1),
+    current: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> MatchmakerContactExchangeContactsResponse:
+    return await get_contact_exchange_contacts(db, current, exchange_id)
 
 
 admin_router = APIRouter(prefix="/admin/matchmaker/service-requests")
