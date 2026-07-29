@@ -2395,6 +2395,34 @@ class DatabaseManager:
             ON DUPLICATE KEY UPDATE user_id = user_id
         """, (user_id,))
 
+        # 初始积分（200 分）
+        cursor.execute("""
+            SELECT id FROM `user_points` WHERE user_id = %s AND type = 0 LIMIT 1
+        """, (user_id,))
+        if not cursor.fetchone():
+            cursor.execute("""
+                INSERT INTO `user_points` (user_id, type, amount, balance, description)
+                VALUES (%s, 0, 200, 200, '测试数据初始积分')
+            """, (user_id,))
+
+        # 城市设置
+        cursor.execute("""
+            UPDATE `user_profile` SET community_city_name = '上海', community_city_code = '310100'
+            WHERE user_id = %s
+        """, (user_id,))
+
+        # 纸飞机次数积分兑换产品
+        point_products = [
+            ("paper_plane_throw_chance", "纸飞机投放次数", "right", 50, None, 0),
+            ("paper_plane_catch_chance", "纸飞机捡拾次数", "right", 50, None, 1),
+        ]
+        for code, name, product_type, points_cost, value, sort in point_products:
+            cursor.execute("""
+                INSERT INTO `config_point_product` (code, name, product_type, points_cost, value, stock, sort, is_active)
+                VALUES (%s, %s, %s, %s, %s, NULL, %s, 1)
+                ON DUPLICATE KEY UPDATE name = VALUES(name), points_cost = VALUES(points_cost), is_active = 1
+            """, (code, name, product_type, points_cost, value, sort))
+
         conn.commit()
         logger.info(f"✅ 测试数据创建完成 | 用户ID: {user_id}")
         return user_id

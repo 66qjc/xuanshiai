@@ -336,6 +336,16 @@ _DEMO_COMMENTS = (
     (5, "13905000870", "不预设结果的见面，反而更轻松。"),
     (6, "13800001001", "愿意把话说完很重要。"),
     (7, "13800001002", "这个周末的安排听起来很舒服。"),
+    (0, "17870810286", "同感，坦诚比完美更重要。"),
+    (1, "13800001001", "下次可以一起走走，我也在上海。"),
+    (2, "13905000870", "确认自己的需求，是关系里很重要的一步。"),
+    (3, "13800001001", "一个人也要好好吃饭，说得太好了。"),
+    (4, "17870810286", "慢慢聊，不着急，这样的关系更真实。"),
+    (5, "13800001002", "不预设结果的相处，反而更让人期待。"),
+    (6, "13998020600", "愿意沟通就是关系的开始。"),
+    (7, "17870810285", "周末安排听起来很舒服。"),
+    (8, "17870810291", "稳定的自己，是关系里最好的基础。"),
+    (9, "13800001001", "这首歌我也喜欢，愿意多聊聊。"),
 )
 
 _DEMO_SIGNUPS = (
@@ -909,6 +919,97 @@ def seed_community_demo(
             _upsert_banner(cursor, _BANNERS[1], activity_ids[0]),
             _upsert_banner(cursor, _BANNERS[2], 0),
         ]
+
+        # 用户隐私设置（privacy API 必需）
+        for uid in user_ids.values():
+            cursor.execute(
+                """INSERT IGNORE INTO user_privacy (user_id) VALUES (%s)""",
+                (uid,),
+            )
+
+        # 用户初始积分（200 分，可兑换 4 次纸飞机）
+        INITIAL_POINTS = 200
+        for uid in user_ids.values():
+            cursor.execute(
+                """SELECT id FROM user_points WHERE user_id = %s AND type = 0 LIMIT 1""",
+                (uid,),
+            )
+            if not cursor.fetchone():
+                cursor.execute(
+                    """INSERT INTO user_points (user_id, type, amount, balance, description)
+                       VALUES (%s, 0, %s, %s, '演示数据初始积分')""",
+                    (uid, INITIAL_POINTS, INITIAL_POINTS),
+                )
+
+        # 用户城市设置（按 residence 分配）
+        city_map = {
+            "13800001001": "南京",
+            "13800001002": "上海",
+            "13998020600": "南京",
+            "13905000870": "上海",
+            "17870810285": "杭州",
+            "17870810286": "杭州",
+            "17870810291": "南京",
+        }
+        city_code_map = {
+            "南京": "320100",
+            "上海": "310100",
+            "杭州": "330100",
+        }
+        for phone, uid in user_ids.items():
+            city = city_map.get(phone)
+            if city:
+                code = city_code_map.get(city, "")
+                cursor.execute(
+                    """UPDATE user_profile SET community_city_name = %s,
+                       community_city_code = %s WHERE user_id = %s""",
+                    (city, code, uid),
+                )
+
+        # 演示通知数据
+        _DEMO_NOTIFICATIONS = (
+            ("like", "有人点赞了你的动态", "最近在练习把自己的想法说清楚…", "post", post_ids_by_index.get(0), "13800001002"),
+            ("comment", "有人评论了你的动态", "把话说清楚真的需要练习，这句话很有共鸣。", "post", post_ids_by_index.get(0), "13998020600"),
+            ("follow", "新关注", "林雨桐关注了你", "user", user_ids.get("13800001002"), "13800001002"),
+            ("system", "实名认证通过", "你的实名认证已通过审核，可以参与社区互动了。", "", 0, ""),
+            ("activity", "活动报名成功", "你已成功报名「南京周末读书会」", "activity", activity_ids_by_title.get("南京周末读书会"), ""),
+            ("like", "有人点赞了你的动态", "周末去武康路走了一圈…", "post", post_ids_by_index.get(1), "13905000870"),
+            ("comment", "有人评论了你的动态", "下次有类似路线可以一起走走。", "post", post_ids_by_index.get(1), "17870810286"),
+            ("system", "欢迎加入宣誓爱", "欢迎来到宣誓爱，开始你的真诚关系之旅。", "", 0, ""),
+        )
+        for ntype, title, content, target_type, target_id, actor_phone in _DEMO_NOTIFICATIONS:
+            actor_id = user_ids.get(actor_phone) if actor_phone else None
+            recipient_id = next(
+                (uid for pid, uid in user_ids.items() if pid == "13800001001"),
+                list(user_ids.values())[0],
+            )
+            if target_type == "post" and target_id is None:
+                continue
+            cursor.execute(
+                """INSERT INTO notification (user_id, notification_type, title, content,
+                   target_type, target_id, actor_user_id, is_read, created_at)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                   ON DUPLICATE KEY UPDATE id = id""",
+                (
+                    recipient_id, ntype, title, content,
+                    target_type, target_id or 0, actor_id,
+                    0, current_time - timedelta(hours=1),
+                ),
+            )
+
+        # 积分兑换产品（纸飞机次数）
+        _POINT_PRODUCTS = (
+            ("paper_plane_throw_chance", "纸飞机投放次数", "right", 50, None, 0),
+            ("paper_plane_catch_chance", "纸飞机捡拾次数", "right", 50, None, 1),
+        )
+        for code, name, product_type, points_cost, value, sort in _POINT_PRODUCTS:
+            cursor.execute(
+                """INSERT INTO config_point_product (code, name, product_type, points_cost, value, stock, sort, is_active)
+                   VALUES (%s, %s, %s, %s, %s, NULL, %s, 1)
+                   ON DUPLICATE KEY UPDATE name = VALUES(name), points_cost = VALUES(points_cost), is_active = 1""",
+                (code, name, product_type, points_cost, value, sort),
+            )
+
         connection.commit()
         return {
             "topics": len(topic_ids),

@@ -543,6 +543,45 @@ async def list_posts(
     )
 
 
+async def list_my_posts(
+    db: AsyncSession,
+    user_id: int,
+    page: int = 1,
+    page_size: int = 20,
+) -> CommunityPostPage:
+    """获取当前用户发布的动态列表。"""
+    base_sql = _post_select_sql("AND p.user_id = :user_id")
+    order_sql = "ORDER BY p.created_at DESC"
+    params = {
+        "user_id": user_id,
+        "limit": page_size,
+        "offset": (page - 1) * page_size,
+    }
+    result = await db.execute(
+        text(f"{base_sql} {order_sql} LIMIT :limit OFFSET :offset"),
+        params,
+    )
+    total = int(
+        (
+            await db.execute(
+                text(
+                    """SELECT COUNT(*) FROM community_post p
+                    WHERE p.user_id = :user_id AND p.status = 1
+                      AND p.deleted_at IS NULL AND p.moderation_status = 1"""
+                ),
+                {"user_id": user_id},
+            )
+        ).scalar()
+        or 0
+    )
+    return CommunityPostPage(
+        items=[_post_response(dict(row)) for row in result.mappings().all()],
+        page=page,
+        page_size=page_size,
+        total=total,
+    )
+
+
 async def delete_post(db: AsyncSession, user_id: int, post_id: int) -> None:
     result = await db.execute(
         text(

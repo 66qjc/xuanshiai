@@ -80,6 +80,7 @@ from app.services.community import (
     list_comment_replies,
     list_root_comments,
     list_my_activities,
+    list_my_posts,
     list_paper_plane_conversations,
     list_paper_plane_messages,
     list_paper_planes,
@@ -233,6 +234,16 @@ async def feed(
         filter_key=filter_key,
         sort=sort_key,
     )
+
+
+@router.get("/community/posts/mine", response_model=CommunityPostPage, summary="查看我的动态")
+async def my_posts(
+    page: int = Query(1, ge=1, le=1000),
+    page_size: int = Query(20, ge=1, le=50),
+    current: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> CommunityPostPage:
+    return await list_my_posts(db, current.id, page=page, page_size=page_size)
 
 
 @router.get("/community/posts/{post_id}", response_model=CommunityPostResponse, summary="查看动态详情")
