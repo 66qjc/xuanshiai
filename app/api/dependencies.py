@@ -65,6 +65,39 @@ async def get_verified_user(current: CurrentUser = Depends(get_current_user)) ->
     return current
 
 
+async def get_current_user_optional(
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer),
+    db: AsyncSession = Depends(get_db),
+) -> CurrentUser | None:
+    """Optional auth — returns None instead of 401 when no token is provided.
+    Useful for read-only routes where user-specific flags (is_liked, is_collected)
+    are nice-to-have but not required."""
+    if not credentials:
+        return None
+    try:
+        payload = decode_access_token(credentials.credentials)
+        user_id = int(payload["sub"])
+        session_id = int(payload["sid"])
+    except (ValueError, KeyError):
+        return None
+    result = await db.execute(
+        text(
+            """SELECT u.id, u.phone, u.status, COALESCE(ua.realname_status, 0) AS realname_status
+               FROM users u LEFT JOIN user_auth ua ON ua.user_id = u.id
+               JOIN user_session s ON s.user_id = u.id
+               WHERE u.id = :user_id AND s.id = :session_id AND s.status = 1
+                 AND s.revoked_at IS NULL AND s.access_expire_at > UTC_TIMESTAMP()"""
+        ),
+        {"user_id": user_id, "session_id": session_id},
+    )
+    row = result.mappings().first()
+    if not row:
+        return None
+    if int(row["status"]) != 1:
+        return None
+    return CurrentUser(**dict(row), session_id=session_id)
+
+
 async def get_realname_verified_user(
     current: CurrentUser = Depends(get_verified_user),
 ) -> CurrentUser:

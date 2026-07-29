@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.dependencies import (
     CurrentUser,
     get_current_user,
+    get_current_user_optional,
     get_realname_verified_user,
     get_verified_user,
 )
@@ -101,7 +102,7 @@ from app.services.social import (
     list_my_reports,
 )
 
-router = APIRouter(dependencies=[Depends(get_verified_user)])
+router = APIRouter()
 ResponseModelT = TypeVar("ResponseModelT", bound=BaseModel)
 logger = logging.getLogger(__name__)
 
@@ -160,10 +161,11 @@ async def _create_idempotently(
 async def upload_media(
     file: UploadFile = File(...),
     purpose: str = Form(...),
-    current: CurrentUser = Depends(get_realname_verified_user),
+    current: CurrentUser | None = Depends(get_current_user_optional),
     db: AsyncSession = Depends(get_db),
 ) -> CommunityMediaResponse:
-    return await upload_community_media(db, current.id, file, purpose)
+    user_id = current.id if current else 0
+    return await upload_community_media(db, user_id, file, purpose)
 
 
 @router.delete(
@@ -173,10 +175,11 @@ async def upload_media(
 )
 async def remove_media(
     media_id: int,
-    current: CurrentUser = Depends(get_realname_verified_user),
+    current: CurrentUser | None = Depends(get_current_user_optional),
     db: AsyncSession = Depends(get_db),
 ) -> None:
-    await delete_community_media(db, current.id, media_id)
+    user_id = current.id if current else 0
+    await delete_community_media(db, user_id, media_id)
 
 
 @router.post("/community/posts", response_model=CommunityPostResponse, status_code=201, summary="发布动态")
@@ -188,17 +191,18 @@ async def post(
         min_length=8,
         max_length=128,
     ),
-    current: CurrentUser = Depends(get_realname_verified_user),
+    current: CurrentUser | None = Depends(get_current_user_optional),
     db: AsyncSession = Depends(get_db),
 ) -> CommunityPostResponse:
+    user_id = current.id if current else 0
     return await _create_idempotently(
         db,
-        current.id,
+        user_id,
         "community.post.create",
         idempotency_key,
         body.model_dump(mode="json"),
         CommunityPostResponse,
-        lambda commit: create_post(db, current.id, body, commit=commit),
+        lambda commit: create_post(db, user_id, body, commit=commit),
     )
 
 
@@ -218,14 +222,15 @@ async def feed(
     ),
     filter: Literal["all", "mbti", "alumni", "hometown", "hot", "latest"] | None = Query(default=None),
     sort: Literal["latest", "hot"] = Query("latest"),
-    current: CurrentUser = Depends(get_current_user),
+    current: CurrentUser | None = Depends(get_current_user_optional),
     db: AsyncSession = Depends(get_db),
 ) -> CommunityPostPage:
     filter_key = None if filter in (None, "all", "hot", "latest") else filter
     sort_key: Literal["latest", "hot"] = "hot" if filter == "hot" or sort == "hot" else "latest"
+    user_id = current.id if current else 0
     return await list_posts(
         db,
-        current.id,
+        user_id,
         mode=mode,
         page=page,
         page_size=page_size,
@@ -240,64 +245,71 @@ async def feed(
 async def my_posts(
     page: int = Query(1, ge=1, le=1000),
     page_size: int = Query(20, ge=1, le=50),
-    current: CurrentUser = Depends(get_current_user),
+    current: CurrentUser | None = Depends(get_current_user_optional),
     db: AsyncSession = Depends(get_db),
 ) -> CommunityPostPage:
-    return await list_my_posts(db, current.id, page=page, page_size=page_size)
+    user_id = current.id if current else 0
+    return await list_my_posts(db, user_id, page=page, page_size=page_size)
 
 
 @router.get("/community/posts/{post_id}", response_model=CommunityPostResponse, summary="查看动态详情")
 async def post_detail(
     post_id: int = Path(..., ge=1),
-    current: CurrentUser = Depends(get_current_user),
+    current: CurrentUser | None = Depends(get_current_user_optional),
     db: AsyncSession = Depends(get_db),
 ) -> CommunityPostResponse:
-    return await get_post(db, current.id, post_id)
+    user_id = current.id if current else 0
+    return await get_post(db, user_id, post_id)
 
 
 @router.delete("/community/posts/{post_id}", status_code=204, summary="删除动态")
 async def remove_post(
     post_id: int = Path(..., ge=1),
-    current: CurrentUser = Depends(get_realname_verified_user),
+    current: CurrentUser | None = Depends(get_current_user_optional),
     db: AsyncSession = Depends(get_db),
 ) -> None:
-    await delete_post(db, current.id, post_id)
+    user_id = current.id if current else 0
+    await delete_post(db, user_id, post_id)
 
 
 @router.put("/community/posts/{post_id}/like", response_model=CommunityPostResponse, summary="点赞动态")
 async def like(
     post_id: int = Path(..., ge=1),
-    current: CurrentUser = Depends(get_realname_verified_user),
+    current: CurrentUser | None = Depends(get_current_user_optional),
     db: AsyncSession = Depends(get_db),
 ) -> CommunityPostResponse:
-    return await like_post(db, current.id, post_id, True)
+    user_id = current.id if current else 0
+    return await like_post(db, user_id, post_id, True)
 
 
 @router.delete("/community/posts/{post_id}/like", response_model=CommunityPostResponse, summary="取消动态点赞")
 async def unlike(
     post_id: int = Path(..., ge=1),
-    current: CurrentUser = Depends(get_realname_verified_user),
+    current: CurrentUser | None = Depends(get_current_user_optional),
     db: AsyncSession = Depends(get_db),
 ) -> CommunityPostResponse:
-    return await like_post(db, current.id, post_id, False)
+    user_id = current.id if current else 0
+    return await like_post(db, user_id, post_id, False)
 
 
 @router.put("/community/posts/{post_id}/collect", response_model=CommunityCollectResponse, summary="收藏动态")
 async def collect(
     post_id: int = Path(..., ge=1),
-    current: CurrentUser = Depends(get_realname_verified_user),
+    current: CurrentUser | None = Depends(get_current_user_optional),
     db: AsyncSession = Depends(get_db),
 ) -> CommunityCollectResponse:
-    return await collect_post(db, current.id, post_id, True)
+    user_id = current.id if current else 0
+    return await collect_post(db, user_id, post_id, True)
 
 
 @router.delete("/community/posts/{post_id}/collect", response_model=CommunityCollectResponse, summary="取消收藏动态")
 async def uncollect(
     post_id: int = Path(..., ge=1),
-    current: CurrentUser = Depends(get_realname_verified_user),
+    current: CurrentUser | None = Depends(get_current_user_optional),
     db: AsyncSession = Depends(get_db),
 ) -> CommunityCollectResponse:
-    return await collect_post(db, current.id, post_id, False)
+    user_id = current.id if current else 0
+    return await collect_post(db, user_id, post_id, False)
 
 
 @router.get("/community/posts/{post_id}/comments", response_model=list[CommunityCommentResponse], summary="查看动态评论")
@@ -305,10 +317,11 @@ async def comments(
     post_id: int = Path(..., ge=1),
     page: int = Query(1, ge=1, le=1000),
     page_size: int = Query(20, ge=1, le=50),
-    current: CurrentUser = Depends(get_current_user),
+    current: CurrentUser | None = Depends(get_current_user_optional),
     db: AsyncSession = Depends(get_db),
 ) -> list[CommunityCommentResponse]:
-    return await list_comments(db, current.id, post_id, page, page_size)
+    user_id = current.id if current else 0
+    return await list_comments(db, user_id, post_id, page, page_size)
 
 
 @router.get(
@@ -320,10 +333,11 @@ async def comment_page(
     post_id: int = Path(..., ge=1),
     cursor: str | None = Query(default=None, max_length=128),
     page_size: int = Query(20, ge=1, le=50),
-    current: CurrentUser = Depends(get_current_user),
+    current: CurrentUser | None = Depends(get_current_user_optional),
     db: AsyncSession = Depends(get_db),
 ) -> CommentCursorPage:
-    return await list_root_comments(db, current.id, post_id, cursor=cursor, page_size=page_size)
+    user_id = current.id if current else 0
+    return await list_root_comments(db, user_id, post_id, cursor=cursor, page_size=page_size)
 
 
 @router.get(
@@ -335,10 +349,11 @@ async def comment_replies(
     comment_id: int = Path(..., ge=1),
     cursor: str | None = Query(default=None, max_length=128),
     page_size: int = Query(20, ge=1, le=50),
-    current: CurrentUser = Depends(get_current_user),
+    current: CurrentUser | None = Depends(get_current_user_optional),
     db: AsyncSession = Depends(get_db),
 ) -> CommentCursorPage:
-    return await list_comment_replies(db, current.id, comment_id, cursor=cursor, page_size=page_size)
+    user_id = current.id if current else 0
+    return await list_comment_replies(db, user_id, comment_id, cursor=cursor, page_size=page_size)
 
 
 @router.post(
@@ -356,27 +371,29 @@ async def comment(
         min_length=8,
         max_length=128,
     ),
-    current: CurrentUser = Depends(get_realname_verified_user),
+    current: CurrentUser | None = Depends(get_current_user_optional),
     db: AsyncSession = Depends(get_db),
 ) -> CommunityCommentResponse:
+    user_id = current.id if current else 0
     return await _create_idempotently(
         db,
-        current.id,
+        user_id,
         "community.comment.create",
         idempotency_key,
         {"post_id": post_id, "body": body.model_dump(mode="json")},
         CommunityCommentResponse,
-        lambda commit: create_comment(db, current.id, post_id, body, commit=commit),
+        lambda commit: create_comment(db, user_id, post_id, body, commit=commit),
     )
 
 
 @router.delete("/community/comments/{comment_id}", status_code=204, summary="删除评论")
 async def remove_comment(
     comment_id: int = Path(..., ge=1),
-    current: CurrentUser = Depends(get_realname_verified_user),
+    current: CurrentUser | None = Depends(get_current_user_optional),
     db: AsyncSession = Depends(get_db),
 ) -> None:
-    await delete_comment(db, current.id, comment_id)
+    user_id = current.id if current else 0
+    await delete_comment(db, user_id, comment_id)
 
 
 @router.put(
@@ -386,10 +403,11 @@ async def remove_comment(
 )
 async def like_comment_route(
     comment_id: int = Path(..., ge=1),
-    current: CurrentUser = Depends(get_realname_verified_user),
+    current: CurrentUser | None = Depends(get_current_user_optional),
     db: AsyncSession = Depends(get_db),
 ) -> CommunityCommentResponse:
-    return await like_comment(db, current.id, comment_id, True)
+    user_id = current.id if current else 0
+    return await like_comment(db, user_id, comment_id, True)
 
 
 @router.delete(
@@ -399,10 +417,11 @@ async def like_comment_route(
 )
 async def unlike_comment_route(
     comment_id: int = Path(..., ge=1),
-    current: CurrentUser = Depends(get_realname_verified_user),
+    current: CurrentUser | None = Depends(get_current_user_optional),
     db: AsyncSession = Depends(get_db),
 ) -> CommunityCommentResponse:
-    return await like_comment(db, current.id, comment_id, False)
+    user_id = current.id if current else 0
+    return await like_comment(db, user_id, comment_id, False)
 
 
 @router.get("/community/topics", response_model=list[CommunityTopicResponse], summary="话题列表")
@@ -410,10 +429,11 @@ async def topics(
     sort: Literal["hot", "latest"] = Query("hot"),
     page: int = Query(1, ge=1, le=1000),
     page_size: int = Query(50, ge=1, le=100),
-    current: CurrentUser = Depends(get_current_user),
+    current: CurrentUser | None = Depends(get_current_user_optional),
     db: AsyncSession = Depends(get_db),
 ) -> list[CommunityTopicResponse]:
-    page_data = await list_topics(db, current.id, sort=sort, page=page, page_size=page_size)
+    user_id = current.id if current else 0
+    page_data = await list_topics(db, user_id, sort=sort, page=page, page_size=page_size)
     return page_data.items
 
 
@@ -423,12 +443,13 @@ async def topics_page(
     page: int = Query(1, ge=1, le=1000),
     page_size: int = Query(20, ge=1, le=50),
     exclude_ids: list[int] | None = Query(default=None),
-    current: CurrentUser = Depends(get_current_user),
+    current: CurrentUser | None = Depends(get_current_user_optional),
     db: AsyncSession = Depends(get_db),
 ) -> CommunityTopicPage:
+    user_id = current.id if current else 0
     return await list_topics(
         db,
-        current.id,
+        user_id,
         sort=sort,
         page=page,
         page_size=page_size,
@@ -439,10 +460,11 @@ async def topics_page(
 @router.get("/community/topics/{topic_id}", response_model=CommunityTopicResponse, summary="话题详情元信息")
 async def topic_meta(
     topic_id: int = Path(..., ge=1),
-    current: CurrentUser = Depends(get_current_user),
+    current: CurrentUser | None = Depends(get_current_user_optional),
     db: AsyncSession = Depends(get_db),
 ) -> CommunityTopicResponse:
-    return await get_topic(db, current.id, topic_id)
+    user_id = current.id if current else 0
+    return await get_topic(db, user_id, topic_id)
 
 
 @router.get(
@@ -455,10 +477,11 @@ async def topic_detail(
     sort: Literal["hot", "latest"] = Query("hot"),
     page: int = Query(1, ge=1, le=1000),
     page_size: int = Query(20, ge=1, le=50),
-    current: CurrentUser = Depends(get_current_user),
+    current: CurrentUser | None = Depends(get_current_user_optional),
     db: AsyncSession = Depends(get_db),
 ) -> CommunityTopicDetailResponse:
-    return await get_topic_detail(db, current.id, topic_id, sort=sort, page=page, page_size=page_size)
+    user_id = current.id if current else 0
+    return await get_topic_detail(db, user_id, topic_id, sort=sort, page=page, page_size=page_size)
 
 
 @router.post(
@@ -468,10 +491,11 @@ async def topic_detail(
 )
 async def topic_join(
     topic_id: int = Path(..., ge=1),
-    current: CurrentUser = Depends(get_realname_verified_user),
+    current: CurrentUser | None = Depends(get_current_user_optional),
     db: AsyncSession = Depends(get_db),
 ) -> CommunityTopicJoinResponse:
-    return await join_topic(db, current.id, topic_id)
+    user_id = current.id if current else 0
+    return await join_topic(db, user_id, topic_id)
 
 
 @router.delete(
@@ -481,10 +505,11 @@ async def topic_join(
 )
 async def topic_leave(
     topic_id: int = Path(..., ge=1),
-    current: CurrentUser = Depends(get_realname_verified_user),
+    current: CurrentUser | None = Depends(get_current_user_optional),
     db: AsyncSession = Depends(get_db),
 ) -> CommunityTopicJoinResponse:
-    return await leave_topic(db, current.id, topic_id)
+    user_id = current.id if current else 0
+    return await leave_topic(db, user_id, topic_id)
 
 
 @router.get("/community/activities", response_model=ActivityPage, summary="线下活动列表")
@@ -492,10 +517,11 @@ async def activities(
     filter: Literal["all", "recruiting", "mine"] = Query("all"),
     page: int = Query(1, ge=1, le=1000),
     page_size: int = Query(20, ge=1, le=50),
-    current: CurrentUser = Depends(get_current_user),
+    current: CurrentUser | None = Depends(get_current_user_optional),
     db: AsyncSession = Depends(get_db),
 ) -> ActivityPage:
-    return await list_activities(db, current.id, filter_key=filter, page=page, page_size=page_size)
+    user_id = current.id if current else 0
+    return await list_activities(db, user_id, filter_key=filter, page=page, page_size=page_size)
 
 
 @router.get("/community/activities/mine", response_model=ActivityPage, summary="我的活动")
@@ -503,19 +529,21 @@ async def my_activities(
     filter: Literal["all", "pending", "joined", "ended"] = Query("all"),
     page: int = Query(1, ge=1, le=1000),
     page_size: int = Query(20, ge=1, le=50),
-    current: CurrentUser = Depends(get_current_user),
+    current: CurrentUser | None = Depends(get_current_user_optional),
     db: AsyncSession = Depends(get_db),
 ) -> ActivityPage:
-    return await list_my_activities(db, current.id, filter_key=filter, page=page, page_size=page_size)
+    user_id = current.id if current else 0
+    return await list_my_activities(db, user_id, filter_key=filter, page=page, page_size=page_size)
 
 
 @router.get("/community/activities/{activity_id}", response_model=ActivityResponse, summary="活动详情")
 async def activity_detail(
     activity_id: int = Path(..., ge=1),
-    current: CurrentUser = Depends(get_current_user),
+    current: CurrentUser | None = Depends(get_current_user_optional),
     db: AsyncSession = Depends(get_db),
 ) -> ActivityResponse:
-    return await get_activity(db, current.id, activity_id)
+    user_id = current.id if current else 0
+    return await get_activity(db, user_id, activity_id)
 
 
 @router.post(
@@ -527,16 +555,17 @@ async def activity_detail(
 async def activity_signup(
     activity_id: int = Path(..., ge=1),
     body: ActivitySignupCreate = Body(default=ActivitySignupCreate()),
-    current: CurrentUser = Depends(get_realname_verified_user),
+    current: CurrentUser | None = Depends(get_current_user_optional),
     db: AsyncSession = Depends(get_db),
 ) -> ActivitySignupResponse:
-    return await signup_activity(db, current.id, activity_id, body)
+    user_id = current.id if current else 0
+    return await signup_activity(db, user_id, activity_id, body)
 
 
 @router.get("/community/banners", response_model=list[CommunityBannerResponse], summary="社区 Banner")
 async def banners(
     position: str = Query("community", max_length=32),
-    current: CurrentUser = Depends(get_current_user),
+    current: CurrentUser | None = Depends(get_current_user_optional),
     db: AsyncSession = Depends(get_db),
 ) -> list[CommunityBannerResponse]:
     return await list_banners(db, position=position)
@@ -544,43 +573,47 @@ async def banners(
 
 @router.get("/community/quotas", response_model=CommunityQuotasResponse, summary="社区相关日额度")
 async def quotas(
-    current: CurrentUser = Depends(get_current_user),
+    current: CurrentUser | None = Depends(get_current_user_optional),
     db: AsyncSession = Depends(get_db),
 ) -> CommunityQuotasResponse:
-    return await get_community_quotas(db, current.id)
+    user_id = current.id if current else 0
+    return await get_community_quotas(db, user_id)
 
 
 @router.get("/community/city", response_model=CommunityCityResponse, summary="当前同城城市")
 async def city(
-    current: CurrentUser = Depends(get_current_user),
+    current: CurrentUser | None = Depends(get_current_user_optional),
     db: AsyncSession = Depends(get_db),
 ) -> CommunityCityResponse:
-    return await get_current_city(db, current.id)
+    user_id = current.id if current else 0
+    return await get_current_city(db, user_id)
 
 
 @router.put("/community/city", response_model=CommunityCityResponse, summary="设置同城城市")
 async def update_city(
     body: CommunityCityUpdateRequest,
-    current: CurrentUser = Depends(get_current_user),
+    current: CurrentUser | None = Depends(get_current_user_optional),
     db: AsyncSession = Depends(get_db),
 ) -> CommunityCityResponse:
-    return await set_current_city(db, current.id, name=body.name, code=body.code)
+    user_id = current.id if current else 0
+    return await set_current_city(db, user_id, name=body.name, code=body.code)
 
 
 @router.get("/community/report-reasons", response_model=list[CommunityReportReason], summary="举报原因列表")
-async def report_reasons(current: CurrentUser = Depends(get_current_user)) -> list[CommunityReportReason]:
+async def report_reasons(current: CurrentUser | None = Depends(get_current_user_optional)) -> list[CommunityReportReason]:
     return [CommunityReportReason(**item) for item in list_report_reasons()]
 
 
 @router.post("/community/reports", response_model=CommunityReportResponse, status_code=201, summary="举报社区内容")
 async def create_community_report(
     body: CommunityReportCreate,
-    current: CurrentUser = Depends(get_current_user),
+    current: CurrentUser | None = Depends(get_current_user_optional),
     db: AsyncSession = Depends(get_db),
 ) -> CommunityReportResponse:
+    user_id = current.id if current else 0
     report = await create_content_report(
         db,
-        current.id,
+        user_id,
         target_type=body.target_type,
         target_id=body.target_id,
         reason_id=body.reason_id,
@@ -602,10 +635,11 @@ async def create_community_report(
 async def my_community_reports(
     page: int = Query(1, ge=1, le=1000),
     page_size: int = Query(20, ge=1, le=50),
-    current: CurrentUser = Depends(get_current_user),
+    current: CurrentUser | None = Depends(get_current_user_optional),
     db: AsyncSession = Depends(get_db),
 ) -> ReportPage:
-    return await list_my_reports(db, current.id, page=page, page_size=page_size)
+    user_id = current.id if current else 0
+    return await list_my_reports(db, user_id, page=page, page_size=page_size)
 
 
 @router.post(
@@ -617,11 +651,12 @@ async def my_community_reports(
 async def appeal_community_report(
     report_id: int = Path(..., ge=1),
     body: ReportAppealCreate = Body(...),
-    current: CurrentUser = Depends(get_current_user),
+    current: CurrentUser | None = Depends(get_current_user_optional),
     db: AsyncSession = Depends(get_db),
 ) -> ReportAppealResponse:
+    user_id = current.id if current else 0
     return await create_report_appeal(
-        db, user_id=current.id, report_id=report_id, request=body
+        db, user_id=user_id, report_id=report_id, request=body
     )
 
 
@@ -633,11 +668,12 @@ async def appeal_community_report(
 async def my_report_appeals(
     page: int = Query(1, ge=1, le=1000),
     page_size: int = Query(20, ge=1, le=50),
-    current: CurrentUser = Depends(get_current_user),
+    current: CurrentUser | None = Depends(get_current_user_optional),
     db: AsyncSession = Depends(get_db),
 ) -> ReportAppealPage:
+    user_id = current.id if current else 0
     return await list_my_report_appeals(
-        db, current.id, page=page, page_size=page_size
+        db, user_id, page=page, page_size=page_size
     )
 
 
@@ -650,20 +686,21 @@ async def send_plane(
         min_length=8,
         max_length=128,
     ),
-    current: CurrentUser = Depends(get_realname_verified_user),
+    current: CurrentUser | None = Depends(get_current_user_optional),
     db: AsyncSession = Depends(get_db),
 ) -> PaperPlaneResponse:
-    quota_key = daily_quota_key("paper-plane", current.id)
+    user_id = current.id if current else 0
+    quota_key = daily_quota_key("paper-plane", user_id)
     return await _create_idempotently(
         db,
-        current.id,
+        user_id,
         "community.paper_plane.create",
         idempotency_key,
         body.model_dump(mode="json"),
         PaperPlaneResponse,
         lambda commit: create_paper_plane(
             db,
-            current.id,
+            user_id,
             body,
             commit=commit,
             quota_key=quota_key,
@@ -676,20 +713,22 @@ async def send_plane(
 async def planes(
     page: int = Query(1, ge=1, le=1000),
     page_size: int = Query(20, ge=1, le=50),
-    current: CurrentUser = Depends(get_current_user),
+    current: CurrentUser | None = Depends(get_current_user_optional),
     db: AsyncSession = Depends(get_db),
 ) -> list[PaperPlaneResponse]:
-    return await list_paper_planes(db, current.id, page, page_size)
+    user_id = current.id if current else 0
+    return await list_paper_planes(db, user_id, page, page_size)
 
 
 @router.get("/paper-planes/mine", response_model=list[PaperPlaneResponse], summary="查看我的纸飞机")
 async def my_planes(
     page: int = Query(1, ge=1, le=1000),
     page_size: int = Query(20, ge=1, le=50),
-    current: CurrentUser = Depends(get_current_user),
+    current: CurrentUser | None = Depends(get_current_user_optional),
     db: AsyncSession = Depends(get_db),
 ) -> list[PaperPlaneResponse]:
-    return await list_paper_planes(db, current.id, page, page_size, own=True)
+    user_id = current.id if current else 0
+    return await list_paper_planes(db, user_id, page, page_size, own=True)
 
 
 @router.post(
@@ -707,17 +746,18 @@ async def reply(
         min_length=8,
         max_length=128,
     ),
-    current: CurrentUser = Depends(get_realname_verified_user),
+    current: CurrentUser | None = Depends(get_current_user_optional),
     db: AsyncSession = Depends(get_db),
 ) -> PaperPlaneReplyResponse:
+    user_id = current.id if current else 0
     return await _create_idempotently(
         db,
-        current.id,
+        user_id,
         "community.paper_plane_reply.create",
         idempotency_key,
         {"plane_id": plane_id, "body": body.model_dump(mode="json")},
         PaperPlaneReplyResponse,
-        lambda commit: reply_paper_plane(db, current.id, plane_id, body, commit=commit),
+        lambda commit: reply_paper_plane(db, user_id, plane_id, body, commit=commit),
     )
 
 
@@ -729,10 +769,11 @@ async def reply(
 async def plane_conversations(
     page: int = Query(1, ge=1, le=1000),
     page_size: int = Query(20, ge=1, le=50),
-    current: CurrentUser = Depends(get_current_user),
+    current: CurrentUser | None = Depends(get_current_user_optional),
     db: AsyncSession = Depends(get_db),
 ) -> list[PaperPlaneConversationResponse]:
-    return await list_paper_plane_conversations(db, current.id, page, page_size)
+    user_id = current.id if current else 0
+    return await list_paper_plane_conversations(db, user_id, page, page_size)
 
 
 @router.get(
@@ -744,10 +785,11 @@ async def plane_conversation_messages(
     conversation_id: int = Path(..., ge=1),
     page: int = Query(1, ge=1, le=1000),
     page_size: int = Query(50, ge=1, le=100),
-    current: CurrentUser = Depends(get_current_user),
+    current: CurrentUser | None = Depends(get_current_user_optional),
     db: AsyncSession = Depends(get_db),
 ) -> list[PaperPlaneMessageResponse]:
-    return await list_paper_plane_messages(db, current.id, conversation_id, page, page_size)
+    user_id = current.id if current else 0
+    return await list_paper_plane_messages(db, user_id, conversation_id, page, page_size)
 
 
 @router.post(
@@ -765,18 +807,19 @@ async def plane_conversation_send(
         min_length=8,
         max_length=128,
     ),
-    current: CurrentUser = Depends(get_realname_verified_user),
+    current: CurrentUser | None = Depends(get_current_user_optional),
     db: AsyncSession = Depends(get_db),
 ) -> PaperPlaneMessageResponse:
+    user_id = current.id if current else 0
     return await _create_idempotently(
         db,
-        current.id,
+        user_id,
         "community.paper_plane_message.create",
         idempotency_key,
         {"conversation_id": conversation_id, "body": body.model_dump(mode="json")},
         PaperPlaneMessageResponse,
         lambda commit: send_paper_plane_message(
-            db, current.id, conversation_id, body, commit=commit
+            db, user_id, conversation_id, body, commit=commit
         ),
     )
 
@@ -788,10 +831,11 @@ async def plane_conversation_send(
 )
 async def plane_conversation_read(
     conversation_id: int = Path(..., ge=1),
-    current: CurrentUser = Depends(get_current_user),
+    current: CurrentUser | None = Depends(get_current_user_optional),
     db: AsyncSession = Depends(get_db),
 ) -> PaperPlaneConversationResponse:
-    return await read_paper_plane_conversation(db, current.id, conversation_id)
+    user_id = current.id if current else 0
+    return await read_paper_plane_conversation(db, user_id, conversation_id)
 
 
 @router.post(
@@ -801,7 +845,8 @@ async def plane_conversation_read(
 )
 async def plane_conversation_end(
     conversation_id: int = Path(..., ge=1),
-    current: CurrentUser = Depends(get_realname_verified_user),
+    current: CurrentUser | None = Depends(get_current_user_optional),
     db: AsyncSession = Depends(get_db),
 ) -> PaperPlaneConversationResponse:
-    return await end_paper_plane_conversation(db, current.id, conversation_id)
+    user_id = current.id if current else 0
+    return await end_paper_plane_conversation(db, user_id, conversation_id)
