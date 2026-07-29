@@ -1001,6 +1001,39 @@ class DatabaseManager:
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             """,
 
+            'user_quota_usage': """
+                CREATE TABLE IF NOT EXISTS `user_quota_usage` (
+                    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+                    `user_id` bigint unsigned NOT NULL,
+                    `quota_code` varchar(32) NOT NULL,
+                    `quota_date` date NOT NULL,
+                    `source` varchar(16) NOT NULL DEFAULT 'free',
+                    `amount` int unsigned NOT NULL DEFAULT '1',
+                    `reason` varchar(255) DEFAULT NULL,
+                    `target_user_id` bigint unsigned DEFAULT NULL,
+                    `created_at` datetime DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (`id`),
+                    KEY `idx_quota_user_date` (`user_id`,`quota_code`,`quota_date`),
+                    KEY `idx_quota_target` (`target_user_id`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='User quota usage ledger'
+            """,
+
+            'user_quota_grant': """
+                CREATE TABLE IF NOT EXISTS `user_quota_grant` (
+                    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+                    `user_id` bigint unsigned NOT NULL,
+                    `quota_code` varchar(32) NOT NULL,
+                    `remaining` int unsigned NOT NULL DEFAULT '0',
+                    `source` varchar(16) NOT NULL DEFAULT 'points',
+                    `order_no` varchar(64) NOT NULL,
+                    `expires_at` datetime DEFAULT NULL,
+                    `created_at` datetime DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (`id`),
+                    UNIQUE KEY `uk_quota_grant_order` (`order_no`),
+                    KEY `idx_quota_grant_user` (`user_id`,`quota_code`,`remaining`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='额外权益次数账户'
+            """,
+
             'point_redeem_order': """
                 CREATE TABLE IF NOT EXISTS `point_redeem_order` (
                     `id` bigint unsigned NOT NULL AUTO_INCREMENT,
@@ -1959,6 +1992,25 @@ class DatabaseManager:
         for table_name, sql in tables.items():
             cursor.execute(sql)
             logger.debug(f"表 `{table_name}` 已创建/确认")
+
+        # Publish the three initial packages and quota products once. Existing
+        # rows remain operator-controlled and are never overwritten.
+        cursor.execute("""
+            INSERT IGNORE INTO config_membership_package
+                (name, code, duration_days, price, original_price, daily_price, sort, is_active, badge, rights)
+            VALUES
+                ('新人专享', 'monthly', 90, 299.00, NULL, 3.32, 1, 1, '含3次申请', '{"apply_bonus": 3, "browse_daily_limit": 20}'),
+                ('心动专享', 'quarterly', 150, 520.00, NULL, 3.47, 2, 1, '含5次申请', '{"apply_bonus": 5, "browse_daily_limit": 20}'),
+                ('臻爱专享', 'yearly', 365, 999.00, NULL, 2.74, 3, 1, '含20次申请', '{"apply_bonus": 20, "browse_daily_limit": 20}')
+        """)
+        cursor.execute("""
+            INSERT IGNORE INTO config_point_product (code, name, product_type, points_cost, value, sort, is_active)
+            VALUES
+                ('extra_apply', '额外申请次数', 'right', 20, '1', 1, 1),
+                ('browse_unlock', '额外资料查看次数', 'right', 10, '1', 2, 1),
+                ('paper_plane_unlock', '纸飞机', 'right', 30, '1', 3, 1),
+                ('profile_detail_unlock', '完整资料卡解锁', 'right', 50, '1', 4, 1)
+        """)
 
         # 兼容已存在的旧库：CREATE TABLE IF NOT EXISTS 不会补齐新增字段。
         self._ensure_required_columns(cursor)

@@ -7,9 +7,23 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.schemas.membership import CreateMembershipOrderRequest, MembershipHistoryItem, MembershipHistoryPage, MembershipOrderResponse, MembershipPackage, MembershipStatus
+from app.schemas.membership import (
+    CreateMembershipOrderRequest,
+    MembershipHistoryItem,
+    MembershipHistoryPage,
+    MembershipOrderResponse,
+    MembershipPackage,
+    MembershipStatus,
+)
 
-DEFAULT_RIGHTS = {"apply_daily_limit": 3, "superlike_daily_limit": 1, "browse_daily_limit": 20, "visitor_detail": False, "browse_history_scope": "today"}
+DEFAULT_RIGHTS = {
+    "apply_daily_limit": 3,
+    "apply_bonus": 0,
+    "superlike_daily_limit": 1,
+    "browse_daily_limit": 8,
+    "visitor_detail": False,
+    "browse_history_scope": "today",
+}
 
 
 def _rights(value, vip: bool = False) -> dict:
@@ -20,26 +34,34 @@ def _rights(value, vip: bool = False) -> dict:
             value = {}
     rights = {**DEFAULT_RIGHTS, **(value if isinstance(value, dict) else {})}
     if vip:
-        rights.update(apply_daily_limit=10, superlike_daily_limit=3, browse_daily_limit=None, visitor_detail=True, browse_history_scope="all")
+        rights.update(
+            apply_daily_limit=3 + int(rights.get("apply_bonus") or 0),
+            superlike_daily_limit=3,
+            browse_daily_limit=20,
+            visitor_detail=True,
+            browse_history_scope="all",
+        )
     return rights
 
 
 async def list_packages(db: AsyncSession) -> list[MembershipPackage]:
     result = await db.execute(text("SELECT code,name,duration_days,price,original_price,daily_price,badge,rights FROM config_membership_package WHERE is_active=1 ORDER BY sort,id"))
-    packages = []
-    for row in result.mappings():
-        code = row["code"]
-        price = settings.membership_price_override(code, "price", float(row["price"]))
-        original_price = settings.membership_price_override(code, "original_price", float(row["original_price"]) if row["original_price"] is not None else None)
-        daily_price = settings.membership_price_override(code, "daily_price", float(row["daily_price"]) if row["daily_price"] is not None else None)
-        packages.append(MembershipPackage(code=code, name=row["name"], duration_days=row["duration_days"], price=price, original_price=original_price, daily_price=daily_price, badge=row["badge"], rights=_rights(row["rights"])))
-    return packages
+    return [
+        MembershipPackage(
+            code=row["code"], name=row["name"], duration_days=row["duration_days"],
+            price=settings.membership_price_override(row["code"], "price", float(row["price"])),
+            original_price=settings.membership_price_override(row["code"], "original_price", float(row["original_price"]) if row["original_price"] is not None else None),
+            daily_price=settings.membership_price_override(row["code"], "daily_price", float(row["daily_price"]) if row["daily_price"] is not None else None),
+            badge=row["badge"], rights=_rights(row["rights"]),
+        )
+        for row in result.mappings()
+    ]
 
 
 async def get_status(db: AsyncSession, user_id: int) -> MembershipStatus:
-    result = await db.execute(text("SELECT package_type,start_at,end_at FROM user_membership WHERE user_id=:id AND status=1 AND (start_at IS NULL OR start_at<=UTC_TIMESTAMP()) AND (end_at IS NULL OR end_at>UTC_TIMESTAMP()) ORDER BY end_at DESC LIMIT 1"), {"id": user_id})
+    result = await db.execute(text("SELECT m.package_type,m.start_at,m.end_at,p.rights FROM user_membership m LEFT JOIN config_membership_package p ON p.code=m.package_type WHERE m.user_id=:id AND m.status=1 AND (m.start_at IS NULL OR m.start_at<=UTC_TIMESTAMP()) AND (m.end_at IS NULL OR m.end_at>UTC_TIMESTAMP()) ORDER BY m.end_at DESC LIMIT 1"), {"id": user_id})
     row = result.mappings().first()
-    return MembershipStatus(is_vip=bool(row), package_type=row["package_type"] if row else None, start_at=row["start_at"] if row else None, end_at=row["end_at"] if row else None, rights=_rights(None, bool(row)))
+    return MembershipStatus(is_vip=bool(row), package_type=row["package_type"] if row else None, start_at=row["start_at"] if row else None, end_at=row["end_at"] if row else None, rights=_rights(row["rights"] if row else None, bool(row)))
 
 
 async def history(db: AsyncSession, user_id: int, page: int, page_size: int) -> MembershipHistoryPage:
@@ -51,16 +73,15 @@ async def history(db: AsyncSession, user_id: int, page: int, page_size: int) -> 
 
 
 async def create_order(db: AsyncSession, user_id: int, body: CreateMembershipOrderRequest, idempotency_key: str | None) -> MembershipOrderResponse:
-    raise HTTPException(403, detail="会员购买功能暂未开放")
     if not idempotency_key or len(idempotency_key) > 128:
-        raise HTTPException(422, detail="请提供有效的 Idempotency-Key")
+        raise HTTPException(422, detail="Idempotency-Key is required")
     existing = await db.execute(text("SELECT order_no,product_type,product_name,amount,pay_type,status,expire_at FROM payment_order WHERE user_id=:uid AND idempotency_key=:key"), {"uid": user_id, "key": idempotency_key})
     row = existing.mappings().first()
     if row:
         return MembershipOrderResponse(order_no=row["order_no"], package_code=str(row["product_type"]), product_name=row["product_name"], amount=float(row["amount"]), pay_type=row["pay_type"], status=row["status"], expire_at=row["expire_at"], payment_required=row["status"] == 0)
     package = (await db.execute(text("SELECT id,code,name,price FROM config_membership_package WHERE code=:code AND is_active=1"), {"code": body.package_code})).mappings().first()
     if not package:
-        raise HTTPException(404, detail="会员套餐不存在或已下架")
+        raise HTTPException(404, detail="Membership package not found")
     price = settings.membership_price_override(package["code"], "price", float(package["price"]))
     order_no = f"VIP{datetime.now(UTC).strftime('%Y%m%d%H%M%S')}{secrets.token_hex(5).upper()}"
     expire_at = datetime.now(UTC).replace(tzinfo=None) + timedelta(minutes=30)
@@ -72,10 +93,24 @@ async def create_order(db: AsyncSession, user_id: int, body: CreateMembershipOrd
 async def get_order(db: AsyncSession, user_id: int, order_no: str) -> MembershipOrderResponse:
     row = (await db.execute(text("SELECT product_type,product_name,amount,pay_type,status,expire_at,order_no FROM payment_order WHERE user_id=:uid AND order_no=:order_no"), {"uid": user_id, "order_no": order_no})).mappings().first()
     if not row:
-        raise HTTPException(404, detail="订单不存在")
+        raise HTTPException(404, detail="Order not found")
     return MembershipOrderResponse(order_no=row["order_no"], package_code=str(row["product_type"]), product_name=row["product_name"], amount=float(row["amount"]), pay_type=row["pay_type"], status=row["status"], expire_at=row["expire_at"], payment_required=row["status"] == 0)
 
 
 async def handle_wechat_callback(db: AsyncSession, body) -> None:
-    """Keep the grant boundary closed until WeChat API v3 keys are configured."""
-    raise HTTPException(503, detail="微信支付回调验签服务尚未配置")
+    if settings.wechat_payment_mode == "real":
+        raise HTTPException(503, detail="WeChat payment callback verification is not configured")
+
+    async with db.begin():
+        result = await db.execute(text("SELECT po.id,po.user_id,po.amount,po.status,po.order_no,cp.code,cp.duration_days FROM payment_order po JOIN config_membership_package cp ON cp.code=po.product_type WHERE po.order_no=:order_no AND po.type=1 FOR UPDATE"), {"order_no": body.order_no})
+        order = result.mappings().first()
+        if not order:
+            raise HTTPException(404, detail="Membership order not found")
+        if order["status"] == 1:
+            return
+        if order["status"] != 0:
+            raise HTTPException(409, detail="Membership order cannot be paid")
+        start_at = datetime.now(UTC).replace(tzinfo=None)
+        end_at = start_at + timedelta(days=int(order["duration_days"]))
+        await db.execute(text("UPDATE payment_order SET status=1,pay_time=UTC_TIMESTAMP(),transaction_id=:transaction_id WHERE id=:id"), {"transaction_id": body.transaction_id, "id": order["id"]})
+        await db.execute(text("INSERT INTO user_membership (user_id,package_type,amount,order_no,start_at,end_at,status) VALUES (:user_id,:package_type,:amount,:order_no,:start_at,:end_at,1)"), {"user_id": order["user_id"], "package_type": order["code"], "amount": order["amount"], "order_no": order["order_no"], "start_at": start_at, "end_at": end_at})

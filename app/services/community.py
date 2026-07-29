@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any, Literal
 
 from fastapi import HTTPException
@@ -11,6 +11,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.redis import consume_daily, refund_daily
+from app.core.config import settings
 from app.schemas.community import (
     CommunityCommentCreate,
     CommunityCommentResponse,
@@ -23,6 +24,7 @@ from app.schemas.community import (
     PaperPlaneResponse,
 )
 from app.services.profile import _json_list
+from app.services.quotas import consume_extra
 
 
 def _json_values(value: Any) -> list[str]:
@@ -150,16 +152,20 @@ async def _paper_response(row: dict[str, Any]) -> PaperPlaneResponse:
 
 
 async def create_paper_plane(db: AsyncSession, user_id: int, request: PaperPlaneCreate) -> PaperPlaneResponse:
-    key = f"paper-plane:{user_id}:{datetime.now(UTC).date().isoformat()}"
-    if not await consume_daily(key, 3):
+    key = f"paper-plane:{user_id}:{date.today().isoformat()}"
+    used_daily = await consume_daily(key, settings.paper_plane_daily_limit)
+    if not used_daily and not await consume_extra(db, user_id, "paper_plane", "积分兑换纸飞机次数"):
         raise HTTPException(429, detail="今日纸飞机次数已用完")
     try:
+        if used_daily:
+            await db.execute(text("INSERT INTO user_quota_usage (user_id,quota_code,quota_date,source,reason) VALUES (:user_id,'paper_plane',:quota_date,'free','每日纸飞机次数')"), {"user_id": user_id, "quota_date": date.today()})
         result = await db.execute(text("""INSERT INTO paper_plane (user_id, content, images, city, tags, is_anonymous, expire_at)
             VALUES (:user_id, :content, :images, :city, :tags, :is_anonymous, :expire_at)"""), {"user_id": user_id, "content": request.content, "images": json.dumps(request.images, ensure_ascii=False), "city": request.city, "tags": json.dumps(request.tags, ensure_ascii=False), "is_anonymous": int(request.is_anonymous), "expire_at": datetime.now(UTC).replace(tzinfo=None) + timedelta(hours=24)})
         await db.commit()
     except Exception:
         await db.rollback()
-        await refund_daily(key)
+        if used_daily:
+            await refund_daily(key)
         raise
     created = await db.execute(text("SELECT id, content, images, city, tags, is_anonymous, reply_count, created_at FROM paper_plane WHERE id = :id"), {"id": result.lastrowid})
     return await _paper_response(dict(created.mappings().one()))

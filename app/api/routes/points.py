@@ -4,9 +4,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.dependencies import CurrentUser, get_current_user
 from app.db.session import get_db
 from app.schemas.points import CheckinResponse, ClaimTaskResponse, InvitePage, PointLedgerPage, PointProduct, PointsSummary, RedeemRequest, RedeemResponse, TaskItem
+from app.schemas.quotas import QuotaSummary
 from app.services.points import checkin, claim_task, invites, ledger, products, redeem, summary, tasks
+from app.services.quotas import summary as quota_summary
 
 router = APIRouter()
+
+@router.get("/users/me/quotas", response_model=QuotaSummary, summary="查询当前用户各项剩余次数")
+async def quotas(current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> QuotaSummary:
+    return await quota_summary(db, current.id)
 
 @router.get("/users/me/points", response_model=PointsSummary, summary="查询积分余额")
 async def points(current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> PointsSummary: return await summary(db, current.id)

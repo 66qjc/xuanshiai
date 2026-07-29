@@ -35,6 +35,7 @@ from app.schemas.discovery import (
     VisitorPage,
 )
 from app.services.profile import _calculate_age, _json_dict, _json_list, get_profile
+from app.services.quotas import consume_extra
 
 
 CARD_SELECT = """
@@ -399,16 +400,39 @@ async def _quota_key(prefix: str, user_id: int) -> str:
     return f"discovery:{prefix}:{user_id}:{date.today().isoformat()}"
 
 
-async def _consume_browse(user_id: int, match_score: float, is_vip: bool) -> int | None:
-    if is_vip:
-        return None
+async def _quota_limit(db: AsyncSession, user_id: int, is_vip: bool) -> int:
+    if not is_vip:
+        return settings.browse_daily_limit
+    result = await db.execute(text("SELECT p.rights FROM user_membership m LEFT JOIN config_membership_package p ON p.code=m.package_type WHERE m.user_id=:user_id AND m.status=1 AND (m.start_at IS NULL OR m.start_at<=UTC_TIMESTAMP()) AND (m.end_at IS NULL OR m.end_at>UTC_TIMESTAMP()) ORDER BY m.end_at DESC LIMIT 1"), {"user_id": user_id})
+    row = result.first()
+    value = row[0] if row else None
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            value = {}
+    if isinstance(value, dict) and value.get("browse_daily_limit") is not None:
+        return max(0, int(value["browse_daily_limit"]))
+    return 20
+
+
+async def _record_quota_usage(db: AsyncSession, user_id: int, quota_code: str, source: str, reason: str, target_user_id: int | None = None) -> None:
+    await db.execute(text("INSERT INTO user_quota_usage (user_id,quota_code,quota_date,source,reason,target_user_id) VALUES (:user_id,:quota_code,:quota_date,:source,:reason,:target_user_id)"), {"user_id": user_id, "quota_code": quota_code, "quota_date": date.today(), "source": source, "reason": reason, "target_user_id": target_user_id})
+
+
+async def _consume_browse(db: AsyncSession, user_id: int, match_score: float, is_vip: bool, target_user_id: int) -> int:
+    limit = await _quota_limit(db, user_id, is_vip)
     regular_key = await _quota_key("browse", user_id)
-    if await consume_daily(regular_key, settings.browse_daily_limit):
-        return settings.browse_daily_limit - int(await redis_client.get(regular_key) or 0)
+    if await consume_daily(regular_key, limit):
+        await _record_quota_usage(db, user_id, "browse", "package" if is_vip else "free", "Daily profile view", target_user_id)
+        return limit - int(await redis_client.get(regular_key) or 0)
     if match_score > 80:
         bonus_key = await _quota_key("browse_bonus", user_id)
         if await consume_daily(bonus_key, settings.browse_high_match_bonus):
+            await _record_quota_usage(db, user_id, "browse", "bonus", "High-match profile bonus", target_user_id)
             return settings.browse_high_match_bonus - int(await redis_client.get(bonus_key) or 0)
+    if await consume_extra(db, user_id, "browse", "积分兑换资料查看次数", target_user_id):
+        return 0
     raise HTTPException(429, detail="今日完整浏览额度已用完")
 
 
@@ -433,7 +457,7 @@ async def view_profile(db: AsyncSession, viewer_id: int, target_id: int) -> Publ
     if row.get("who_can_see_me") == 3 and not vip:
         raise HTTPException(404, detail="用户不存在或当前不可见")
     privacy_locked = bool(row.get("only_vip_can_see_detail")) and not vip
-    quota = None if privacy_locked else await _consume_browse(viewer_id, score, vip)
+    quota = None if privacy_locked else await _consume_browse(db, viewer_id, score, vip, target_id)
     full = vip or (not privacy_locked and quota is not None)
     await _record_browse(db, viewer_id, target_id)
     card = _card(row, score, reason, detail_locked=not full)
@@ -635,10 +659,25 @@ async def _notify(db: AsyncSession, user_id: int, notification_type: str, title:
     })
 
 
-async def _consume_apply_quota(viewer_id: int, vip: bool) -> None:
+async def _consume_apply_quota(db: AsyncSession, viewer_id: int, vip: bool) -> bool:
     limit = settings.apply_daily_vip_limit if vip else settings.apply_daily_free_limit
+    if vip:
+        result = await db.execute(text("SELECT p.rights FROM user_membership m LEFT JOIN config_membership_package p ON p.code=m.package_type WHERE m.user_id=:user_id AND m.status=1 AND (m.start_at IS NULL OR m.start_at<=UTC_TIMESTAMP()) AND (m.end_at IS NULL OR m.end_at>UTC_TIMESTAMP()) ORDER BY m.end_at DESC LIMIT 1"), {"user_id": viewer_id})
+        value = result.first()
+        rights = value[0] if value else None
+        if isinstance(rights, str):
+            try:
+                rights = json.loads(rights)
+            except json.JSONDecodeError:
+                rights = {}
+        if isinstance(rights, dict):
+            limit = settings.apply_daily_free_limit + int(rights.get("apply_bonus") or 0)
+
     if not await consume_daily(await _quota_key("apply", viewer_id), limit):
+        if await consume_extra(db, viewer_id, "apply", "积分兑换申请次数"):
+            return False
         raise HTTPException(429, detail="今日认识申请次数已用完")
+    return True
 
 
 async def create_application(db: AsyncSession, viewer_id: int, target_id: int, request: ApplicationCreateRequest) -> ApplicationResponse:
@@ -656,7 +695,9 @@ async def create_application(db: AsyncSession, viewer_id: int, target_id: int, r
     if existing.first():
         raise HTTPException(409, detail="双方已有进行中的认识申请或匹配")
     quota_key = await _quota_key("apply", viewer_id)
-    await _consume_apply_quota(viewer_id, await _is_vip(db, viewer_id))
+    vip = await _is_vip(db, viewer_id)
+    if await _consume_apply_quota(db, viewer_id, vip):
+        await _record_quota_usage(db, viewer_id, "apply", "package" if vip else "free", "Daily application quota", target_id)
     expire_at = datetime.now(UTC).replace(tzinfo=None) + timedelta(hours=48)
     try:
         result = await db.execute(text("INSERT INTO match_apply (from_user_id, to_user_id, message, status, expire_at) VALUES (:from_id, :to_id, :message, 0, :expire_at)"), {"from_id": viewer_id, "to_id": target_id, "message": request.message, "expire_at": expire_at})
@@ -703,6 +744,7 @@ async def respond_application(db: AsyncSession, viewer_id: int, application_id: 
         created_at = row["created_at"]
         if created_at is not None and created_at.date() == datetime.now(UTC).date():
             await refund_daily(await _quota_key("apply", row["from_user_id"]))
+            await db.execute(text("INSERT INTO user_quota_usage (user_id,quota_code,quota_date,source,reason,target_user_id) VALUES (:user_id,'apply',:quota_date,'refund','申请被拒绝，返还申请次数',:target_user_id)"), {"user_id": row["from_user_id"], "quota_date": date.today(), "target_user_id": viewer_id})
     await db.commit()
     updated = await db.execute(text("SELECT id, from_user_id, to_user_id, message, status, expire_at, created_at FROM match_apply WHERE id = :id"), {"id": application_id})
     return ApplicationResponse(**updated.mappings().one())
@@ -743,7 +785,11 @@ async def create_superlike(db: AsyncSession, viewer_id: int, target_id: int, ide
     limit = settings.superlike_daily_vip_limit if vip else settings.superlike_daily_free_limit
     key = await _quota_key("superlike", viewer_id)
     if not await consume_daily(key, limit):
-        raise HTTPException(429, detail="今日爆灯次数已用完")
+        if await consume_extra(db, viewer_id, "superlike", "积分兑换爆灯次数", target_id):
+            # The extra grant is consumed below as part of the same operation.
+            pass
+        else:
+            raise HTTPException(429, detail="今日爆灯次数已用完")
     created_at = datetime.now(UTC).replace(tzinfo=None)
     try:
         await db.execute(text("""INSERT INTO user_boost (user_id, target_user_id, amount, order_no, start_at, end_at, status)

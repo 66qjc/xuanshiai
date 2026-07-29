@@ -6,6 +6,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.services.quotas import grant
 from app.schemas.points import CheckinResponse, ClaimTaskResponse, InvitePage, InviteItem, PointLedgerItem, PointLedgerPage, PointProduct, PointsSummary, RedeemRequest, RedeemResponse, TaskItem
 
 TASKS = {"profile_complete": ("完成资料", "profile_complete_reward"), "realname_verified": ("完成实名认证", "realname_verified_reward")}
@@ -116,7 +117,15 @@ async def redeem(db: AsyncSession, user_id: int, body: RedeemRequest, idempotenc
         after = before - points_cost
         order_no = f"PT{datetime.now(UTC).strftime('%Y%m%d%H%M%S')}{secrets.token_hex(5).upper()}"
         await db.execute(text("INSERT INTO user_points (user_id,type,amount,balance,`desc`) VALUES (:id,4,:amount,:balance,:description)"), {"id": user_id, "amount": -points_cost, "balance": after, "description": f"兑换{product['name']}"})
-        await db.execute(text("INSERT INTO point_redeem_order (order_no,user_id,product_id,product_code,points_cost,status,idempotency_key) VALUES (:order_no,:user_id,:product_id,:product_code,:points_cost,0,:key)"), {"order_no": order_no, "user_id": user_id, "product_id": product["id"], "product_code": product["code"], "points_cost": points_cost, "key": idempotency_key})
+        right_quota = {"extra_apply": "apply", "browse_unlock": "browse", "paper_plane_unlock": "paper_plane"}.get(product["code"])
+        order_status = 1 if right_quota else 0
+        await db.execute(text("INSERT INTO point_redeem_order (order_no,user_id,product_id,product_code,points_cost,status,idempotency_key) VALUES (:order_no,:user_id,:product_id,:product_code,:points_cost,:status,:key)"), {"order_no": order_no, "user_id": user_id, "product_id": product["id"], "product_code": product["code"], "points_cost": points_cost, "status": order_status, "key": idempotency_key})
+        if right_quota:
+            try:
+                amount = max(1, int(product["value"] or 1))
+            except (TypeError, ValueError):
+                raise HTTPException(422, detail="积分商品权益数量配置无效")
+            await grant(db, user_id, right_quota, amount, "points", order_no)
         if product["stock"] is not None:
             await db.execute(text("UPDATE config_point_product SET stock=stock-1 WHERE id=:id"), {"id": product["id"]})
-    return RedeemResponse(order_no=order_no, product_code=product["code"], product_name=product["name"], points_cost=points_cost, status=0, balance=after)
+    return RedeemResponse(order_no=order_no, product_code=product["code"], product_name=product["name"], points_cost=points_cost, status=order_status, balance=after)

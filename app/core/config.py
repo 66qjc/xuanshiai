@@ -42,6 +42,7 @@ class Settings(BaseSettings):
     wechat_app_id: str | None = None
     wechat_app_secret: str | None = None
     wechat_provider: str = "wechat"
+    wechat_payment_mode: Literal["mock", "real"] = "mock"
     wechat_mock_openid_prefix: str = "mock-openid-"
     sms_provider: str = "disabled"
     agreement_versions_raw: str = (
@@ -53,14 +54,15 @@ class Settings(BaseSettings):
     public_base_url: str = "http://127.0.0.1:8000"
     wechat_mini_program_page: str = "pages/profile/profile"
     recommendation_page_size: int = 20
-    browse_daily_limit: int = 20
+    browse_daily_limit: int = 8
     browse_high_match_bonus: int = 5
     apply_daily_free_limit: int = 3
-    apply_daily_vip_limit: int = 10
+    apply_daily_vip_limit: int = 3
     # 红娘服务只能通过现金订单获得，不为新用户自动发放免费次数。
     matchmaker_service_default_quota: int = 0
     superlike_daily_free_limit: int = 1
     superlike_daily_vip_limit: int = 3
+    paper_plane_daily_limit: int = 3
 
     # Optional environment overrides for commercial configuration. When unset,
     # the corresponding database configuration remains the fallback.
@@ -127,9 +129,9 @@ class Settings(BaseSettings):
         if self.environment in {"staging", "production"} and self.auto_init_db:
             raise ValueError("staging/production 环境必须关闭 AUTO_INIT_DB")
         if not self.is_test_mode and (
-            self.sms_provider == "mock" or self.wechat_provider == "mock"
+            self.sms_provider == "mock" or self.wechat_provider == "mock" or self.wechat_payment_mode == "mock"
         ):
-            raise ValueError("生产环境禁止启用短信或微信 Mock 服务")
+            raise ValueError("生产环境禁止启用短信、微信登录或微信支付 Mock 服务")
         if self.sms_provider.lower() == "mock" and (
             len(self.sms_mock_code) != 6 or not self.sms_mock_code.isdigit()
         ):
