@@ -597,4 +597,34 @@ Bearer <对应账号的 access_token>
 .\.venv\Scripts\pytest.exe
 ```
 
+## 17. Shared query interfaces for the parent client
+
+The parent application is a separate client and reuses this API with the parent user's own access token. This backend does not implement parent-side pages or an in-app parent workflow.
+
+### `GET /api/v1/matchmaker/service-products/{product_id}`
+
+- Authentication: public.
+- Returns one active paid matchmaking or private customization product.
+- Returns `404` for an unknown, inactive, or unsupported product.
+
+### `GET /api/v1/matchmaker/service-requests/orders`
+
+- Authentication: logged-in user.
+- Query: `page` 1~1000, default `1`; `page_size` 1~50, default `20`.
+- Returns only orders owned by the current account, with `items`, `page`, `page_size`, `total`, and `has_more`.
+
+### `GET /api/v1/matchmaker/service-requests/{service_id}`
+
+- Authentication: logged-in user.
+- Returns the service record when the current account is the service owner or assigned service matchmaker.
+- Other accounts receive `404` to avoid exposing service existence.
+- Subsequent service delivery is confirmed through WeChat; this endpoint only exposes the order/service record.
+
+### Change log: 2026-07-30
+
+- Added public product detail lookup.
+- Added paginated current-user order listing.
+- Added authorized service detail lookup.
+- Kept WeChat delivery as the post-purchase service boundary; no in-app matchmaker conversation or meeting workflow was added.
+
 如果使用 `uv run` 遇到本机 uv 缓存目录权限或路径错误，使用项目已有 `.venv` 中的工具执行上述检查。

@@ -54,7 +54,10 @@ def test_matchmaker_routes_are_registered_and_require_authentication() -> None:
     assert "/api/v1/matchmaker/service-requests/assigned" in paths
     assert "/api/v1/matchmaker/service-products" in paths
     assert "/api/v1/matchmaker/service-products/{product_id}" in paths
+    assert "get" in paths["/api/v1/matchmaker/service-products/{product_id}"]
     assert "/api/v1/matchmaker/service-requests/orders" in paths
+    assert "get" in paths["/api/v1/matchmaker/service-requests/orders"]
+    assert "/api/v1/matchmaker/service-requests/{service_id}" in paths
     assert "/api/v1/matchmaker/service-requests/{service_id}/contact" in paths
     assert "/api/v1/matchmaker/service-requests/{service_id}/contact-exchanges" in paths
     assert "/api/v1/matchmaker/service-requests/contact-exchanges/{exchange_id}" in paths
@@ -70,6 +73,13 @@ def test_matchmaker_public_list_does_not_require_authentication() -> None:
     operation = client.get("/openapi.json").json()["paths"]["/api/v1/matchmakers"]["get"]
     security = operation.get("security", [])
     assert security == []
+
+
+def test_parent_client_can_use_public_catalog_but_not_private_order_queries() -> None:
+    paths = client.get("/openapi.json").json()["paths"]
+    assert paths["/api/v1/matchmaker/service-products/{product_id}"]["get"].get("security", []) == []
+    assert paths["/api/v1/matchmaker/service-requests/orders"]["get"].get("security")
+    assert paths["/api/v1/matchmaker/service-requests/{service_id}"]["get"].get("security")
 
 
 def test_contact_exchange_schema_requires_explicit_consent_action() -> None:

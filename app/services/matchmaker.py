@@ -24,6 +24,7 @@ from app.schemas.matchmaker import (
     MatchmakerContactExchangeUpdate,
     MatchmakerContactUpdate,
     MatchmakerServiceOrderCreate,
+    MatchmakerServiceOrderPage,
     MatchmakerServiceOrderResponse,
     MatchmakerServiceProductCreate,
     MatchmakerServiceProductResponse,
