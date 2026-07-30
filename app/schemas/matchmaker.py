@@ -86,6 +86,14 @@ class MatchmakerServiceOrderResponse(BaseModel):
     pay_time: datetime | None
 
 
+class MatchmakerServiceOrderPage(BaseModel):
+    items: list[MatchmakerServiceOrderResponse]
+    page: int
+    page_size: int
+    total: int
+    has_more: bool
+
+
 class MatchmakerServiceRequestCreate(BaseModel):
     order_no: str = Field(min_length=8, max_length=64)
     requirement: str = Field(min_length=10, max_length=2000)

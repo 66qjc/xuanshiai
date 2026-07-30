@@ -187,6 +187,16 @@ async def list_service_products(db: AsyncSession) -> list[MatchmakerServiceProdu
     return [_product_response(row) for row in result.mappings().all()]
 
 
+async def get_service_product(db: AsyncSession, product_id: int) -> MatchmakerServiceProductResponse:
+    result = await db.execute(text("""SELECT id, code, name, service_type, price, description,
+        status, created_at, updated_at FROM matchmaker_service_product
+        WHERE id = :id AND status = 1 AND service_type IN (1, 3)"""), {"id": product_id})
+    row = result.mappings().first()
+    if not row:
+        raise HTTPException(404, detail="红娘服务商品不存在或已下架")
+    return _product_response(row)
+
+
 async def admin_create_service_product(
     db: AsyncSession, admin_id: int, request: MatchmakerServiceProductCreate
 ) -> MatchmakerServiceProductResponse:
@@ -306,6 +316,41 @@ async def get_service_order(db: AsyncSession, current: CurrentUser, order_no: st
     if not row:
         raise HTTPException(404, detail="红娘服务订单不存在")
     return _order_response(row)
+
+
+async def list_service_orders(
+    db: AsyncSession, current: CurrentUser, page: int, page_size: int
+) -> MatchmakerServiceOrderPage:
+    base = """FROM payment_order po
+        JOIN matchmaker_service_product sp ON sp.id = po.service_product_id
+        WHERE po.user_id = :user_id AND po.type = 3"""
+    params = {"user_id": current.id, "limit": page_size, "offset": (page - 1) * page_size}
+    result = await db.execute(text(f"""SELECT po.id, po.order_no, po.user_id, po.matchmaker_id,
+        po.service_product_id, sp.service_type, po.product_name, po.amount, po.status,
+        po.service_request_id, po.created_at, po.pay_time {base}
+        ORDER BY po.created_at DESC, po.id DESC LIMIT :limit OFFSET :offset"""), params)
+    count = await db.execute(text(f"SELECT COUNT(*) {base}"), {"user_id": current.id})
+    total = int(count.scalar() or 0)
+    return MatchmakerServiceOrderPage(
+        items=[_order_response(row) for row in result.mappings().all()],
+        page=page,
+        page_size=page_size,
+        total=total,
+        has_more=page * page_size < total,
+    )
+
+
+async def get_service_request(
+    db: AsyncSession, current: CurrentUser, service_id: int
+) -> MatchmakerServiceRequestResponse:
+    result = await db.execute(text(f"""{SERVICE_SELECT}
+        WHERE id = :id AND (user_id = :user_id OR matchmaker_id = :user_id)"""), {
+        "id": service_id, "user_id": current.id,
+    })
+    row = result.mappings().first()
+    if not row:
+        raise HTTPException(404, detail="红娘服务不存在或无权查看")
+    return _service_response(row)
 
 
 async def activate_paid_service_order(db: AsyncSession, order_id: int) -> int:
