@@ -73,8 +73,10 @@ async def list_matchmakers(
         JOIN users u ON u.id = app.user_id AND u.status = 1
         JOIN user_role role ON role.user_id = app.user_id
           AND role.role_code = 'service_matchmaker' AND role.status = 1
-        LEFT JOIN (SELECT matchmaker_id, COUNT(*) AS success_count
-          FROM matchmaker_service WHERE status = 2 GROUP BY matchmaker_id) service_stats
+        LEFT JOIN (SELECT ms.matchmaker_id, COUNT(*) AS success_count
+          FROM matchmaker_service ms
+          JOIN payment_order po ON po.id = ms.order_id AND po.type = 3 AND po.status = 1
+          WHERE ms.status = 2 GROUP BY ms.matchmaker_id) service_stats
           ON service_stats.matchmaker_id = app.user_id
         LEFT JOIN (SELECT matchmaker_id, AVG(score) AS rating_score, COUNT(*) AS rating_count
           FROM matchmaker_rating GROUP BY matchmaker_id) rating_stats
@@ -103,8 +105,10 @@ async def get_matchmaker(db: AsyncSession, matchmaker_id: int) -> MatchmakerCard
         JOIN users u ON u.id = app.user_id AND u.status = 1
         JOIN user_role role ON role.user_id = app.user_id
           AND role.role_code = 'service_matchmaker' AND role.status = 1
-        LEFT JOIN (SELECT matchmaker_id, COUNT(*) AS success_count
-          FROM matchmaker_service WHERE status = 2 GROUP BY matchmaker_id) service_stats
+        LEFT JOIN (SELECT ms.matchmaker_id, COUNT(*) AS success_count
+          FROM matchmaker_service ms
+          JOIN payment_order po ON po.id = ms.order_id AND po.type = 3 AND po.status = 1
+          WHERE ms.status = 2 GROUP BY ms.matchmaker_id) service_stats
           ON service_stats.matchmaker_id = app.user_id
         LEFT JOIN (SELECT matchmaker_id, AVG(score) AS rating_score, COUNT(*) AS rating_count
           FROM matchmaker_rating GROUP BY matchmaker_id) rating_stats
@@ -312,7 +316,7 @@ async def get_service_order(db: AsyncSession, current: CurrentUser, order_no: st
         po.service_product_id, sp.service_type, po.product_name, po.amount, po.status,
         po.service_request_id, po.created_at, po.pay_time
         FROM payment_order po JOIN matchmaker_service_product sp ON sp.id = po.service_product_id
-        WHERE po.order_no = :order_no AND po.user_id = :user_id"""), {"order_no": order_no, "user_id": current.id})
+        WHERE po.order_no = :order_no AND po.user_id = :user_id AND po.type = 3"""), {"order_no": order_no, "user_id": current.id})
     row = result.mappings().first()
     if not row:
         raise HTTPException(404, detail="红娘服务订单不存在")

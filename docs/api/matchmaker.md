@@ -626,5 +626,6 @@ The parent application is a separate client and reuses this API with the parent 
 - Added paginated current-user order listing.
 - Added authorized service detail lookup.
 - Kept WeChat delivery as the post-purchase service boundary; no in-app matchmaker conversation or meeting workflow was added.
+- The ranking `success_count` field is currently defined as the count of paid type-3 matchmaker orders whose linked service record is completed (`status=2`); it is not a confirmed matchmaking-success count.
 
 如果使用 `uv run` 遇到本机 uv 缓存目录权限或路径错误，使用项目已有 `.venv` 中的工具执行上述检查。
