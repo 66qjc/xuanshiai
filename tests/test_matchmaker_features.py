@@ -10,6 +10,7 @@ from app.schemas.matchmaker import (
     MatchmakerServiceProductCreate,
     MatchmakerServiceProductUpdate,
     MatchmakerServiceRequestCreate,
+    MatchmakerServiceRequestResponse,
     MatchmakerServiceRequestUpdate,
 )
 
@@ -73,6 +74,33 @@ def test_matchmaker_public_list_does_not_require_authentication() -> None:
     operation = client.get("/openapi.json").json()["paths"]["/api/v1/matchmakers"]["get"]
     security = operation.get("security", [])
     assert security == []
+
+
+def test_matchmaker_fixed_routes_precede_dynamic_service_route() -> None:
+    route_paths = list(client.get("/openapi.json").json()["paths"])
+    orders_index = route_paths.index("/api/v1/matchmaker/service-requests/orders")
+    assigned_index = route_paths.index("/api/v1/matchmaker/service-requests/assigned")
+    dynamic_index = route_paths.index("/api/v1/matchmaker/service-requests/{service_id}")
+    assert orders_index < dynamic_index
+    assert assigned_index < dynamic_index
+
+
+def test_matchmaker_service_response_has_no_unapproved_workflow_or_contact_fields() -> None:
+    fields = set(MatchmakerServiceRequestResponse.model_fields)
+    assert fields == {
+        "id", "user_id", "matchmaker_id", "service_type", "status", "order_id",
+        "product_id", "requirement", "feedback", "created_at", "updated_at",
+        "start_at", "end_at",
+    }
+    assert not fields.intersection({"wechat_contact", "phone", "chat_id", "meeting_id", "match_result"})
+
+
+def test_matchmaker_openapi_does_not_add_in_app_delivery_workflow_routes() -> None:
+    paths = [path for path in client.get("/openapi.json").json()["paths"] if "/matchmaker" in path]
+    # Meeting association routes already exist for compatibility; this guards
+    # against adding new in-app chat or matchmaking-result workflows.
+    forbidden_fragments = ("/chat", "/conversation", "/match-result", "/workflow")
+    assert not any(any(fragment in path for fragment in forbidden_fragments) for path in paths)
 
 
 def test_parent_client_can_use_public_catalog_but_not_private_order_queries() -> None:
