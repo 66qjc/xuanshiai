@@ -16,6 +16,7 @@ from app.schemas.matchmaker import (
     MatchmakerContactUpdate,
     MatchmakerPage,
     MatchmakerServiceOrderCreate,
+    MatchmakerServiceOrderPage,
     MatchmakerServiceOrderResponse,
     MatchmakerServiceProductCreate,
     MatchmakerServiceProductResponse,
@@ -34,8 +35,11 @@ from app.services.matchmaker import (
     get_matchmaker_contact,
     get_contact_exchange_contacts,
     get_service_order,
+    get_service_product,
+    get_service_request,
     get_matchmaker,
     list_service_products,
+    list_service_orders,
     list_matchmakers,
     list_service_requests,
     set_matchmaker_contact,
@@ -80,6 +84,13 @@ async def service_products(db: AsyncSession = Depends(get_db)) -> list[Matchmake
     return await list_service_products(db)
 
 
+@product_router.get("/{product_id}", response_model=MatchmakerServiceProductResponse)
+async def service_product_detail(
+    product_id: int = Path(..., ge=1), db: AsyncSession = Depends(get_db)
+) -> MatchmakerServiceProductResponse:
+    return await get_service_product(db, product_id)
+
+
 @product_router.post("", response_model=MatchmakerServiceProductResponse, status_code=201, summary="创建红娘服务商品")
 async def create_service_product(
     body: MatchmakerServiceProductCreate,
@@ -121,6 +132,16 @@ async def get_order(
     return await get_service_order(db, current, order_no)
 
 
+@requests_router.get("/orders", response_model=MatchmakerServiceOrderPage)
+async def my_orders(
+    page: int = Query(1, ge=1, le=1000),
+    page_size: int = Query(20, ge=1, le=50),
+    current: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> MatchmakerServiceOrderPage:
+    return await list_service_orders(db, current, page, page_size)
+
+
 @requests_router.post("", response_model=MatchmakerServiceRequestResponse, status_code=201, summary="提交牵线服务申请")
 async def create_request(
     body: MatchmakerServiceRequestCreate,
@@ -148,6 +169,15 @@ async def assigned_requests(
     db: AsyncSession = Depends(get_db),
 ) -> MatchmakerServiceRequestPage:
     return await list_service_requests(db, current, page, page_size, assigned=True)
+
+
+@requests_router.get("/{service_id}", response_model=MatchmakerServiceRequestResponse)
+async def service_request_detail(
+    service_id: int = Path(..., ge=1),
+    current: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> MatchmakerServiceRequestResponse:
+    return await get_service_request(db, current, service_id)
 
 
 @requests_router.patch("/{service_id}", response_model=MatchmakerServiceRequestResponse, summary="处理牵线服务申请")
