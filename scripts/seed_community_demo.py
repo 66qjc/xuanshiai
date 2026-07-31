@@ -49,6 +49,9 @@ DEMO_PROFILE_PHONES = (
     "17870810291",
 )
 
+# The WeChat smoke login uses this demo account; notifications must be visible there.
+DEMO_NOTIFICATION_RECIPIENT_PHONE = "17870810285"
+
 _DEMO_PROFILES = (
     {
         "phone": "13800001001",
@@ -936,7 +939,7 @@ def seed_community_demo(
             )
             if not cursor.fetchone():
                 cursor.execute(
-                    """INSERT INTO user_points (user_id, type, amount, balance, description)
+                    """INSERT INTO user_points (user_id, type, amount, balance, `desc`)
                        VALUES (%s, 0, %s, %s, '演示数据初始积分')""",
                     (uid, INITIAL_POINTS, INITIAL_POINTS),
                 )
@@ -980,19 +983,19 @@ def seed_community_demo(
         for ntype, title, content, target_type, target_id, actor_phone in _DEMO_NOTIFICATIONS:
             actor_id = user_ids.get(actor_phone) if actor_phone else None
             recipient_id = next(
-                (uid for pid, uid in user_ids.items() if pid == "13800001001"),
+                (uid for pid, uid in user_ids.items() if pid == DEMO_NOTIFICATION_RECIPIENT_PHONE),
                 list(user_ids.values())[0],
             )
             if target_type == "post" and target_id is None:
                 continue
             cursor.execute(
-                """INSERT INTO notification (user_id, notification_type, title, content,
-                   target_type, target_id, actor_user_id, is_read, created_at)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """INSERT INTO user_notification (user_id, notification_type, title, content,
+                   target_type, target_id, related_user_id, related_id, is_read, created_at)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                    ON DUPLICATE KEY UPDATE id = id""",
                 (
                     recipient_id, ntype, title, content,
-                    target_type, target_id or 0, actor_id,
+                    target_type, target_id or 0, actor_id, target_id or 0,
                     0, current_time - timedelta(hours=1),
                 ),
             )

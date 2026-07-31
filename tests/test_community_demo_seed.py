@@ -39,7 +39,17 @@ def test_community_demo_seed_contains_profile_feed_comment_and_signup_writes() -
     assert "INSERT INTO community_post" in script
     assert "INSERT INTO community_comment" in script
     assert "INSERT INTO activity_signup" in script
+    assert "INSERT INTO user_points (user_id, type, amount, balance, `desc`)" in script
+    assert "INSERT INTO user_notification" in script
+    assert "related_user_id" in script
     assert "ON DUPLICATE KEY UPDATE" in script
+
+
+def test_community_demo_notifications_target_the_current_debug_login() -> None:
+    script = (ROOT / "scripts" / "seed_community_demo.py").read_text(encoding="utf-8")
+
+    assert 'DEMO_NOTIFICATION_RECIPIENT_PHONE = "17870810285"' in script
+    assert "pid == DEMO_NOTIFICATION_RECIPIENT_PHONE" in script
 
 
 def test_paper_plane_message_response_exposes_viewer_message_ownership() -> None:

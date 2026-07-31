@@ -23,6 +23,7 @@ from sqlalchemy.pool import NullPool
 import database_setup_marriage
 from app.api.dependencies import CurrentUser, get_current_user, get_realname_verified_user
 from app.api.routes import community as community_routes
+from app.core.config import settings
 from app.core import redis as redis_module
 from app.db.session import get_db
 from app.main import app
@@ -403,17 +404,15 @@ async def community_database() -> CommunityDatabaseHarness:
 
 def route_dependencies(path: str, method: str) -> set[object]:
     method_u = method.upper()
-    matches = []
-    for route in app.routes:
-        route_path = getattr(route, "path", None)
-        methods = getattr(route, "methods", None) or set()
-        if route_path == path and method_u in {m.upper() for m in methods}:
-            matches.append(route)
-        for child in getattr(route, "routes", []) or []:
-            child_path = getattr(child, "path", None)
-            child_methods = getattr(child, "methods", None) or set()
-            if child_path == path and method_u in {m.upper() for m in child_methods}:
-                matches.append(child)
+    route_path = path.removeprefix(settings.api_prefix)
+    matches = [
+        route
+        for route in community_routes.router.routes
+        if getattr(route, "path", None) == route_path
+        and method_u in {
+            method_name.upper() for method_name in (getattr(route, "methods", None) or set())
+        }
+    ]
     if not matches:
         raise AssertionError(f"route not found: {method_u} {path}")
     route = matches[0]

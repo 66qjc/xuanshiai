@@ -459,7 +459,7 @@ class DatabaseManager:
             cursor.execute(f"""
                 SELECT CONSTRAINT_NAME, DELETE_RULE
                 FROM information_schema.REFERENTIAL_CONSTRAINTS
-                WHERE TABLE_SCHEMA = DATABASE()
+                WHERE CONSTRAINT_SCHEMA = DATABASE()
                 AND TABLE_NAME = '{table_name}'
                 AND CONSTRAINT_NAME = '{fk_name}'
             """)
