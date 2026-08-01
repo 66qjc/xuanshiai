@@ -6,7 +6,7 @@ import base64
 import binascii
 import json
 import logging
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
 from fastapi import HTTPException
@@ -496,7 +496,7 @@ def _normalize_city_display_name(name: str | None) -> str:
 
 
 def _feed_clauses(
-    mode: Literal["latest", "following", "city", "liked_users", "following_and_liked", "topic"],
+    mode: Literal["latest", "following", "city", "liked_users", "following_and_liked", "mine", "topic"],
     *,
     city: str | None,
     city_code: str | None,
@@ -511,6 +511,8 @@ def _feed_clauses(
         clauses.append(
             " AND EXISTS (SELECT 1 FROM user_favorite f WHERE f.user_id = :user_id AND f.target_user_id = p.user_id AND f.type = 3)"
         )
+    elif mode == "mine":
+        clauses.append(" AND p.user_id = :user_id")
     elif mode == "liked_users":
         clauses.append(
             " AND EXISTS (SELECT 1 FROM user_favorite f WHERE f.user_id = :user_id AND f.target_user_id = p.user_id AND f.type = 1)"
@@ -610,7 +612,7 @@ async def list_posts(
     db: AsyncSession,
     user_id: int,
     mode: Literal[
-        "latest", "following", "city", "liked_users", "following_and_liked", "topic"
+        "latest", "following", "city", "liked_users", "following_and_liked", "mine", "topic"
     ] = "latest",
     page: int = 1,
     page_size: int = 20,
@@ -638,7 +640,11 @@ async def list_posts(
         me=me,
     )
     extra_where = f"{_post_visibility_clause()}{extra_where}"
-    order_sql = "ORDER BY p.like_count DESC, p.created_at DESC" if sort == "hot" else "ORDER BY p.is_top DESC, p.created_at DESC"
+    order_sql = (
+        "ORDER BY p.like_count DESC, p.created_at DESC, p.id DESC"
+        if sort == "hot"
+        else "ORDER BY p.is_top DESC, p.created_at DESC, p.id DESC"
+    )
     params = {
         "user_id": user_id,
         "limit": page_size,
@@ -1143,6 +1149,10 @@ def _topic_response(row: dict[str, Any]) -> CommunityTopicResponse:
         heat=heat,
         joined=bool(row.get("joined")),
         created_at=row.get("created_at"),
+        background_url=row.get("background_url"),
+        description=row.get("description"),
+        view_count=int(row.get("view_count") or 0),
+        status=row.get("status"),
     )
 
 
