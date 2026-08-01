@@ -77,6 +77,14 @@ def test_record_lists_expose_scroll_pagination_contract() -> None:
         assert "page" in str(paths[path]["get"])
 
 
+def test_test_payment_and_paid_discovery_routes_are_registered() -> None:
+    paths = client.get("/openapi.json").json()["paths"]
+    assert "/api/v1/payments/test/pay" in paths
+    assert "/api/v1/boost/packages" in paths
+    assert "/api/v1/boost/orders" in paths
+    assert "/api/v1/spotlights/payments" in paths
+
+
 def test_discovery_card_respects_privacy_and_detail_lock() -> None:
     row = {
         "user_id": 1,

@@ -85,9 +85,10 @@ async def create_order(db: AsyncSession, user_id: int, body: CreateMembershipOrd
     price = settings.membership_price_override(package["code"], "price", float(package["price"]))
     order_no = f"VIP{datetime.now(UTC).strftime('%Y%m%d%H%M%S')}{secrets.token_hex(5).upper()}"
     expire_at = datetime.now(UTC).replace(tzinfo=None) + timedelta(minutes=30)
-    await db.execute(text("INSERT INTO payment_order (user_id,order_no,type,product_id,product_type,product_name,amount,pay_type,status,expire_at,idempotency_key) VALUES (:uid,:order_no,1,:pid,1,:code,:amount,1,0,:expire_at,:key)"), {"uid": user_id, "order_no": order_no, "pid": package["id"], "code": package["code"], "amount": price, "expire_at": expire_at, "key": idempotency_key})
+    pay_type = 4 if settings.is_test_mode else 1
+    await db.execute(text("INSERT INTO payment_order (user_id,order_no,type,product_id,product_type,product_name,amount,pay_type,status,expire_at,idempotency_key) VALUES (:uid,:order_no,1,:pid,1,:code,:amount,:pay_type,0,:expire_at,:key)"), {"uid": user_id, "order_no": order_no, "pid": package["id"], "code": package["code"], "amount": price, "pay_type": pay_type, "expire_at": expire_at, "key": idempotency_key})
     await db.commit()
-    return MembershipOrderResponse(order_no=order_no, package_code=package["code"], product_name=package["name"], amount=price, pay_type=1, status=0, expire_at=expire_at, payment_required=True)
+    return MembershipOrderResponse(order_no=order_no, package_code=package["code"], product_name=package["name"], amount=price, pay_type=pay_type, status=0, expire_at=expire_at, payment_required=True)
 
 
 async def get_order(db: AsyncSession, user_id: int, order_no: str) -> MembershipOrderResponse:

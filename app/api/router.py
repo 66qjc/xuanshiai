@@ -18,6 +18,7 @@ from app.api.routes import (
     meeting,
     membership,
     organization,
+    payments,
     points,
     presence,
     profile,
@@ -35,6 +36,7 @@ api_router.include_router(auth.router, tags=["账号与认证"])
 api_router.include_router(users.router, tags=["账号与认证"])
 api_router.include_router(certifications.router, tags=["认证审核"])
 api_router.include_router(membership.router, tags=["会员"])
+api_router.include_router(payments.router, tags=["支付"])
 api_router.include_router(points.router, tags=["积分"])
 api_router.include_router(regions.router, tags=["地区"])
 api_router.include_router(presence.router, tags=["消息"])
@@ -70,6 +72,7 @@ OPENAPI_TAGS = [
     {"name": "财务与结算", "description": "订单、分成、账本、余额和提现。"},
     {"name": "认证审核", "description": "认证资料和认证审核相关能力。"},
     {"name": "会员", "description": "会员相关能力。"},
+    {"name": "支付", "description": "测试支付和商业化订单履约。"},
     {"name": "积分", "description": "积分账户和积分流水相关能力。"},
     {"name": "地区", "description": "省市区等地区数据查询。"},
     {"name": "系统", "description": "健康检查和系统发现信息。"},
