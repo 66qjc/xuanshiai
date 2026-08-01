@@ -1367,6 +1367,7 @@ source = { editable = "." }
 dependencies = [
     { name = "aiofiles" },
     { name = "aiomysql" },
+    { name = "bcrypt" },
     { name = "fastapi" },
     { name = "passlib", extra = ["bcrypt"] },
     { name = "pillow" },
@@ -1392,6 +1393,7 @@ dev = [
 requires-dist = [
     { name = "aiofiles", specifier = ">=24,<25" },
     { name = "aiomysql", specifier = ">=0.2,<1.0" },
+    { name = "bcrypt", specifier = ">=4.0,<6.0" },
     { name = "fastapi", specifier = ">=0.115,<1.0" },
     { name = "httpx", marker = "extra == 'dev'", specifier = ">=0.27,<1.0" },
     { name = "passlib", extras = ["bcrypt"], specifier = ">=1.7,<2.0" },
