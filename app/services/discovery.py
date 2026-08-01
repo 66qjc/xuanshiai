@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 import httpx
@@ -30,9 +30,14 @@ from app.schemas.discovery import (
     FilterOptionsResponse,
     ApplicationPage,
     FavoritePage,
+    FavoriteReceivedItem,
+    FavoriteReceivedPage,
+    RelationUserSummary,
     PublicProfileResponse,
     SavedFilterResponse,
     SuperLikeResponse,
+    SuperLikeItem,
+    SuperLikePage,
     VisitorPage,
 )
 from app.services.notifications import emit_notification
@@ -657,6 +662,39 @@ async def list_favorites(db: AsyncSession, viewer_id: int, page: int, page_size:
     return FavoritePage(items=items, page=page, page_size=page_size, total=total, has_more=page * page_size < total)
 
 
+async def list_received_favorites(db: AsyncSession, viewer_id: int, page: int, page_size: int) -> FavoriteReceivedPage:
+    """Return users who saved the viewer, while applying the same privacy rules as cards."""
+    visible = """ AND u.status = 1
+        AND COALESCE(pr.show_profile, 1) = 1
+        AND COALESCE(pr.who_can_see_me, 1) <> 4
+        AND COALESCE(pr.match_status, 1) = 1
+        AND NOT EXISTS (SELECT 1 FROM user_block bl
+                        WHERE (bl.user_id = :user_id AND bl.target_user_id = u.id)
+                           OR (bl.user_id = u.id AND bl.target_user_id = :user_id))"""
+    params = {"user_id": viewer_id, "limit": page_size, "offset": (page - 1) * page_size}
+    total = int((await db.execute(text(f"""SELECT COUNT(*)
+        FROM user_favorite f JOIN users u ON u.id = f.user_id
+        LEFT JOIN user_privacy pr ON pr.user_id = u.id
+        WHERE f.target_user_id = :user_id AND f.type = 2{visible}"""), params)).scalar() or 0)
+    result = await db.execute(text(f"""SELECT f.id, f.user_id, u.nickname, u.avatar, u.birthday,
+        p.residence_city_code, f.created_at
+        FROM user_favorite f JOIN users u ON u.id = f.user_id
+        LEFT JOIN user_profile p ON p.user_id = u.id
+        LEFT JOIN user_privacy pr ON pr.user_id = u.id
+        WHERE f.target_user_id = :user_id AND f.type = 2{visible}
+        ORDER BY f.created_at DESC, f.id DESC LIMIT :limit OFFSET :offset"""), params)
+    items = [
+        FavoriteReceivedItem(
+            id=int(row["id"]),
+            user=RelationUserSummary(user_id=int(row["user_id"]), nickname=row["nickname"], avatar=row["avatar"], age=_calculate_age(row["birthday"]) if row["birthday"] else None, city_code=row["residence_city_code"]),
+            relation="received",
+            created_at=row["created_at"],
+        )
+        for row in result.mappings().all()
+    ]
+    return FavoriteReceivedPage(items=items, page=page, page_size=page_size, total=total, has_more=page * page_size < total)
+
+
 async def _notify(db: AsyncSession, user_id: int, notification_type: str, title: str, content: str, related_user_id: int, related_id: int | None = None) -> None:
     target_type = "message" if notification_type.startswith("match_application") else "user"
     await emit_notification(
@@ -737,9 +775,21 @@ async def create_application(db: AsyncSession, viewer_id: int, target_id: int, r
 async def list_applications(db: AsyncSession, viewer_id: int, incoming: bool, page: int, page_size: int) -> ApplicationPage:
     await _expire_pending_applications(db)
     field = "to_user_id" if incoming else "from_user_id"
-    total = int((await db.execute(text(f"SELECT COUNT(*) FROM match_apply WHERE {field} = :user_id"), {"user_id": viewer_id})).scalar() or 0)
-    result = await db.execute(text(f"SELECT id, from_user_id, to_user_id, message, status, expire_at, created_at FROM match_apply WHERE {field} = :user_id ORDER BY created_at DESC, id DESC LIMIT :limit OFFSET :offset"), {"user_id": viewer_id, "limit": page_size, "offset": (page - 1) * page_size})
-    items = [ApplicationResponse(**row) for row in result.mappings().all()]
+    params = {"user_id": viewer_id, "limit": page_size, "offset": (page - 1) * page_size}
+    total = int((await db.execute(text(f"SELECT COUNT(*) FROM match_apply WHERE {field} = :user_id"), params)).scalar() or 0)
+    result = await db.execute(text(f"""SELECT a.id, a.from_user_id, a.to_user_id, a.message, a.status, a.expire_at, a.created_at,
+        fu.nickname AS from_nickname, fu.avatar AS from_avatar, fu.birthday AS from_birthday, fp.residence_city_code AS from_city_code,
+        tu.nickname AS to_nickname, tu.avatar AS to_avatar, tu.birthday AS to_birthday, tp.residence_city_code AS to_city_code
+        FROM match_apply a
+        JOIN users fu ON fu.id = a.from_user_id LEFT JOIN user_profile fp ON fp.user_id = fu.id
+        JOIN users tu ON tu.id = a.to_user_id LEFT JOIN user_profile tp ON tp.user_id = tu.id
+        WHERE a.{field} = :user_id ORDER BY a.created_at DESC, a.id DESC LIMIT :limit OFFSET :offset"""), params)
+    items = []
+    for row in result.mappings().all():
+        data = dict(row)
+        data["from_user"] = RelationUserSummary(user_id=data.pop("from_user_id"), nickname=data.pop("from_nickname"), avatar=data.pop("from_avatar"), age=_calculate_age(data.pop("from_birthday")) if data.get("from_birthday") else None, city_code=data.pop("from_city_code"))
+        data["to_user"] = RelationUserSummary(user_id=data.pop("to_user_id"), nickname=data.pop("to_nickname"), avatar=data.pop("to_avatar"), age=_calculate_age(data.pop("to_birthday")) if data.get("to_birthday") else None, city_code=data.pop("to_city_code"))
+        items.append(ApplicationResponse(**data))
     return ApplicationPage(items=items, page=page, page_size=page_size, total=total, has_more=page * page_size < total)
 
 
@@ -830,6 +880,44 @@ async def create_superlike(db: AsyncSession, viewer_id: int, target_id: int, ide
         raise
     used = int(await redis_client.get(key) or 0)
     return SuperLikeResponse(target_user_id=target_id, remaining_today=max(0, limit - used), created_at=created_at)
+
+
+async def list_superlikes(db: AsyncSession, viewer_id: int, direction: str, page: int, page_size: int) -> SuperLikePage:
+    if direction not in {"sent", "received"}:
+        raise ValueError("invalid superlike direction")
+    owner_field = "b.user_id" if direction == "sent" else "b.target_user_id"
+    other_field = "b.target_user_id" if direction == "sent" else "b.user_id"
+    params = {"user_id": viewer_id, "limit": page_size, "offset": (page - 1) * page_size}
+    where = f"""{owner_field} = :user_id AND u.status = 1
+        AND COALESCE(pr.show_profile, 1) = 1
+        AND COALESCE(pr.match_status, 1) = 1
+        AND NOT EXISTS (SELECT 1 FROM user_block bl
+                        WHERE (bl.user_id = :user_id AND bl.target_user_id = u.id)
+                           OR (bl.user_id = u.id AND bl.target_user_id = :user_id))"""
+    total = int((await db.execute(text(f"""SELECT COUNT(*) FROM user_boost b
+        JOIN users u ON u.id = {other_field}
+        LEFT JOIN user_privacy pr ON pr.user_id = u.id
+        WHERE {where}"""), params)).scalar() or 0)
+    result = await db.execute(text(f"""SELECT b.id, b.order_no, b.created_at, b.status,
+        u.id AS other_id, u.nickname, u.avatar, u.birthday, p.residence_city_code,
+        EXISTS (SELECT 1 FROM user_match m WHERE m.user_id = :user_id AND m.target_user_id = u.id AND m.status IN (1, 2)) AS matched
+        FROM user_boost b JOIN users u ON u.id = {other_field}
+        LEFT JOIN user_profile p ON p.user_id = u.id
+        LEFT JOIN user_privacy pr ON pr.user_id = u.id
+        WHERE {where} ORDER BY b.created_at DESC, b.id DESC LIMIT :limit OFFSET :offset"""), params)
+    items = [
+        SuperLikeItem(
+            id=int(row["id"]),
+            user=RelationUserSummary(user_id=int(row["other_id"]), nickname=row["nickname"], avatar=row["avatar"], age=_calculate_age(row["birthday"]) if row["birthday"] else None, city_code=row["residence_city_code"]),
+            direction=direction,
+            status=int(row["status"] or 1),
+            created_at=row["created_at"],
+            matched=bool(row["matched"]),
+            order_no=row["order_no"],
+        )
+        for row in result.mappings().all()
+    ]
+    return SuperLikePage(items=items, page=page, page_size=page_size, total=total, has_more=page * page_size < total)
 
 
 async def create_poster(db: AsyncSession, viewer_id: int, target_id: int, template: int) -> Response:

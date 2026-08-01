@@ -22,10 +22,12 @@ from app.schemas.discovery import (
     DiscoverySearch,
     FavoriteResponse,
     FavoritePage,
+    FavoriteReceivedPage,
     FilterOptionsResponse,
     PublicProfileResponse,
     SavedFilterResponse,
     SuperLikeResponse,
+    SuperLikePage,
     VisitorPage,
 )
 from app.services.discovery import (
@@ -39,6 +41,8 @@ from app.services.discovery import (
     search_discovery,
     list_applications,
     list_favorites,
+    list_received_favorites,
+    list_superlikes,
     respond_application,
     set_favorite,
     save_filter,
@@ -95,6 +99,11 @@ async def favorites(page: int = Query(1, ge=1, le=1000), page_size: int = Query(
     return await list_favorites(db, current.id, page, page_size)
 
 
+@router.get("/favorites/received", response_model=FavoriteReceivedPage, summary="查询收到的收藏")
+async def received_favorites(page: int = Query(1, ge=1, le=1000), page_size: int = Query(20, ge=1, le=50), current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> FavoriteReceivedPage:
+    return await list_received_favorites(db, current.id, page, page_size)
+
+
 @router.put("/favorites/{target_id}", response_model=FavoriteResponse, summary="收藏名片")
 async def add_favorite(target_id: int = Path(..., ge=1), current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> FavoriteResponse:
     return await set_favorite(db, current.id, target_id, True)
@@ -133,6 +142,16 @@ async def reject_application(application_id: int = Path(..., ge=1), body: Applic
 @router.post("/superlikes/{target_id}", response_model=SuperLikeResponse, status_code=201, summary="爆灯")
 async def superlike(target_id: int = Path(..., ge=1), idempotency_key: str = Header(..., alias="Idempotency-Key", min_length=8, max_length=128), current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> SuperLikeResponse:
     return await create_superlike(db, current.id, target_id, idempotency_key)
+
+
+@router.get("/superlikes/sent", response_model=SuperLikePage, summary="查询我发出的爆灯")
+async def sent_superlikes(page: int = Query(1, ge=1, le=1000), page_size: int = Query(20, ge=1, le=50), current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> SuperLikePage:
+    return await list_superlikes(db, current.id, "sent", page, page_size)
+
+
+@router.get("/superlikes/received", response_model=SuperLikePage, summary="查询收到的爆灯")
+async def received_superlikes(page: int = Query(1, ge=1, le=1000), page_size: int = Query(20, ge=1, le=50), current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> SuperLikePage:
+    return await list_superlikes(db, current.id, "received", page, page_size)
 
 
 @users_router.get("/{user_id}/profile", response_model=PublicProfileResponse, summary="查看他人主页")

@@ -70,6 +70,9 @@ def test_record_lists_expose_scroll_pagination_contract() -> None:
         "/api/v1/discovery/favorites",
         "/api/v1/discovery/applications/incoming",
         "/api/v1/discovery/applications/outgoing",
+        "/api/v1/discovery/favorites/received",
+        "/api/v1/discovery/superlikes/sent",
+        "/api/v1/discovery/superlikes/received",
     ):
         assert "page" in str(paths[path]["get"])
 

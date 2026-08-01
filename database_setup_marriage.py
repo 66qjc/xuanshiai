@@ -207,6 +207,7 @@ class DatabaseManager:
                 'marriage_reviewed_at': "`marriage_reviewed_at` datetime DEFAULT NULL",
             },
             'user_profile': {
+                'weight': "`weight` int DEFAULT NULL COMMENT '体重kg'",
                 'occupation': "`occupation` varchar(128) DEFAULT NULL COMMENT '职业'",
                 'industry': "`industry` varchar(128) DEFAULT NULL COMMENT '行业'",
                 'education_level': "`education_level` tinyint DEFAULT NULL COMMENT '学历等级'",

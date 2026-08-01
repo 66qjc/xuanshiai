@@ -25,7 +25,10 @@ def test_profile_validates_mbti_height_and_tags() -> None:
     assert request.tag_selections["sports"] == ["健身", "跑步"]
 
     with pytest.raises(ValidationError):
-        ProfileUpdateRequest(height=149)
+        ProfileUpdateRequest(height=139)
+    assert ProfileUpdateRequest(height=140, weight=40, self_intro="x" * 500).height == 140
+    with pytest.raises(ValidationError):
+        ProfileUpdateRequest(weight=39)
     with pytest.raises(ValidationError):
         ProfileUpdateRequest(mbti="XXXX")
     with pytest.raises(ValidationError):

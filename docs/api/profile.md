@@ -35,6 +35,11 @@ JSON 接口使用 `Content-Type: application/json`；上传接口使用 `multipa
 | `unread_notification_count` | integer | 未读通知数量 |
 | `incoming_application_count` / `outgoing_application_count` | integer | 待处理的收到/发出申请数量 |
 | `match_count` | integer | 当前有效匹配数量 |
+| `visitor_count` | integer | 去重后的历史访客数量 |
+| `favorite_count` | integer | 当前用户收藏他人的数量 |
+| `favorite_received_count` | integer | 他人收藏当前用户的数量 |
+| `superlike_sent_count` | integer | 当前用户发出的爆灯数量 |
+| `superlike_received_count` | integer | 当前用户收到的爆灯数量 |
 | `shortcuts` | object | 当前账号可用的快捷入口权限，来源于服务端门槛计算 |
 
 响应示例：
@@ -59,6 +64,7 @@ JSON 接口使用 `Content-Type: application/json`；上传接口使用 `multipa
 ### 变更记录
 
 - 2026-07-23：新增 overview 聚合接口；认证、会员、通知、申请和匹配摘要均由服务端查询，旧的独立资料接口保持不变。
+- 2026-08-01：overview 增加访客、收藏和爆灯统计；资料更新支持 `weight`，身高范围调整为 140~220cm，自我介绍上限统一为 500 字。旧客户端忽略新增字段即可。
 
 ## 1. 固定标签目录
 
@@ -206,13 +212,14 @@ JSON 接口使用 `Content-Type: application/json`；上传接口使用 `multipa
 | `birthday` | date/null | 否 | `YYYY-MM-DD`；服务端计算年龄且必须满 18 岁 |
 | `is_married` | integer/null | 否 | `1` 未婚、`2` 离异、`3` 丧偶 |
 | `height` | integer/null | 否 | 150~200cm |
+| `weight` | integer/null | 否 | 40~120kg |
 | `occupation` | string/null | 否 | 最长 128 字符 |
 | `industry` | string/null | 否 | 最长 128 字符 |
 | `education_level` | integer/null | 否 | 1~8 |
 | `income` | number/null | 否 | 0~1,000,000 |
 | `hometown_province_code/city_code/district_code` | string/null | 否 | 各最长 32 字符 |
 | `residence_province_code/city_code/district_code` | string/null | 否 | 各最长 32 字符 |
-| `self_intro` | string/null | 否 | 最长 1000 字符 |
+| `self_intro` | string/null | 否 | 最长 500 字符 |
 | `interest_tags` | array[string] | 否 | 3~5 个，必须来自固定目录 |
 | `personality_tags` | array[string] | 否 | 3~5 个，必须来自固定目录 |
 | `mbti` | string/null | 否 | `INTJ` 等 16 种标准值 |

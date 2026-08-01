@@ -213,6 +213,10 @@ Path `target_id` 为正整数。收藏成功返回：
 
 取消当前用户自己的收藏，成功返回 `{"target_user_id":23,"is_favorite":false}`。收藏不通知对方，也不产生匹配。
 
+### `GET /api/v1/discovery/favorites/received`
+
+查询“谁收藏我”。需要登录；按 `page`（1~1000，默认 1）和 `page_size`（1~50，默认 20）分页。返回 `items/page/page_size/total/has_more`，每条 `items[]` 包含 `id`、`user`（`user_id/nickname/avatar/age/city_code`）、`relation=received` 和 `created_at`。已注销、隐藏资料、暂停交友及互相拉黑的用户会被过滤；该接口表达收藏关系，不等同于喜欢或认识申请。
+
 ## 7. 认识申请
 
 ### `POST /api/v1/discovery/applications/{target_id}`
@@ -276,6 +280,10 @@ Path `target_id` 为正整数。收藏成功返回：
 | `created_at` | datetime | 爆灯时间 |
 
 爆灯会写入有效记录并通知对方；Redis 不可用返回 `503`。
+
+### `GET /api/v1/discovery/superlikes/sent` / `GET /api/v1/discovery/superlikes/received`
+
+查询本人发出或收到的爆灯记录。需要登录，支持 `page`（1~1000，默认 1）和 `page_size`（1~50，默认 20）。返回 `items/page/page_size/total/has_more`；每条记录包含 `id`、`user`（`user_id/nickname/avatar/age/city_code`）、`direction`、`status`、`created_at`、`matched` 和仅本人可见的 `order_no`。用户注销或互相拉黑后的记录不对外展示。
 
 ## 9. 他人主页和海报
 

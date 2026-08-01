@@ -145,6 +145,29 @@ class FavoritePage(BaseModel):
     has_more: bool
 
 
+class RelationUserSummary(BaseModel):
+    user_id: int
+    nickname: str | None
+    avatar: str | None
+    age: int | None
+    city_code: str | None
+
+
+class FavoriteReceivedItem(BaseModel):
+    id: int
+    user: RelationUserSummary
+    relation: Literal["received"]
+    created_at: datetime
+
+
+class FavoriteReceivedPage(BaseModel):
+    items: list[FavoriteReceivedItem]
+    page: int
+    page_size: int
+    total: int
+    has_more: bool
+
+
 class ApplicationCreateRequest(BaseModel):
     message: str | None = Field(default=None, max_length=255)
 
@@ -157,6 +180,8 @@ class ApplicationResponse(BaseModel):
     status: Literal[0, 1, 2, 3]
     expire_at: datetime | None
     created_at: datetime
+    from_user: RelationUserSummary | None = None
+    to_user: RelationUserSummary | None = None
 
 
 class ApplicationPage(BaseModel):
@@ -175,3 +200,21 @@ class SuperLikeResponse(BaseModel):
     target_user_id: int
     remaining_today: int | None
     created_at: datetime
+
+
+class SuperLikeItem(BaseModel):
+    id: int
+    user: RelationUserSummary
+    direction: Literal["sent", "received"]
+    status: int
+    created_at: datetime
+    matched: bool
+    order_no: str | None = None
+
+
+class SuperLikePage(BaseModel):
+    items: list[SuperLikeItem]
+    page: int
+    page_size: int
+    total: int
+    has_more: bool
