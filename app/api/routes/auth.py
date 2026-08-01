@@ -17,6 +17,7 @@ from app.schemas.auth import (
     SmsSendRequest,
     SmsSendResponse,
     TokenResponse,
+    ExistingAccountLoginRequest,
     UserResponse,
     WechatLoginRequest,
 )
@@ -49,6 +50,12 @@ async def phone_login(request: Request, body: PhoneLoginRequest, db: AsyncSessio
 async def wechat_login(request: Request, body: WechatLoginRequest, db: AsyncSession = Depends(get_db)) -> dict:
     """使用微信登录凭证换取用户身份并创建登录会话。"""
     return await auth.login_wechat(db, body, request_ip(request), request.headers.get("user-agent"))
+
+
+@router.post("/test-login", response_model=TokenResponse, summary="使用已有账号测试登录")
+async def test_login(request: Request, body: ExistingAccountLoginRequest, db: AsyncSession = Depends(get_db)) -> dict:
+    """Development/testing only: issue tokens for an existing active account."""
+    return await auth.login_existing_account(db, body, request_ip(request), request.headers.get("user-agent"))
 
 
 @router.post("/bind-phone", status_code=status.HTTP_204_NO_CONTENT, summary="绑定手机号")
