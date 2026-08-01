@@ -55,6 +55,7 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
 def create_app() -> FastAPI:
     """Create and configure the FastAPI application."""
     application = FastAPI(
+        root_path="/api",  # ← 添加这一行
         title=settings.app_name,
         version=settings.app_version,
         debug=settings.debug,
@@ -63,6 +64,7 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
         openapi_tags=OPENAPI_TAGS,
     )
+    # ... 其余代码保持不变 ...
 
     application.add_middleware(
         CORSMiddleware,
