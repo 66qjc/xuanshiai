@@ -42,15 +42,19 @@ def test_community_media_routes_registered() -> None:
     from app.main import app
 
     paths: set[str] = set()
-    for route in app.routes:
-        path = getattr(route, "path", None)
-        if isinstance(path, str):
-            paths.add(path)
-        # Nested/mounted routers expose routes under .routes
-        for child in getattr(route, "routes", []) or []:
-            child_path = getattr(child, "path", None)
-            if isinstance(child_path, str):
-                paths.add(child_path)
+    def walk(routes: object, prefix: str = ""):
+        for route in routes or []:
+            route_path = getattr(route, "path", None)
+            if isinstance(route_path, str):
+                yield f"{prefix}{route_path}"
+            if hasattr(route, "original_router"):
+                context = getattr(route, "include_context", None)
+                include_prefix = getattr(context, "prefix", "")
+                yield from walk(route.original_router.routes, f"{prefix}{include_prefix}")
+            else:
+                yield from walk(getattr(route, "routes", None), prefix)
+
+    paths.update(walk(app.routes))
     assert "/api/v1/community/media/uploads" in paths or any(
         p.endswith("/community/media/uploads") for p in paths
     )

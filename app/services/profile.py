@@ -205,7 +205,7 @@ async def _get_media(db: AsyncSession, user_id: int, media_type: str | None = No
 async def get_profile(db: AsyncSession, user_id: int, public: bool = False) -> dict[str, Any]:
     result = await db.execute(
         text("""SELECT u.id AS user_id, u.nickname, u.gender, u.birthday, u.is_married, u.avatar,
-                      p.height, p.occupation, p.industry, p.education_level, p.income,
+                      p.height, p.weight, p.occupation, p.industry, p.education_level, p.income,
                       p.hometown_province_code, p.hometown_city_code, p.hometown_district_code,
                       p.residence_province_code, p.residence_city_code, p.residence_district_code,
                       p.self_intro, p.interest_tags, p.personality_tags, p.mbti, p.tags,
@@ -427,7 +427,12 @@ async def get_profile_overview(db: AsyncSession, user_id: int) -> ProfileOvervie
         (SELECT COUNT(*) FROM user_notification n WHERE n.user_id = u.id AND n.is_read = 0) AS unread_count,
         (SELECT COUNT(*) FROM match_apply a WHERE a.to_user_id = u.id AND a.status = 0) AS incoming_count,
         (SELECT COUNT(*) FROM match_apply a WHERE a.from_user_id = u.id AND a.status = 0) AS outgoing_count,
-        (SELECT COUNT(*) FROM user_match m WHERE m.user_id = u.id AND m.status IN (1, 2)) AS match_count
+        (SELECT COUNT(*) FROM user_match m WHERE m.user_id = u.id AND m.status IN (1, 2)) AS match_count,
+        (SELECT COUNT(DISTINCT bh.user_id) FROM user_browse_history bh WHERE bh.target_user_id = u.id) AS visitor_count,
+        (SELECT COUNT(*) FROM user_favorite f WHERE f.user_id = u.id AND f.type = 2) AS favorite_count,
+        (SELECT COUNT(*) FROM user_favorite f WHERE f.target_user_id = u.id AND f.type = 2) AS favorite_received_count,
+        (SELECT COUNT(*) FROM user_boost b WHERE b.user_id = u.id) AS superlike_sent_count,
+        (SELECT COUNT(*) FROM user_boost b WHERE b.target_user_id = u.id) AS superlike_received_count
         FROM users u LEFT JOIN user_auth ua ON ua.user_id = u.id WHERE u.id = :user_id"""), {"user_id": user_id})
     row = result.mappings().first()
     if not row:
@@ -443,6 +448,11 @@ async def get_profile_overview(db: AsyncSession, user_id: int) -> ProfileOvervie
         incoming_application_count=int(row["incoming_count"] or 0),
         outgoing_application_count=int(row["outgoing_count"] or 0),
         match_count=int(row["match_count"] or 0),
+        visitor_count=int(row["visitor_count"] or 0),
+        favorite_count=int(row["favorite_count"] or 0),
+        favorite_received_count=int(row["favorite_received_count"] or 0),
+        superlike_sent_count=int(row["superlike_sent_count"] or 0),
+        superlike_received_count=int(row["superlike_received_count"] or 0),
         shortcuts={"can_browse": completion.can_browse, "can_apply": completion.can_apply, "can_chat": completion.can_chat},
     )
 

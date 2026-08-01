@@ -86,7 +86,8 @@ class ProfileUpdateRequest(BaseModel):
     gender: Literal[1, 2] | None = None
     birthday: date | None = None
     is_married: Literal[1, 2, 3] | None = None
-    height: int | None = Field(default=None, ge=150, le=200)
+    height: int | None = Field(default=None, ge=140, le=220)
+    weight: int | None = Field(default=None, ge=40, le=120)
     occupation: str | None = Field(default=None, max_length=128)
     industry: str | None = Field(default=None, max_length=128)
     education_level: int | None = Field(default=None, ge=1, le=8)
@@ -97,7 +98,7 @@ class ProfileUpdateRequest(BaseModel):
     residence_province_code: str | None = Field(default=None, max_length=32)
     residence_city_code: str | None = Field(default=None, max_length=32)
     residence_district_code: str | None = Field(default=None, max_length=32)
-    self_intro: str | None = Field(default=None, max_length=1000)
+    self_intro: str | None = Field(default=None, max_length=500)
     interest_tags: list[str] | None = Field(default=None, max_length=5)
     personality_tags: list[str] | None = Field(default=None, max_length=5)
     mbti: MbtiType | None = None
@@ -150,6 +151,7 @@ class ProfileResponse(BaseModel):
     age: int | None
     is_married: int | None
     height: int | None
+    weight: int | None
     occupation: str | None
     industry: str | None
     education_level: int | None
@@ -212,6 +214,11 @@ class ProfileOverviewResponse(BaseModel):
     incoming_application_count: int
     outgoing_application_count: int
     match_count: int
+    visitor_count: int
+    favorite_count: int
+    favorite_received_count: int
+    superlike_sent_count: int
+    superlike_received_count: int
     shortcuts: OverviewShortcuts
 
 

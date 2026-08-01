@@ -207,6 +207,7 @@ class DatabaseManager:
                 'marriage_reviewed_at': "`marriage_reviewed_at` datetime DEFAULT NULL",
             },
             'user_profile': {
+                'weight': "`weight` int DEFAULT NULL COMMENT '体重kg'",
                 'occupation': "`occupation` varchar(128) DEFAULT NULL COMMENT '职业'",
                 'industry': "`industry` varchar(128) DEFAULT NULL COMMENT '行业'",
                 'education_level': "`education_level` tinyint DEFAULT NULL COMMENT '学历等级'",
@@ -345,11 +346,22 @@ class DatabaseManager:
 
         for table_name, columns in required_columns.items():
             self._ensure_table_columns(cursor, f'`{table_name}`', columns)
+        self._ensure_payment_order_product_type(cursor)
         self._ensure_community_moderation_status_types(cursor)
         self._ensure_matchmaker_application_index(cursor)
         self._ensure_payment_order_idempotency_index(cursor)
         self._ensure_community_post_feed_indexes(cursor)
         self._ensure_idempotency_contract(cursor)
+
+    def _ensure_payment_order_product_type(self, cursor):
+        """Keep package codes such as ``monthly`` lossless in payment orders."""
+        try:
+            cursor.execute("SHOW COLUMNS FROM `payment_order` LIKE 'product_type'")
+            row = cursor.fetchone()
+            if row and "char" not in str(row["Type"]).lower() and "text" not in str(row["Type"]).lower():
+                cursor.execute("ALTER TABLE `payment_order` MODIFY COLUMN `product_type` varchar(64) DEFAULT NULL COMMENT '商品编码'")
+        except Exception as exc:
+            logger.warning(f"⚠️ payment_order.product_type 类型迁移失败: {exc}")
 
     def _ensure_community_moderation_status_types(self, cursor):
         """Migrate pre-merge string states on posts/comments to numeric states."""
@@ -1891,7 +1903,7 @@ class DatabaseManager:
                     `order_no` varchar(64) NOT NULL COMMENT '订单号',
                     `type` tinyint DEFAULT '1' COMMENT '1会员 2爆灯 3牵线套餐 4置顶曝光 5活动报名 6虚拟商品',
                     `product_id` bigint DEFAULT NULL COMMENT '商品ID',
-                    `product_type` tinyint DEFAULT NULL COMMENT '商品类型 1会员 2爆灯 3置顶曝光 4牵线套餐 5活动报名 6虚拟商品',
+                    `product_type` varchar(64) DEFAULT NULL COMMENT '商品编码，如 monthly、superlike、boost_7d',
                     `product_name` varchar(128) DEFAULT NULL,
                     `amount` decimal(10,2) NOT NULL COMMENT '金额',
                     `pay_type` tinyint DEFAULT '1' COMMENT '1微信支付 2余额 3积分',

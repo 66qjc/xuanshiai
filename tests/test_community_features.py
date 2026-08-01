@@ -404,16 +404,22 @@ async def community_database() -> CommunityDatabaseHarness:
 def route_dependencies(path: str, method: str) -> set[object]:
     method_u = method.upper()
     matches = []
-    for route in app.routes:
-        route_path = getattr(route, "path", None)
+    def walk(routes: object, prefix: str = ""):
+        for route in routes or []:
+            route_path = getattr(route, "path", None)
+            effective_path = f"{prefix}{route_path}" if isinstance(route_path, str) else None
+            yield route, effective_path
+            if hasattr(route, "original_router"):
+                context = getattr(route, "include_context", None)
+                include_prefix = getattr(context, "prefix", "")
+                yield from walk(route.original_router.routes, f"{prefix}{include_prefix}")
+            else:
+                yield from walk(getattr(route, "routes", None), prefix)
+
+    for route, route_path in walk(app.routes):
         methods = getattr(route, "methods", None) or set()
         if route_path == path and method_u in {m.upper() for m in methods}:
             matches.append(route)
-        for child in getattr(route, "routes", []) or []:
-            child_path = getattr(child, "path", None)
-            child_methods = getattr(child, "methods", None) or set()
-            if child_path == path and method_u in {m.upper() for m in child_methods}:
-                matches.append(child)
     if not matches:
         raise AssertionError(f"route not found: {method_u} {path}")
     route = matches[0]
@@ -482,7 +488,11 @@ def test_primary_community_and_social_docs_match_current_contracts() -> None:
     primary_media = community_primary.split("## 11.", 1)[1]
 
     assert "当前未提供话题查询接口" not in community_primary
-    assert "`latest` / `following` / `city` / `liked_users` / `following_and_liked`" in primary_feed
+    assert "`latest` / `following` / `city` / `liked_users` / `following_and_liked` / `mine`" in primary_feed
+    assert "`mode=mine`" in primary_feed
+    assert "评论点赞接口已提供" in community_docs
+    assert "当前未提供：媒体内容流式审核" in community_docs
+    assert "当前未提供：媒体内容流式审核、敏感词三态（替换*/进审）与词库管理 CRUD、评论点赞接口" not in community_docs
     assert '"posts":{"items":' in primary_topic_detail
     assert '"posts":[]' not in primary_topic_detail
     assert '"points_available":false' in primary_quotas
@@ -562,6 +572,42 @@ def test_topic_detail_retains_post_page_metadata() -> None:
     assert detail.posts.page == 2
     assert detail.posts.page_size == 10
     assert detail.posts.total == 23
+
+
+def test_topic_response_compatibility_fields_default_without_persisted_topic_columns() -> None:
+    topic = CommunityTopicResponse(
+        id=1,
+        name="树洞",
+        icon=None,
+        sort=0,
+        post_count=0,
+        participant_count=0,
+        heat=0,
+        joined=False,
+    )
+    assert topic.background_url is None
+    assert topic.description is None
+    assert topic.view_count == 0
+    assert topic.status is None
+
+
+def test_feed_modes_and_stable_order_are_server_side() -> None:
+    where, params = community_service._feed_clauses(
+        "mine", city=None, city_code=None, topic_id=None, filter_key=None, me=None
+    )
+    assert "p.user_id = :user_id" in where
+    assert params == {}
+    assert "p.id DESC" in inspect.getsource(community_service.list_posts)
+
+
+def test_feed_openapi_exposes_mine_mode() -> None:
+    parameter = next(
+        item
+        for item in app.openapi()["paths"]["/api/v1/community/posts"]["get"]["parameters"]
+        if item["name"] == "mode"
+    )
+    modes = str(parameter)
+    assert "mine" in modes
 
 
 @pytest.mark.asyncio
