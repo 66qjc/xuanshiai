@@ -165,7 +165,7 @@ Idempotency-Key: post-20260725-0001
 
 | 参数 | 位置 | 类型 | 必填 | 默认值 | 规则 | 含义 |
 | --- | --- | --- | --- | --- | --- | --- |
-| `mode` | query | string | 否 | `latest` | `latest` / `following` / `city` / `liked_users` / `following_and_liked` | 全站最新 / 我关注用户 / 同城 / 我喜欢用户发布的动态 / 关注与喜欢用户的并集 |
+| `mode` | query | string | 否 | `latest` | `latest` / `following` / `city` / `liked_users` / `following_and_liked` / `mine` | 全站最新 / 我关注用户 / 同城 / 我喜欢用户发布的动态 / 关注与喜欢用户的并集 / 我的动态 |
 | `page` | query | integer | 否 | `1` | `1~1000` | 页码 |
 | `page_size` | query | integer | 否 | `20` | `1~50` | 每页数量 |
 | `city` | query | string/null | 否 | `null` | 最长 64 字符 | `mode=city` 的城市展示名锚点 |
@@ -174,6 +174,8 @@ Idempotency-Key: post-20260725-0001
 | `sort` | query | string | 否 | `latest` | `latest` / `hot` | 排序；`filter=hot` 时按热度 |
 
 `city_code` 提供时只能是 4 或 6 位 ASCII 数字；其他值在 API 边界返回 `422`。同时提供且与 `city` 冲突时，`city_code` 优先。`mode=city` 仅按帖子发布地 `location` 过滤；请求未提供城市时才回落到同城浏览偏好 `community_city_*`，两者都没有可用锚点时返回 `422`。
+
+`mode=mine` 仅返回当前用户作为作者的动态，不接受外部作者 ID。
 
 请求示例：
 
@@ -191,7 +193,7 @@ Authorization: Bearer <access_token>
 | `page_size` | integer | 是 | 不为空 | 当前页大小 |
 | `total` | integer | 是 | 无数据为 `0` | 当前模式下动态总数 |
 
-排序：先按平台置顶字段 `is_top` 倒序，再按 `created_at` 倒序。成功示例：
+排序：先按平台置顶字段 `is_top` 倒序，再按 `created_at` 倒序，最后按 `id` 倒序保证分页稳定。成功示例：
 
 ```json
 {"items":[],"page":1,"page_size":20,"total":0}
@@ -401,7 +403,7 @@ Authorization: Bearer <access_token>
 
 | 参数 | 位置 | 类型 | 必填 | 默认值 | 规则 | 含义 |
 | --- | --- | --- | --- | --- | --- | --- |
-| `mode` | query | string | 否 | `latest` | `latest` / `following` / `city` / `liked_users` / `following_and_liked` | 最新、关注、同城、喜欢用户动态、关注∪喜欢并集 |
+| `mode` | query | string | 否 | `latest` | `latest` / `following` / `city` / `liked_users` / `following_and_liked` / `mine` | 最新、关注、同城、喜欢用户动态、关注∪喜欢并集、我的动态 |
 | `city` | query | string/null | 否 | `null` | 最长 64；`mode=city` 展示名兼容 | 同城城市名 |
 | `city_code` | query | string/null | 否 | `null` | 市一级 6 位码（如 `330100`）；短码 4 位右补 `00` | 同城主键，优先于 name |
 | `filter` | query | string/null | 否 | `null` | `all` / `mbti` / `alumni` / `hometown` / `hot` / `latest` | 发现页二级筛选或热度 |
@@ -412,6 +414,12 @@ Authorization: Bearer <access_token>
 发现页 `same_city` 仍只看资料 `residence_city_code`，与同城偏好无关。
 
 `mode=following_and_liked`：作者在 `user_favorite` 且 `user_id=me` 且 `type IN (1, 3)`（喜欢用户 ∪ 关注），服务端去重 + COUNT 分页。关注 Tab「全部」应对接此 mode，禁止客户端双请求假并集。
+
+`mode=mine` 仅返回当前用户作为作者的动态，不接受外部作者 ID。
+
+`mode=mine`：仅返回当前登录用户作为作者的动态，服务端追加 `p.user_id = 当前用户` 条件，并继续应用状态、审核、删除、隐私、拉黑和分页规则。该模式不接受额外作者 ID，避免通过查询参数越权读取其他用户动态。
+
+动态流排序的最终稳定键为 `p.id DESC`：同置顶状态、同热度、同创建时间的动态仍保持确定顺序，翻页时不会因数据库非确定排序导致重复或遗漏。
 
 ### 6.3 收藏 / 取消收藏
 
@@ -518,6 +526,10 @@ Authorization: Bearer <access_token>
 | `heat` | integer | `participant_count*10 + post_count` |
 | `joined` | boolean | 当前用户是否参与 |
 | `created_at` | datetime/null | 创建时间 |
+| `background_url` | string/null | 兼容字段；当前版本未持久化背景配置时为 `null` |
+| `description` | string/null | 兼容字段；当前版本未持久化话题简介时为 `null` |
+| `view_count` | integer | 话题浏览量；当前版本未持久化统计时为 `0` |
+| `status` | integer/string/null | 兼容字段；当前版本沿用 `is_active` 查询且未单独返回状态时为 `null` |
 
 ## 8. 线下活动
 
@@ -1087,7 +1099,19 @@ Legacy clients may continue sending all three fields without a breaking change:
 The stored name and phone are nevertheless taken from the canonical account
 records, not these request values.
 
-当前未提供：媒体内容流式审核、敏感词三态（替换*/进审）与词库管理 CRUD、评论点赞接口、纸飞机语音、纸飞机回复自动转私信、独立话题参与表。`join_topic` 仅做存在性校验与幂等成功，不以独立表记录参与。
+当前未提供：媒体内容流式审核、敏感词三态（替换*/进审）与词库管理 CRUD、纸飞机语音、纸飞机回复自动转私信。评论点赞接口已提供（见评论点赞契约）；话题参与已使用独立表 `community_topic_participant`，`join_topic` 对 `(topic_id, user_id)` 幂等写入。
+
+### 7.x 评论点赞
+
+#### `PUT /api/v1/community/comments/{comment_id}/like`
+
+#### `DELETE /api/v1/community/comments/{comment_id}/like`
+
+两接口要求登录、绑定手机号并通过实名认证，无请求体，成功返回完整 `CommunityCommentResponse`。重复点赞或重复取消均保持幂等，返回当前评论状态。
+
+资源不可见时不通过点赞接口泄露存在性：评论不存在、已删除、已下架，或所属动态对当前用户不可见时返回 `404`；当前用户被评论作者拉黑时返回 `403`。评论点赞计数以有效点赞记录为准，客户端应使用响应中的 `like_count` 和 `is_liked` 更新本地状态。
+
+**变更记录（2026-08-01）**：补齐评论点赞正式契约，删除旧的“当前未提供”描述；接口路径和响应保持兼容。
 
 ### 2026-07-28（社区内容审核）
 

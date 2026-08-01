@@ -206,7 +206,7 @@ async def post(
 @router.get("/community/posts", response_model=CommunityPostPage, summary="查看动态流")
 async def feed(
     mode: Literal[
-        "latest", "following", "city", "liked_users", "following_and_liked"
+        "latest", "following", "city", "liked_users", "following_and_liked", "mine"
     ] = Query("latest"),
     page: int = Query(1, ge=1, le=1000),
     page_size: int = Query(20, ge=1, le=50),

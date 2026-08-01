@@ -133,6 +133,12 @@ class CommunityTopicResponse(BaseModel):
     heat: int
     joined: bool
     created_at: datetime | None = None
+    # Optional compatibility fields. The current topic table does not persist
+    # these values yet, so existing responses keep null/zero defaults.
+    background_url: str | None = None
+    description: str | None = None
+    view_count: int = Field(default=0, ge=0)
+    status: int | str | None = None
 
 
 class CommunityTopicPage(BaseModel):
