@@ -133,6 +133,7 @@ class ModerationItem(BaseModel):
     user_id: int
     status: Literal["pending", "approved", "rejected", "replaced", "deleted", "hidden"]
     risk_level: int
+    provider: str = "local"
     matched_words: list[str]
     raw_content: str | None
     display_content: str | None

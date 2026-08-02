@@ -3,7 +3,7 @@
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field, model_validator
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -65,6 +65,24 @@ class Settings(BaseSettings):
     superlike_daily_free_limit: int = 1
     superlike_daily_vip_limit: int = 3
     paper_plane_daily_limit: int = 3
+
+    # Optional second-layer text moderation. The provider is disabled until
+    # the purchased marketplace API path and AppCode are configured.
+    aliyun_content_moderation_enabled: bool = False
+    aliyun_content_moderation_base_url: str = (
+        "https://lxmingan.market.alicloudapi.com"
+    )
+    aliyun_content_moderation_path: str = "/YOUR_API_PATH"
+    aliyun_content_moderation_app_code: SecretStr | None = None
+    aliyun_content_moderation_request_mode: Literal["json", "form"] = "json"
+    aliyun_content_moderation_text_field: str = "text"
+    aliyun_content_moderation_timeout_seconds: float = Field(
+        default=2.5, gt=0, le=10
+    )
+    aliyun_content_moderation_fail_mode: Literal["review", "reject"] = "review"
+    aliyun_content_moderation_default_action: Literal[
+        "manual_review", "reject", "replace"
+    ] = "manual_review"
 
     # Optional environment overrides for commercial configuration. When unset,
     # the corresponding database configuration remains the fallback.
@@ -138,6 +156,14 @@ class Settings(BaseSettings):
             len(self.sms_mock_code) != 6 or not self.sms_mock_code.isdigit()
         ):
             raise ValueError("SMS_MOCK_CODE 必须是6位数字")
+        if (
+            self.environment == "production"
+            and self.aliyun_content_moderation_enabled
+            and not self.aliyun_content_moderation_app_code
+        ):
+            raise ValueError(
+                "生产环境启用阿里云敏感词服务时必须配置 AppCode"
+            )
         return self
 
 

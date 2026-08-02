@@ -22,6 +22,7 @@ class ContentDecision:
     display_content: str
     matched_words: tuple[str, ...] = ()
     max_level: int = 0
+    provider: str = "local"
 
 
 def clear_sensitive_word_cache() -> None:
@@ -121,3 +122,41 @@ async def decide_text(db: AsyncSession, content: str | None) -> ContentDecision:
     for token in sorted(unique, key=len, reverse=True):
         display = display.replace(token, "*" * max(1, len(token)))
     return ContentDecision("replace", display, unique, level)
+
+
+async def moderate_text(
+    db: AsyncSession,
+    content: str | None,
+    *,
+    field: str = "内容",
+) -> ContentDecision:
+    """Apply local rules first, then the optional external provider once."""
+    # Keep the existing assertion hook for compatibility with callers and
+    # tests. It blocks local reject rules before any external request.
+    await assert_text_allowed(db, content, field=field)
+    local_decision = await decide_text(db, content)
+    if local_decision.action == "reject":
+        return local_decision
+
+    from app.services.aliyun_content_moderation import moderate_with_aliyun
+
+    provider_decision = await moderate_with_aliyun(content or "")
+    if provider_decision.action == "allow":
+        return local_decision
+
+    display_content = content or ""
+    if provider_decision.action == "replace":
+        for token in sorted(provider_decision.matched_words, key=len, reverse=True):
+            if token:
+                display_content = display_content.replace(
+                    token,
+                    "*" * max(1, len(token)),
+                )
+
+    return ContentDecision(
+        action=provider_decision.action,
+        display_content=display_content,
+        matched_words=provider_decision.matched_words,
+        max_level=provider_decision.risk_level,
+        provider=provider_decision.provider,
+    )
