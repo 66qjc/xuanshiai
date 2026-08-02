@@ -50,6 +50,16 @@ class WechatLoginRequest(BaseModel):
     app_version: str | None = Field(default=None, max_length=32)
 
 
+class ExistingAccountLoginRequest(BaseModel):
+    """Login an existing local account with its phone and password."""
+
+    phone: str = Field(pattern=r"^1[3-9]\d{9}$")
+    password: str = Field(min_length=8, max_length=128)
+    device_id: str | None = Field(default=None, max_length=128)
+    platform: str | None = Field(default=None, max_length=32)
+    app_version: str | None = Field(default=None, max_length=32)
+
+
 class BindPhoneRequest(PhoneLoginRequest):
     pass
 

@@ -15,6 +15,18 @@ Content-Type: application/json
 
 登录、刷新 Token 和发送短信不需要登录；微信登录需要配置微信 `AppID` 和 `AppSecret`；短信登录需要配置短信服务。
 
+## 1.1 已有账号测试登录
+
+### `POST /api/v1/auth/test-login`
+
+仅 `development`/`testing` 环境开放，用于没有短信或微信第三方 API 时使用手机号和密码登录已有账号。不会创建新账号：
+
+```json
+{"phone":"13900000001","password":"password123","device_id":"dev-device-01","platform":"devtools","app_version":"test"}
+```
+
+账号不存在返回 `404`，密码错误返回 `401`，冻结/注销账号返回 `403`。密码必须在 `users.password` 中保存为 bcrypt 哈希，不能保存明文。成功返回与手机号/微信登录相同的 `TokenResponse`，并遵守现有会话数量限制。`staging`/`production` 环境固定返回 `403`。
+
 ## 2. 发送短信验证码
 
 ### 基本信息

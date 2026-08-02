@@ -7,8 +7,11 @@ from datetime import UTC, datetime, timedelta
 
 from jose import JWTError, jwt
 from cryptography.fernet import Fernet
+import bcrypt
 
 from app.core.config import settings
+
+
 
 
 def hash_token(value: str) -> str:
@@ -44,6 +47,19 @@ def random_token() -> str:
 def hash_passwordless_code(code: str) -> str:
     """Hash SMS codes before persistence; the raw code never enters the database."""
     return hash_token(code)
+
+
+def hash_password(password: str) -> str:
+    """Hash an account password; plaintext passwords must never be persisted."""
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+
+def verify_password(password: str, password_hash: str) -> bool:
+    """Verify a password against a bcrypt hash without exposing comparison details."""
+    try:
+        return bcrypt.checkpw(password.encode("utf-8"), password_hash.encode("utf-8"))
+    except (ValueError, TypeError, UnicodeError):
+        return False
 
 
 def encrypt_sensitive(value: str) -> str:

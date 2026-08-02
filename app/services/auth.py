@@ -19,6 +19,7 @@ from app.core.security import (
     hash_token,
     mask_id_card,
     random_token,
+    verify_password,
 )
 from app.schemas.auth import (
     BindPhoneRequest,
@@ -26,6 +27,7 @@ from app.schemas.auth import (
     RealNameRequest,
     RefreshRequest,
     WechatLoginRequest,
+    ExistingAccountLoginRequest,
 )
 from app.services.sms.providers import get_sms_provider
 from app.services.wechat.providers import get_wechat_provider
@@ -225,6 +227,28 @@ async def login_wechat(db: AsyncSession, request: WechatLoginRequest, ip: str | 
         tokens = await create_session(db, user_id, request.device_id, request.platform, request.app_version, ip, user_agent)
         await db.execute(text("INSERT INTO user_login_log (user_id, login_type, ip, device) VALUES (:id, 1, :ip, :device)"), {"id": user_id, "ip": ip, "device": user_agent})
     tokens["need_bind_phone"] = not bool(phone)
+    return tokens
+
+
+async def login_existing_account(db: AsyncSession, request: ExistingAccountLoginRequest, ip: str | None, user_agent: str | None) -> dict[str, Any]:
+    """Issue a normal session for an existing account without SMS/WeChat."""
+    if not settings.is_test_mode:
+        raise HTTPException(403, detail="已有账号测试登录仅允许在 development/testing 环境使用")
+    user_agent = normalize_user_agent(user_agent)
+    async with db.begin():
+        result = await db.execute(text("SELECT id, phone, password, status FROM users WHERE phone = :phone FOR UPDATE"), {"phone": request.phone})
+        row = result.mappings().first()
+        if not row:
+            raise HTTPException(404, detail="账号不存在")
+        if int(row["status"]) != 1:
+            raise HTTPException(403, detail="账号当前不可用")
+        if not row["password"] or not verify_password(request.password, row["password"]):
+            raise HTTPException(401, detail="手机号或密码错误")
+        await ensure_default_user_role(db, int(row["id"]))
+        await db.execute(text("UPDATE users SET last_login_at = UTC_TIMESTAMP() WHERE id = :id"), {"id": row["id"]})
+        tokens = await create_session(db, int(row["id"]), request.device_id, request.platform, request.app_version, ip, user_agent)
+        await db.execute(text("INSERT INTO user_login_log (user_id, login_type, ip, device) VALUES (:id, 3, :ip, :device)"), {"id": row["id"], "ip": ip, "device": user_agent})
+    tokens["need_bind_phone"] = not bool(row["phone"])
     return tokens
 
 
