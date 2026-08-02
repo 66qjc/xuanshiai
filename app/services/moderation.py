@@ -42,7 +42,7 @@ async def list_moderation_items(db: AsyncSession, *, page: int, page_size: int, 
     where_sql = " AND ".join(where)
     total = int((await db.execute(text(f"SELECT COUNT(*) FROM community_moderation_task WHERE {where_sql}"), params)).scalar() or 0)
     result = await db.execute(text(f"""SELECT id, target_type, target_id, user_id, status,
-        risk_level, matched_words, raw_content, display_content, reason, created_at, expires_at
+        risk_level, provider, matched_words, raw_content, display_content, reason, created_at, expires_at
         FROM community_moderation_task WHERE {where_sql}
         ORDER BY risk_level DESC, created_at ASC, id ASC LIMIT :limit OFFSET :offset"""), params)
     items = []

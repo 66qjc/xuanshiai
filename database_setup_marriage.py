@@ -299,6 +299,9 @@ class DatabaseManager:
                 'moderated_by': "`moderated_by` bigint unsigned DEFAULT NULL",
                 'moderated_at': "`moderated_at` datetime DEFAULT NULL",
             },
+            'community_moderation_task': {
+                'provider': "`provider` varchar(32) NOT NULL DEFAULT 'local' COMMENT 'local/aliyun_market/manual'",
+            },
             'config_sensitive_word': {
                 'action': "`action` varchar(24) NOT NULL DEFAULT 'replace' COMMENT 'reject/replace/manual_review'",
             },
@@ -2150,6 +2153,7 @@ class DatabaseManager:
                     `user_id` bigint unsigned NOT NULL,
                     `status` varchar(24) NOT NULL DEFAULT 'pending' COMMENT 'pending/approved/rejected/replaced/deleted/hidden',
                     `risk_level` tinyint NOT NULL DEFAULT '1',
+                    `provider` varchar(32) NOT NULL DEFAULT 'local' COMMENT 'local/aliyun_market/manual',
                     `matched_words` json DEFAULT NULL,
                     `raw_content` text,
                     `display_content` text,

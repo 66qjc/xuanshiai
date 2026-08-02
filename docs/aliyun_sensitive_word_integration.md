@@ -699,4 +699,24 @@ hit response
 error response
 ```
 
+### Existing database migration
+
+`database_setup_marriage.py` adds the `provider` column for newly initialized
+databases and attempts to add it during startup for older databases. For a
+production database where automatic schema initialization is disabled, run the
+following once during a maintenance window after taking a backup:
+
+```sql
+ALTER TABLE community_moderation_task
+    ADD COLUMN provider varchar(32) NOT NULL DEFAULT 'local'
+    COMMENT 'local/aliyun_market/manual'
+    AFTER status;
+```
+
+If the column already exists, do not run the statement again. Verify it with:
+
+```sql
+SHOW COLUMNS FROM community_moderation_task LIKE 'provider';
+```
+
 这些字段确认后，适配器中的 `YOUR_API_PATH`、请求字段和结果解析器才能改成完全准确的生产实现。
