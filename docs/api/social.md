@@ -290,11 +290,54 @@ Authorization: Bearer <access_token>
 
 #### `DELETE /api/v1/chat/messages/{message_id}`
 
-请求体无，成功状态 `204 No Content`。只能撤回自己发送且尚未撤回的消息；撤回后查询接口返回 `content="消息已撤回"`、`media_url=null`、`revoked=true`。消息不存在、不是本人发送或已撤回时返回：
+请求体无，成功状态 `204 No Content`。只能撤回自己发送的消息；重复撤回保持幂等。撤回后查询接口返回 `content="消息已撤回"`、`media_url=null`、`revoked=true`。消息不存在或不是本人发送时返回：
 
 ```json
 {"detail":"消息不存在或无法撤回"}
 ```
+
+#### `POST /api/v1/chat/messages/{message_id}/recall`
+
+**兼容变更（2026-08-03）：** 新增返回消息状态的撤回接口。它与 `DELETE /api/v1/chat/messages/{message_id}` 调用同一服务层逻辑；旧接口继续返回 `204 No Content`，本接口返回消息对象，前端可按客户端版本选择。
+
+- 权限：登录用户，且必须是消息发送者和当前会话成员。
+- 请求体：无请求体。
+- 成功状态：`200 OK`。
+- 重复撤回：幂等返回已撤回状态，不重复更新撤回时间。
+- 普通用户看到 `content="消息已撤回"`、`media_url=null`；原文保留在数据库，管理员仅能在举报/治理场景按权限查看并写审计日志。
+
+请求示例：
+
+```http
+POST http://127.0.0.1:8000/api/v1/chat/messages/101/recall
+Authorization: Bearer <access_token>
+Content-Type: application/json
+```
+
+无请求体。
+
+响应新增字段：`revoked` 为旧客户端兼容字段；`is_recalled` 为新撤回状态；`recalled_at` 为实际撤回时间。其余字段与 `ChatMessageResponse` 相同。
+
+成功响应：
+
+```json
+{
+  "id": 101,
+  "session_id": 8,
+  "from_user_id": 23,
+  "to_user_id": 41,
+  "type": 1,
+  "content": "消息已撤回",
+  "media_url": null,
+  "is_read": true,
+  "revoked": true,
+  "is_recalled": true,
+  "recalled_at": "2026-08-03T10:02:00",
+  "created_at": "2026-08-03T10:00:00"
+}
+```
+
+错误：`401` 未登录；`403` 非会话成员、已拉黑或没有匹配；`404` 消息不存在、非本人消息或资源不可见；`422` 非法消息 ID。前端对 `404` 统一按消息不可用处理，不根据错误差异推断资源存在性。
 
 ## 4. 通知
 
@@ -509,3 +552,13 @@ Authorization: Bearer <access_token>
 - 关注只在首次写入关系时产生 `follow` 通知；重复 `PUT`、取消关注不产生通知。动态/评论点赞同样只在首次点赞时通知。
 - 兼容性：旧通知行的目标字段可为 `null`；旧客户端继续读取 `related_id`。新客户端不得假定所有通知都可导航。
 - 通知标题和正文预览由中央写入器分别限制为 128 和 255 字符；长评论仍可正常发布，通知仅保存截断预览。
+## 3.4 撤回兼容接口（2026-08-03）
+
+保留 `DELETE /api/v1/chat/messages/{message_id}`（成功 `204 No Content`），同时提供 `POST /api/v1/chat/messages/{message_id}/recall`（成功 `200 OK` 并返回消息对象）。两个接口调用同一撤回逻辑，发送者归属校验、会话权限校验和幂等行为一致；前端按客户端版本选择调用。
+
+撤回后的响应同时返回兼容字段 `revoked=true`、`is_recalled=true` 和 `recalled_at`；普通用户看到 `content="消息已撤回"`、`media_url=null`。数据库保留原消息和撤回时间，管理员取证接口可继续读取原始数据。不存在、非本人消息或无权访问会话返回 `404`。
+
+## 3.5 限制与总封禁边界
+
+社区发帖、评论、纸飞机发布/回复/会话消息和认识申请由服务层检查 `user_restriction`。`TOTAL_BAN` 覆盖所有写入动作；专项限制只覆盖对应动作。限制表不可用时接口返回 `503`，不放行写入。总封禁数据保留，但发现卡片、社区帖子、纸飞机公开列表等普通用户/父母端公开查询不返回被封禁用户。
+高风险写入接口在实名认证通过后还要求 `user_auth.face_verified=1`。双重认证的定义是“姓名+身份证实名认证通过”与“人脸识别认证通过”同时成立；旧客户端仍可继续使用原路径，但服务端不会把缺少人脸认证当作已认证。

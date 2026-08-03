@@ -35,6 +35,7 @@ from app.services.social import (
     mark_messages_read,
     mark_notification_read,
     revoke_message,
+    recall_message,
     send_message,
     set_block,
     set_follow,
@@ -119,6 +120,11 @@ async def read_messages(session_id: int = Path(..., ge=1), current: CurrentUser 
 @router.delete("/chat/messages/{message_id}", status_code=204, summary="撤回聊天消息")
 async def revoke(message_id: int = Path(..., ge=1), current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> None:
     await revoke_message(db, current.id, message_id)
+
+
+@router.post("/chat/messages/{message_id}/recall", response_model=ChatMessageResponse, summary="撤回聊天消息并返回最新状态")
+async def recall(message_id: int = Path(..., ge=1), current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> ChatMessageResponse:
+    return await recall_message(db, current.id, message_id)
 
 
 @router.get("/notifications", response_model=NotificationPage, summary="查看消息通知")
