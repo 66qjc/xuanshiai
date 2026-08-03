@@ -1095,6 +1095,26 @@ class DatabaseManager:
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='拉黑记录'
             """,
 
+            'user_restriction': """
+                CREATE TABLE IF NOT EXISTS `user_restriction` (
+                    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+                    `user_id` bigint unsigned NOT NULL,
+                    `restriction_type` varchar(32) NOT NULL COMMENT 'TOTAL_BAN/POST_RESTRICTED/COMMENT_RESTRICTED/MESSAGE_RESTRICTED/APPLICATION_RESTRICTED',
+                    `reason_code` varchar(64) NOT NULL,
+                    `reason` varchar(255) NOT NULL,
+                    `starts_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    `ends_at` datetime DEFAULT NULL,
+                    `status` tinyint NOT NULL DEFAULT '1' COMMENT '1生效 2已解除',
+                    `ended_at` datetime DEFAULT NULL,
+                    `created_by` bigint unsigned NOT NULL,
+                    `note` varchar(1000) DEFAULT NULL,
+                    `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (`id`),
+                    KEY `idx_user_restriction_active` (`user_id`, `status`, `restriction_type`, `ends_at`),
+                    KEY `idx_user_restriction_created` (`created_at`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='用户功能限制与封禁记录'
+            """,
+
             # ============================================
             # 7. 举报记录
             # ============================================

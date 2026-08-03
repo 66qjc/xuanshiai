@@ -77,6 +77,8 @@ class ChatMessageResponse(BaseModel):
     media_url: str | None
     is_read: bool
     revoked: bool
+    is_recalled: bool = False
+    recalled_at: datetime | None = None
     created_at: datetime
 
 
@@ -183,7 +185,7 @@ class ReportDetailResponse(BaseModel):
     description: str | None
     status: Literal[0, 1, 2]
     result: str | None
-    action: Literal["none", "hide_content", "restore_content", "dismiss"] = "none"
+    action: Literal["none", "hide_content", "restore_content", "restrict_user", "dismiss"] = "none"
     reviewed_at: datetime | None = None
     created_at: datetime
     updated_at: datetime | None = None

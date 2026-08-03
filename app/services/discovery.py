@@ -43,6 +43,7 @@ from app.schemas.discovery import (
 from app.services.notifications import emit_notification
 from app.services.profile import _calculate_age, _json_dict, _json_list, get_profile
 from app.services.quotas import consume_extra
+from app.services.restrictions import ensure_user_allowed
 
 logger = logging.getLogger(__name__)
 
@@ -276,6 +277,7 @@ async def _fetch_rows(
     }
     clauses = [
         "u.id <> :viewer_id", "u.status = 1", "COALESCE(c.score, 0) >= 100",
+        "NOT EXISTS (SELECT 1 FROM user_restriction ban WHERE ban.user_id = u.id AND ban.restriction_type = 'TOTAL_BAN' AND ban.status = 1 AND ban.starts_at <= UTC_TIMESTAMP() AND (ban.ends_at IS NULL OR ban.ends_at > UTC_TIMESTAMP()))",
         "COALESCE(pr.show_profile, 1) = 1",
         "COALESCE(pr.who_can_see_me, 1) <> 4", "COALESCE(pr.match_status, 1) = 1",
         "(:viewer_is_vip = 1 OR COALESCE(pr.who_can_see_me, 1) <> 3)",
@@ -499,6 +501,7 @@ async def _target_rows(db: AsyncSession, viewer_id: int, target_ids: list[int]) 
     result = await db.execute(
         text(CARD_SELECT + f""" WHERE u.id IN ({placeholders}) AND u.status = 1
                  AND COALESCE(pr.who_can_see_me, 1) <> 4
+                 AND NOT EXISTS (SELECT 1 FROM user_restriction ban WHERE ban.user_id = u.id AND ban.restriction_type = 'TOTAL_BAN' AND ban.status = 1 AND ban.starts_at <= UTC_TIMESTAMP() AND (ban.ends_at IS NULL OR ban.ends_at > UTC_TIMESTAMP()))
                  AND COALESCE(pr.match_status, 1) = 1
                  AND NOT EXISTS (SELECT 1 FROM user_media pending_media
                      WHERE pending_media.user_id = u.id AND pending_media.deleted_at IS NULL
@@ -738,6 +741,7 @@ async def _refund_quota_after_database_failure(key: str) -> None:
 
 
 async def create_application(db: AsyncSession, viewer_id: int, target_id: int, request: ApplicationCreateRequest) -> ApplicationResponse:
+    await ensure_user_allowed(db, viewer_id, "APPLICATION_RESTRICTED")
     await _lock_user_pair(db, viewer_id, target_id)
     await _ensure_target(db, viewer_id, target_id)
     await _expire_pending_applications(db)

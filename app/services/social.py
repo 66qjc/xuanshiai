@@ -43,6 +43,9 @@ from app.schemas.admin import (
 from app.services.discovery import _ensure_target, _target_rows
 from app.services.notifications import emit_notification
 from app.services.profile import _calculate_age
+from app.services.restrictions import ensure_user_allowed
+from app.services.restrictions import create_restriction
+from app.schemas.restrictions import RestrictionCreate
 
 
 def _social_user(row: dict[str, Any]) -> SocialUser:
@@ -174,6 +177,11 @@ async def list_chat_sessions(db: AsyncSession, user_id: int, page: int, page_siz
           AND EXISTS (SELECT 1 FROM user_match um WHERE um.user_id = :user_id
                       AND um.target_user_id = CASE WHEN s.user1_id = :user_id THEN s.user2_id ELSE s.user1_id END
                       AND um.status IN (1, 2))
+          AND NOT EXISTS (SELECT 1 FROM user_restriction ban
+                          WHERE ban.user_id = CASE WHEN s.user1_id = :user_id THEN s.user2_id ELSE s.user1_id END
+                            AND ban.restriction_type = 'TOTAL_BAN' AND ban.status = 1
+                            AND ban.starts_at <= UTC_TIMESTAMP()
+                            AND (ban.ends_at IS NULL OR ban.ends_at > UTC_TIMESTAMP()))
           AND NOT EXISTS (SELECT 1 FROM user_block ub WHERE (ub.user_id = :user_id
                       AND ub.target_user_id = CASE WHEN s.user1_id = :user_id THEN s.user2_id ELSE s.user1_id END)
                    OR (ub.target_user_id = :user_id
@@ -186,6 +194,11 @@ async def list_chat_sessions(db: AsyncSession, user_id: int, page: int, page_siz
           AND EXISTS (SELECT 1 FROM user_match um WHERE um.user_id = :user_id
                       AND um.target_user_id = CASE WHEN s.user1_id = :user_id THEN s.user2_id ELSE s.user1_id END
                       AND um.status IN (1, 2))
+          AND NOT EXISTS (SELECT 1 FROM user_restriction ban
+                          WHERE ban.user_id = CASE WHEN s.user1_id = :user_id THEN s.user2_id ELSE s.user1_id END
+                            AND ban.restriction_type = 'TOTAL_BAN' AND ban.status = 1
+                            AND ban.starts_at <= UTC_TIMESTAMP()
+                            AND (ban.ends_at IS NULL OR ban.ends_at > UTC_TIMESTAMP()))
           AND NOT EXISTS (SELECT 1 FROM user_block ub WHERE (ub.user_id = :user_id
                       AND ub.target_user_id = CASE WHEN s.user1_id = :user_id THEN s.user2_id ELSE s.user1_id END)
                    OR (ub.target_user_id = :user_id
@@ -197,7 +210,20 @@ async def list_chat_sessions(db: AsyncSession, user_id: int, page: int, page_siz
 
 def _message(row: dict[str, Any]) -> ChatMessageResponse:
     revoked = row.get("revoked_at") is not None
-    return ChatMessageResponse(id=int(row["id"]), session_id=int(row["session_id"]), from_user_id=int(row["from_user_id"]), to_user_id=int(row["to_user_id"]), type=int(row["type"]), content="消息已撤回" if revoked else row.get("content"), media_url=None if revoked else row.get("media_url"), is_read=bool(row["is_read"]), revoked=revoked, created_at=row["created_at"])
+    return ChatMessageResponse(
+        id=int(row["id"]),
+        session_id=int(row["session_id"]),
+        from_user_id=int(row["from_user_id"]),
+        to_user_id=int(row["to_user_id"]),
+        type=int(row["type"]),
+        content="消息已撤回" if revoked else row.get("content"),
+        media_url=None if revoked else row.get("media_url"),
+        is_read=bool(row["is_read"]),
+        revoked=revoked,
+        is_recalled=revoked,
+        recalled_at=row.get("revoked_at"),
+        created_at=row["created_at"],
+    )
 
 
 async def list_messages(db: AsyncSession, user_id: int, session_id: int, page: int, page_size: int) -> list[ChatMessageResponse]:
@@ -207,6 +233,7 @@ async def list_messages(db: AsyncSession, user_id: int, session_id: int, page: i
 
 
 async def send_message(db: AsyncSession, user_id: int, session_id: int, request: ChatMessageCreate) -> ChatMessageResponse:
+    await ensure_user_allowed(db, user_id, "MESSAGE_RESTRICTED")
     session, target_id = await _session(db, user_id, session_id)
     result = await db.execute(text("""INSERT INTO chat_message (session_id, from_user_id, to_user_id, type, content, media_url)
         VALUES (:session_id, :from_id, :to_id, :type, :content, :media_url)"""), {"session_id": session_id, "from_id": user_id, "to_id": target_id, **request.model_dump()})
@@ -228,14 +255,26 @@ async def mark_messages_read(db: AsyncSession, user_id: int, session_id: int) ->
     await db.commit()
 
 
-async def revoke_message(db: AsyncSession, user_id: int, message_id: int) -> None:
-    result = await db.execute(text("SELECT id, session_id FROM chat_message WHERE id = :id AND from_user_id = :user_id AND revoked_at IS NULL"), {"id": message_id, "user_id": user_id})
+async def recall_message(db: AsyncSession, user_id: int, message_id: int) -> ChatMessageResponse:
+    result = await db.execute(text("""SELECT id, session_id, from_user_id, to_user_id, type,
+        content, media_url, is_read, revoked_at, created_at
+        FROM chat_message WHERE id = :id AND from_user_id = :user_id"""), {"id": message_id, "user_id": user_id})
     row = result.mappings().first()
     if not row:
         raise HTTPException(404, detail="消息不存在或无法撤回")
     await _session(db, user_id, int(row["session_id"]))
-    await db.execute(text("UPDATE chat_message SET revoked_at = UTC_TIMESTAMP() WHERE id = :id"), {"id": message_id})
+    if row.get("revoked_at") is None:
+        await db.execute(text("UPDATE chat_message SET revoked_at = UTC_TIMESTAMP() WHERE id = :id"), {"id": message_id})
+        refreshed = await db.execute(text("SELECT revoked_at FROM chat_message WHERE id = :id"), {"id": message_id})
+        row = dict(row)
+        row["revoked_at"] = refreshed.scalar()
     await db.commit()
+    return _message(dict(row))
+
+
+async def revoke_message(db: AsyncSession, user_id: int, message_id: int) -> None:
+    """Backward-compatible 204 endpoint; the recall endpoint returns the message projection."""
+    await recall_message(db, user_id, message_id)
 
 
 async def list_notifications(db: AsyncSession, user_id: int, page: int, page_size: int) -> NotificationPage:
@@ -831,6 +870,7 @@ async def review_report(db: AsyncSession, report_id: int, request: ReportReviewR
     status = request.status
 
     content_moderated = False
+    restriction_created = False
     target_type = row.get("target_type") or "user"
     target_id = row.get("target_id")
     if action in ("hide_content", "restore_content"):
@@ -846,6 +886,20 @@ async def review_report(db: AsyncSession, report_id: int, request: ReportReviewR
             source_report_id=report_id if action == "hide_content" else None,
         )
         content_moderated = True
+    if action == "restrict_user":
+        await create_restriction(
+            db,
+            int(row["target_user_id"]),
+            RestrictionCreate(
+                restriction_type=request.restriction_type,
+                reason_code=request.restriction_reason_code,
+                reason=request.result,
+                ends_at=request.restriction_ends_at,
+            ),
+            actor_id or 0,
+            commit=False,
+        )
+        restriction_created = True
 
     await db.execute(
         text(
@@ -891,6 +945,7 @@ async def review_report(db: AsyncSession, report_id: int, request: ReportReviewR
         result=request.result,
         action=action,
         content_moderated=content_moderated,
+        restriction_created=restriction_created,
     )
 
 

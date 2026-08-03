@@ -55,7 +55,9 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
 def create_app() -> FastAPI:
     """Create and configure the FastAPI application."""
     application = FastAPI(
-        root_path="/api",  # ← 添加这一行
+        # The router already carries the public /api/v1 prefix. Keeping a
+        # second /api root path makes local requests resolve as /api/api/v1.
+        root_path="",
         title=settings.app_name,
         version=settings.app_version,
         debug=settings.debug,
