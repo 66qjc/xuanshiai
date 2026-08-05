@@ -46,21 +46,23 @@ IMAGE_MAX_PIXELS = 25_000_000
 COMPLETION_RULES: tuple[tuple[str, str, int], ...] = (
     ("gender", "性别", 7),
     ("birthday", "出生日期/年龄", 7),
-    ("location", "所在地区", 7),
+    ("location", "所在地区", 5),
     ("marriage", "婚姻状况", 5),
     ("occupation", "职业", 4),
     ("education", "学历", 4),
     ("income", "收入", 4),
     ("height", "身高", 4),
+    ("weight", "体重", 4),
+    ("hometown", "家乡", 4),
     ("avatar", "头像", 15),
     ("intro", "自我介绍", 10),
-    ("album", "相册", 10),
+    ("album", "相册", 8),
     ("interest", "兴趣标签", 5),
     ("personality", "性格标签", 3),
     ("mbti", "MBTI", 2),
     ("preference", "择偶要求", 3),
     ("realname", "实名认证", 5),
-    ("single_pledge", "单身承诺", 5),
+    ("single_pledge", "单身承诺", 1),
 )
 
 INTRO_TEMPLATES: tuple[dict[str, str], ...] = (
@@ -324,7 +326,8 @@ async def recalculate_completion(db: AsyncSession, user_id: int) -> float:
     result = await db.execute(
         text("""SELECT u.gender, u.birthday, u.is_married, u.avatar, u.is_single_pledge,
                       COALESCE(ua.realname_status, 0) AS realname_status,
-                      p.occupation, p.education_level, p.income, p.height, p.self_intro,
+                      p.occupation, p.education_level, p.income, p.height, p.weight, p.self_intro,
+                      p.hometown_province_code, p.hometown_city_code,
                       p.residence_province_code, p.residence_city_code, p.interest_tags,
                       p.personality_tags, p.mbti, p.tags, pref.age_min AS preference_age_min,
                       pref.age_max AS preference_age_max,
@@ -348,6 +351,8 @@ async def recalculate_completion(db: AsyncSession, user_id: int) -> float:
         "education": row["education_level"] is not None,
         "income": row["income"] is not None,
         "height": row["height"] is not None,
+        "weight": row["weight"] is not None,
+        "hometown": bool(row["hometown_province_code"] and row["hometown_city_code"]),
         "avatar": bool(row["avatar"]),
         "intro": bool(row["self_intro"] and len(row["self_intro"].strip()) >= 20),
         "album": bool(row["album_done"]),
@@ -368,6 +373,8 @@ async def recalculate_completion(db: AsyncSession, user_id: int) -> float:
         "education_completed": completed["education"],
         "income_completed": completed["income"],
         "height_completed": completed["height"],
+        "weight_completed": completed["weight"],
+        "hometown_completed": completed["hometown"],
         "avatar_completed": completed["avatar"],
         "intro_completed": completed["intro"],
         "album_completed": completed["album"],
@@ -380,8 +387,8 @@ async def recalculate_completion(db: AsyncSession, user_id: int) -> float:
     assignments = ", ".join(f"{key} = :{key}" for key in (*columns, "score"))
     await db.execute(
         text(f"""INSERT INTO user_profile_completion (user_id, {', '.join(columns)}, score, algorithm_version, calculated_at)
-                   VALUES (:user_id, {', '.join(f':{key}' for key in columns)}, :score, 'profile-v2', UTC_TIMESTAMP())
-                   ON DUPLICATE KEY UPDATE {assignments}, algorithm_version = 'profile-v2', calculated_at = UTC_TIMESTAMP()"""),
+                   VALUES (:user_id, {', '.join(f':{key}' for key in columns)}, :score, 'profile-v3', UTC_TIMESTAMP())
+                   ON DUPLICATE KEY UPDATE {assignments}, algorithm_version = 'profile-v3', calculated_at = UTC_TIMESTAMP()"""),
         {"user_id": user_id, **{key: int(value) for key, value in columns.items()}, "score": score},
     )
     await db.execute(text("UPDATE users SET data_complete_rate = :score WHERE id = :id"), {"score": score, "id": user_id})
@@ -394,7 +401,8 @@ async def get_completion(db: AsyncSession, user_id: int) -> CompletionResponse:
     result = await db.execute(
         text("""SELECT u.gender, u.birthday, u.is_married, u.is_single_pledge, u.avatar,
                       COALESCE(ua.realname_status, 0) AS realname_status,
-                      p.occupation, p.education_level, p.income, p.height, p.self_intro,
+                      p.occupation, p.education_level, p.income, p.height, p.weight, p.self_intro,
+                      p.hometown_province_code, p.hometown_city_code,
                       p.residence_province_code, p.residence_city_code, p.interest_tags,
                       p.personality_tags, p.mbti, p.tags, pref.age_min AS preference_age_min,
                       pref.age_max AS preference_age_max,
@@ -416,6 +424,8 @@ async def get_completion(db: AsyncSession, user_id: int) -> CompletionResponse:
         "education": row["education_level"] is not None,
         "income": row["income"] is not None,
         "height": row["height"] is not None,
+        "weight": row["weight"] is not None,
+        "hometown": bool(row["hometown_province_code"] and row["hometown_city_code"]),
         "avatar": bool(row["avatar"]),
         "intro": bool(row["self_intro"] and len(row["self_intro"].strip()) >= 20),
         "album": bool(row["album_done"]),

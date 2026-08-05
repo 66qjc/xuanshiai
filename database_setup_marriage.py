@@ -232,6 +232,8 @@ class DatabaseManager:
                 'completion_calculated_at': "`completion_calculated_at` datetime DEFAULT NULL",
             },
             'user_profile_completion': {
+                'weight_completed': "`weight_completed` tinyint NOT NULL DEFAULT '0'",
+                'hometown_completed': "`hometown_completed` tinyint NOT NULL DEFAULT '0'",
                 'mbti_completed': "`mbti_completed` tinyint NOT NULL DEFAULT '0'",
                 'single_pledge_completed': "`single_pledge_completed` tinyint NOT NULL DEFAULT '0'",
             },
@@ -948,6 +950,8 @@ class DatabaseManager:
                     `education_completed` tinyint NOT NULL DEFAULT '0',
                     `income_completed` tinyint NOT NULL DEFAULT '0',
                     `height_completed` tinyint NOT NULL DEFAULT '0',
+                    `weight_completed` tinyint NOT NULL DEFAULT '0',
+                    `hometown_completed` tinyint NOT NULL DEFAULT '0',
                     `avatar_completed` tinyint NOT NULL DEFAULT '0',
                     `intro_completed` tinyint NOT NULL DEFAULT '0',
                     `album_completed` tinyint NOT NULL DEFAULT '0',

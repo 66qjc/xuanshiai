@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ssh myfirst_cloud \"echo '=== xuanshiai.conf ===' && cat /etc/nginx/conf.d/xuanshiai.conf && echo && echo '=== xhztest.conf ===' && cat /etc/nginx/conf.d/xhztest.conf && echo && echo '=== nginx.conf ===' && cat /etc/nginx/nginx.conf\")"
+    ]
+  }
+}

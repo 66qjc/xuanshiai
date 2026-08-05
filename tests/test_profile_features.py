@@ -10,6 +10,7 @@ from app.services.profile import COMPLETION_RULES, IMAGE_MAX_PIXELS, _image_outp
 
 def test_completion_weights_total_100() -> None:
     assert sum(weight for _, _, weight in COMPLETION_RULES) == 100
+    assert {key for key, _, _ in COMPLETION_RULES} >= {"weight", "hometown", "album"}
 
 
 def test_profile_validates_mbti_height_and_tags() -> None:
@@ -23,6 +24,8 @@ def test_profile_validates_mbti_height_and_tags() -> None:
     )
     assert request.mbti == "INTJ"
     assert request.tag_selections["sports"] == ["健身", "跑步"]
+    assert request.interest_tags == ["健身", "旅行", "摄影"]
+    assert request.personality_tags == ["内向但真诚", "温柔细心", "独立自信"]
 
     with pytest.raises(ValidationError):
         ProfileUpdateRequest(height=139)
