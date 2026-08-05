@@ -478,7 +478,7 @@ def test_city_code_requires_four_or_six_ascii_digits_at_schema_and_feed_boundary
 
 
 def test_primary_community_and_social_docs_match_current_contracts() -> None:
-    community_docs = Path("docs/api/community.md").read_text(encoding="utf-8")
+    community_docs = Path("docs/api/社区.md").read_text(encoding="utf-8")
     community_primary = community_docs.split("## 10.", 1)[0]
     primary_feed = community_primary.split("### 2.3", 1)[0]
     primary_topic_detail = community_primary.split(
@@ -507,7 +507,7 @@ def test_primary_community_and_social_docs_match_current_contracts() -> None:
     assert "`ready`" in primary_media and "`bound`" in primary_media
     assert "multipart/form-data" in primary_media
 
-    social_docs = Path("docs/api/social.md").read_text(encoding="utf-8")
+    social_docs = Path("docs/api/社交消息.md").read_text(encoding="utf-8")
     likes = social_docs.split("### 2.1", 1)[1].split("### 2.2", 1)[0]
     follows = social_docs.split("### 2.2", 1)[1].split("### 2.3", 1)[0]
     assert "实名认证通过" in likes
