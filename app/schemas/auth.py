@@ -109,10 +109,23 @@ class ProfileUpdateRequest(BaseModel):
     residence_city_code: str | None = Field(default=None, max_length=32)
     residence_district_code: str | None = Field(default=None, max_length=32)
     self_intro: str | None = Field(default=None, max_length=500)
-    interest_tags: list[str] | None = Field(default=None, max_length=5)
-    personality_tags: list[str] | None = Field(default=None, max_length=5)
+    interest_tags: list[str] | None = Field(
+        default=None,
+        min_length=3,
+        max_length=5,
+        description="兴趣标签，传值时必须选择 3~5 个系统标签",
+    )
+    personality_tags: list[str] | None = Field(
+        default=None,
+        min_length=3,
+        max_length=5,
+        description="性格标签，传值时必须选择 3~5 个系统标签",
+    )
     mbti: MbtiType | None = None
-    tag_selections: dict[str, list[str]] | None = None
+    tag_selections: dict[str, list[str]] | None = Field(
+        default=None,
+        description="扩展标签分类映射，不替代兴趣标签和性格标签",
+    )
 
     @field_validator("interest_tags", "personality_tags")
     @classmethod
