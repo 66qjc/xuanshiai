@@ -16,6 +16,8 @@ from app.schemas.auth import (
     ProfileResponse,
     ProfileUpdateRequest,
     ProfileOverviewResponse,
+    NicknameUpdateRequest,
+    NicknameUpdateResponse,
 )
 from app.services.profile import (
     delete_photo,
@@ -33,6 +35,7 @@ from app.services.profile import (
     upload_photo,
     upload_video,
     get_profile_overview,
+    update_nickname,
 )
 
 router = APIRouter(prefix="/users/me")
@@ -53,6 +56,16 @@ async def profile(current: CurrentUser = Depends(get_current_user), db: AsyncSes
 async def edit_profile(body: ProfileUpdateRequest, current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> dict:
     """更新当前用户资料并重新计算资料完整度。"""
     return await update_profile(db, current.id, body)
+
+
+@router.patch("/nickname", response_model=NicknameUpdateResponse, summary="修改个人昵称")
+async def edit_nickname(
+    body: NicknameUpdateRequest,
+    current: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> NicknameUpdateResponse:
+    """Update only the nickname without changing other profile fields."""
+    return await update_nickname(db, current.id, body.nickname)
 
 
 @router.get("/completion", response_model=CompletionResponse, summary="查询资料完整度")

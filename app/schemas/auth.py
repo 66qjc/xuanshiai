@@ -140,6 +140,20 @@ class ProfileUpdateRequest(BaseModel):
         return value
 
 
+class NicknameUpdateRequest(BaseModel):
+    nickname: str = Field(min_length=1, max_length=64, description="用户昵称，去除首尾空格后不能为空")
+
+    @field_validator("nickname", mode="before")
+    @classmethod
+    def normalize_nickname(cls, value: str) -> str:
+        if not isinstance(value, str):
+            raise ValueError("昵称必须是字符串")
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("昵称不能为空或只包含空格")
+        return normalized
+
+
 class UserResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -182,6 +196,12 @@ class ProfileResponse(BaseModel):
     photos: list[ProfileMediaResponse]
     video: ProfileMediaResponse | None
     completion_score: float
+
+
+class NicknameUpdateResponse(BaseModel):
+    user_id: int
+    nickname: str
+    updated_at: datetime
 
 
 class CompletionResponse(BaseModel):

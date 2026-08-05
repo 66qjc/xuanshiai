@@ -32,6 +32,7 @@ from app.schemas.auth import (
     ProfilePreviewResponse,
     ProfileOverviewResponse,
     ProfileUpdateRequest,
+    NicknameUpdateResponse,
     TagCategoryResponse,
     TagOptionsResponse,
 )
@@ -288,6 +289,35 @@ async def update_profile(db: AsyncSession, user_id: int, request: ProfileUpdateR
     await recalculate_completion(db, user_id)
     await db.commit()
     return await get_profile(db, user_id)
+
+
+async def update_nickname(
+    db: AsyncSession, user_id: int, nickname: str
+) -> NicknameUpdateResponse:
+    """Update only the current user's nickname and return the persisted value."""
+    result = await db.execute(
+        text("SELECT id FROM users WHERE id = :user_id FOR UPDATE"),
+        {"user_id": user_id},
+    )
+    if result.mappings().first() is None:
+        raise HTTPException(404, detail="用户不存在")
+    await db.execute(
+        text("UPDATE users SET nickname = :nickname, updated_at = UTC_TIMESTAMP() WHERE id = :user_id"),
+        {"user_id": user_id, "nickname": nickname},
+    )
+    await db.commit()
+    result = await db.execute(
+        text("SELECT id, nickname, updated_at FROM users WHERE id = :user_id"),
+        {"user_id": user_id},
+    )
+    row = result.mappings().first()
+    if row is None:
+        raise HTTPException(404, detail="用户不存在")
+    return NicknameUpdateResponse(
+        user_id=int(row["id"]),
+        nickname=str(row["nickname"]),
+        updated_at=row["updated_at"],
+    )
 
 
 async def recalculate_completion(db: AsyncSession, user_id: int) -> float:

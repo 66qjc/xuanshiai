@@ -4,7 +4,7 @@ import pytest
 from PIL import Image
 from pydantic import ValidationError
 
-from app.schemas.auth import PhotoOrderRequest, PreferenceUpdateRequest, ProfileUpdateRequest
+from app.schemas.auth import NicknameUpdateRequest, PhotoOrderRequest, PreferenceUpdateRequest, ProfileUpdateRequest
 from app.services.profile import COMPLETION_RULES, IMAGE_MAX_PIXELS, _image_outputs
 
 
@@ -35,6 +35,14 @@ def test_profile_validates_mbti_height_and_tags() -> None:
         ProfileUpdateRequest(interest_tags=["只有一个"])
     with pytest.raises(ValidationError):
         ProfileUpdateRequest(tag_selections={"sports": ["自定义标签"]})
+
+
+def test_nickname_update_trims_and_rejects_blank_values() -> None:
+    assert NicknameUpdateRequest(nickname="  小明  ").nickname == "小明"
+    with pytest.raises(ValidationError):
+        NicknameUpdateRequest(nickname="   ")
+    with pytest.raises(ValidationError):
+        NicknameUpdateRequest(nickname="x" * 65)
 
 
 def test_preference_ranges_must_be_ordered() -> None:
