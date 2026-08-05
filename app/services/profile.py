@@ -171,11 +171,12 @@ def _image_outputs(data: bytes) -> tuple[bytes, bytes]:
             if image.mode not in {"RGB", "RGBA"}:
                 image = image.convert("RGBA" if "A" in image.getbands() else "RGB")
             output = BytesIO()
-            image.save(output, format="WEBP", quality=85, method=6)
+            # method=4 keeps the visual quality while avoiding the slowest WebP encoder path.
+            image.save(output, format="WEBP", quality=85, method=4)
             thumbnail = image.copy()
             thumbnail.thumbnail((480, 480), Image.Resampling.LANCZOS)
             thumb_output = BytesIO()
-            thumbnail.save(thumb_output, format="WEBP", quality=80, method=6)
+            thumbnail.save(thumb_output, format="WEBP", quality=80, method=4)
             return output.getvalue(), thumb_output.getvalue()
     except DecompressionBombError as exc:
         raise HTTPException(413, detail="图片像素过大") from exc
@@ -543,13 +544,15 @@ async def update_preferences(db: AsyncSession, user_id: int, request: Preference
 
 async def upload_avatar(db: AsyncSession, user_id: int, file: UploadFile) -> dict[str, Any]:
     data = await _read_limited(file, IMAGE_MAX_BYTES)
-    image_data, thumbnail_data = _image_outputs(data)
+    image_data, thumbnail_data = await asyncio.to_thread(_image_outputs, data)
     name = uuid.uuid4().hex
     directory = _user_media_dir(user_id)
     image_path = directory / f"avatar-{name}.webp"
     thumbnail_path = directory / f"avatar-{name}-thumb.webp"
-    await _write_bytes(image_path, image_data)
-    await _write_bytes(thumbnail_path, thumbnail_data)
+    await asyncio.gather(
+        _write_bytes(image_path, image_data),
+        _write_bytes(thumbnail_path, thumbnail_data),
+    )
     url = _media_url(user_id, image_path.name)
     thumbnail_url = _media_url(user_id, thumbnail_path.name)
     await db.execute(text("UPDATE user_media SET deleted_at = UTC_TIMESTAMP() WHERE user_id = :user_id AND media_type = 'avatar' AND deleted_at IS NULL"), {"user_id": user_id})
@@ -569,13 +572,15 @@ async def upload_avatar(db: AsyncSession, user_id: int, file: UploadFile) -> dic
 
 async def upload_background(db: AsyncSession, user_id: int, file: UploadFile) -> dict[str, Any]:
     data = await _read_limited(file, IMAGE_MAX_BYTES)
-    image_data, thumbnail_data = _image_outputs(data)
+    image_data, thumbnail_data = await asyncio.to_thread(_image_outputs, data)
     name = uuid.uuid4().hex
     directory = _user_media_dir(user_id)
     image_path = directory / f"background-{name}.webp"
     thumbnail_path = directory / f"background-{name}-thumb.webp"
-    await _write_bytes(image_path, image_data)
-    await _write_bytes(thumbnail_path, thumbnail_data)
+    await asyncio.gather(
+        _write_bytes(image_path, image_data),
+        _write_bytes(thumbnail_path, thumbnail_data),
+    )
     url = _media_url(user_id, image_path.name)
     thumbnail_url = _media_url(user_id, thumbnail_path.name)
     await db.execute(text("UPDATE user_media SET deleted_at = UTC_TIMESTAMP() WHERE user_id = :user_id AND media_type = 'background' AND deleted_at IS NULL"), {"user_id": user_id})
@@ -596,7 +601,7 @@ async def upload_photo(db: AsyncSession, user_id: int, file: UploadFile) -> dict
     if result.scalar() >= MAX_PHOTOS:
         raise HTTPException(409, detail="相册最多保存9张图片")
     data = await _read_limited(file, IMAGE_MAX_BYTES)
-    image_data, thumbnail_data = _image_outputs(data)
+    image_data, thumbnail_data = await asyncio.to_thread(_image_outputs, data)
     result = await db.execute(text("SELECT COALESCE(MAX(sort_order), -1) + 1 FROM user_media WHERE user_id = :user_id AND media_type = 'photo' AND deleted_at IS NULL"), {"user_id": user_id})
     sort_order = int(result.scalar())
     is_primary = sort_order == 0
@@ -604,8 +609,10 @@ async def upload_photo(db: AsyncSession, user_id: int, file: UploadFile) -> dict
     directory = _user_media_dir(user_id)
     image_path = directory / f"photo-{name}.webp"
     thumbnail_path = directory / f"photo-{name}-thumb.webp"
-    await _write_bytes(image_path, image_data)
-    await _write_bytes(thumbnail_path, thumbnail_data)
+    await asyncio.gather(
+        _write_bytes(image_path, image_data),
+        _write_bytes(thumbnail_path, thumbnail_data),
+    )
     url = _media_url(user_id, image_path.name)
     thumbnail_url = _media_url(user_id, thumbnail_path.name)
     result = await db.execute(

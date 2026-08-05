@@ -73,5 +73,15 @@ def test_image_outputs_are_webp_and_have_thumbnail() -> None:
         assert max(thumbnail.size) <= 480
 
 
+def test_image_outputs_use_fast_webp_encoding() -> None:
+    source = BytesIO()
+    Image.new("RGB", (64, 64), "white").save(source, format="PNG")
+
+    image_data, thumbnail_data = _image_outputs(source.getvalue())
+
+    assert image_data
+    assert thumbnail_data
+
+
 def test_image_pixel_limit_is_explicit() -> None:
     assert IMAGE_MAX_PIXELS == 25_000_000
