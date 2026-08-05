@@ -21,7 +21,10 @@ class MediaReviewResponse(BaseModel):
 class ReportReviewRequest(BaseModel):
     status: Literal[1, 2]
     result: str = Field(min_length=1, max_length=255)
-    action: Literal["none", "hide_content", "restore_content", "dismiss"] = "none"
+    action: Literal["none", "hide_content", "restore_content", "restrict_user", "dismiss"] = "none"
+    restriction_type: Literal["TOTAL_BAN", "POST_RESTRICTED", "COMMENT_RESTRICTED", "MESSAGE_RESTRICTED", "APPLICATION_RESTRICTED"] | None = None
+    restriction_reason_code: str | None = Field(default=None, min_length=1, max_length=64)
+    restriction_ends_at: datetime | None = None
 
     @model_validator(mode="after")
     def validate_status_action(self) -> "ReportReviewRequest":
@@ -29,6 +32,10 @@ class ReportReviewRequest(BaseModel):
             raise ValueError("内容处置只能用于成立的举报")
         if self.action == "dismiss" and self.status != 2:
             raise ValueError("dismiss 只能用于驳回的举报")
+        if self.action == "restrict_user" and (self.status != 1 or not self.restriction_type or not self.restriction_reason_code):
+            raise ValueError("restrict_user requires a successful review, restriction type and reason code")
+        if self.restriction_ends_at and self.restriction_ends_at <= datetime.now(self.restriction_ends_at.tzinfo):
+            raise ValueError("restriction end time must be in the future")
         return self
 
 
@@ -36,8 +43,9 @@ class ReportReviewResponse(BaseModel):
     report_id: int
     status: Literal[1, 2]
     result: str
-    action: Literal["none", "hide_content", "restore_content", "dismiss"] = "none"
+    action: Literal["none", "hide_content", "restore_content", "restrict_user", "dismiss"] = "none"
     content_moderated: bool = False
+    restriction_created: bool = False
 
 
 class AdminReportItem(BaseModel):
@@ -50,7 +58,7 @@ class AdminReportItem(BaseModel):
     description: str | None
     status: Literal[0, 1, 2]
     result: str | None
-    action: Literal["none", "hide_content", "restore_content", "dismiss"] = "none"
+    action: Literal["none", "hide_content", "restore_content", "restrict_user", "dismiss"] = "none"
     reviewed_by: int | None = None
     reviewed_at: datetime | None = None
     created_at: datetime
@@ -133,6 +141,7 @@ class ModerationItem(BaseModel):
     user_id: int
     status: Literal["pending", "approved", "rejected", "replaced", "deleted", "hidden"]
     risk_level: int
+    provider: str = "local"
     matched_words: list[str]
     raw_content: str | None
     display_content: str | None

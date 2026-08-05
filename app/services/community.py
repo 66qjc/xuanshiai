@@ -51,6 +51,7 @@ from app.services.community_media import (
 )
 from app.services.profile import _calculate_age, _json_list
 from app.services.notifications import emit_notification, ensure_interaction_allowed
+from app.services.restrictions import ensure_user_allowed
 
 logger = logging.getLogger(__name__)
 
@@ -97,11 +98,13 @@ async def _record_moderation_task(
     notice_content = "你的内容正在审核中，审核完成后会通知你" if status == "pending" else "你的内容已完成敏感词处理"
     await db.execute(
         text("""INSERT INTO community_moderation_task
-            (target_type, target_id, user_id, status, risk_level, matched_words,
-             raw_content, display_content, expires_at)
+            (target_type, target_id, user_id, status, risk_level, provider,
+             matched_words, raw_content, display_content, expires_at)
             VALUES (:target_type, :target_id, :user_id, :status, :risk_level,
-                    :matched_words, :raw_content, :display_content, :expires_at)
+                    :provider, :matched_words, :raw_content, :display_content,
+                    :expires_at)
             ON DUPLICATE KEY UPDATE status = VALUES(status), risk_level = VALUES(risk_level),
+                provider = VALUES(provider),
                 matched_words = VALUES(matched_words), raw_content = VALUES(raw_content),
                 display_content = VALUES(display_content), reason = NULL, reviewed_by = NULL,
                 reviewed_at = NULL, expires_at = VALUES(expires_at)"""),
@@ -111,6 +114,7 @@ async def _record_moderation_task(
             "user_id": user_id,
             "status": status,
             "risk_level": decision.max_level,
+            "provider": getattr(decision, "provider", "local"),
             "matched_words": json.dumps(list(decision.matched_words), ensure_ascii=False),
             "raw_content": raw_content,
             "display_content": decision.display_content,
@@ -163,6 +167,10 @@ def _post_select_sql(extra_where: str = "", *, include_pending: bool = False) ->
         WHERE p.status = 1
           {moderation_clause}
           AND p.deleted_at IS NULL
+          AND NOT EXISTS (SELECT 1 FROM user_restriction ban
+                          WHERE ban.user_id = p.user_id AND ban.restriction_type = 'TOTAL_BAN'
+                            AND ban.status = 1 AND ban.starts_at <= UTC_TIMESTAMP()
+                            AND (ban.ends_at IS NULL OR ban.ends_at > UTC_TIMESTAMP()))
           AND NOT EXISTS (
             SELECT 1 FROM user_block b
             WHERE (b.user_id = :user_id AND b.target_user_id = p.user_id)
@@ -233,12 +241,11 @@ async def create_post(
     *,
     commit: bool = True,
 ) -> CommunityPostResponse:
-    from app.services.content_filter import assert_text_allowed, decide_text
+    await ensure_user_allowed(db, user_id, "POST_RESTRICTED")
+    from app.services.content_filter import moderate_text
 
     content = (request.content or "").strip()
-    if content:
-        await assert_text_allowed(db, content, field="动态内容")
-    decision = await decide_text(db, content)
+    decision = await moderate_text(db, content, field="动态内容")
     if decision.action == "reject":
         await _notify_moderation_rejected(db, user_id, "post")
         if commit:
@@ -360,15 +367,13 @@ async def update_post(
     *,
     commit: bool = True,
 ) -> CommunityPostResponse:
-    from app.services.content_filter import assert_text_allowed, decide_text
+    from app.services.content_filter import moderate_text
 
     result = await db.execute(text("SELECT id FROM community_post WHERE id = :id AND user_id = :user_id AND status <> 3 FOR UPDATE"), {"id": post_id, "user_id": user_id})
     if not result.scalar():
         raise HTTPException(404, detail="动态不存在或无权修改")
     content = (request.content or "").strip()
-    if content:
-        await assert_text_allowed(db, content, field="动态内容")
-    decision = await decide_text(db, content)
+    decision = await moderate_text(db, content, field="动态内容")
     if decision.action == "reject":
         await _notify_moderation_rejected(db, user_id, "post")
         if commit:
@@ -789,6 +794,10 @@ _COMMENT_SELECT = """SELECT c.id, c.post_id, c.user_id, u.nickname, u.avatar, c.
             ) AS is_liked,
             (c.user_id = :user_id AND c.deleted_at IS NULL AND c.moderation_status = 1) AS can_delete
             FROM community_comment c JOIN users u ON u.id = c.user_id
+              AND NOT EXISTS (SELECT 1 FROM user_restriction ban
+                              WHERE ban.user_id = c.user_id AND ban.restriction_type = 'TOTAL_BAN'
+                                AND ban.status = 1 AND ban.starts_at <= UTC_TIMESTAMP()
+                                AND (ban.ends_at IS NULL OR ban.ends_at > UTC_TIMESTAMP()))
             LEFT JOIN community_comment parent ON parent.id = c.parent_id
             LEFT JOIN users parent_user ON parent_user.id = parent.user_id"""
 
@@ -983,10 +992,10 @@ async def create_comment(
     *,
     commit: bool = True,
 ) -> CommunityCommentResponse:
-    from app.services.content_filter import assert_text_allowed, decide_text
+    await ensure_user_allowed(db, user_id, "COMMENT_RESTRICTED")
+    from app.services.content_filter import moderate_text
 
-    await assert_text_allowed(db, request.content, field="评论内容")
-    decision = await decide_text(db, request.content)
+    decision = await moderate_text(db, request.content, field="评论内容")
     if decision.action == "reject":
         await _notify_moderation_rejected(db, user_id, "comment")
         if commit:
@@ -1706,17 +1715,16 @@ async def create_paper_plane(
     quota_key: str | None = None,
 ) -> PaperPlaneResponse:
     from app.core.redis import daily_quota_key
-    from app.services.content_filter import assert_text_allowed, decide_text
+    from app.services.content_filter import moderate_text
 
+    await ensure_user_allowed(db, user_id, "POST_RESTRICTED")
     key = quota_key or daily_quota_key("paper-plane", user_id)
     if not await consume_daily(key, 3):
         raise HTTPException(429, detail="今日纸飞机次数已用完")
 
     content = (request.content or "").strip()
     try:
-        if content:
-            await assert_text_allowed(db, content, field="纸飞机内容")
-        decision = await decide_text(db, content)
+        decision = await moderate_text(db, content, field="纸飞机内容")
     except Exception:
         await _refund_quota_after_failure(key)
         raise
@@ -1820,6 +1828,10 @@ async def list_paper_planes(db: AsyncSession, user_id: int, page: int, page_size
             WHERE {own_clause}
               AND p.status = 1
               AND COALESCE(p.moderation_status, 1) = 1
+              AND NOT EXISTS (SELECT 1 FROM user_restriction ban
+                              WHERE ban.user_id = p.user_id AND ban.restriction_type = 'TOTAL_BAN'
+                                AND ban.status = 1 AND ban.starts_at <= UTC_TIMESTAMP()
+                                AND (ban.ends_at IS NULL OR ban.ends_at > UTC_TIMESTAMP()))
               AND (p.expire_at IS NULL OR p.expire_at > UTC_TIMESTAMP())
             ORDER BY p.created_at DESC LIMIT :limit OFFSET :offset"""
         ),
@@ -1930,10 +1942,10 @@ async def reply_paper_plane(
     *,
     commit: bool = True,
 ) -> PaperPlaneReplyResponse:
-    from app.services.content_filter import assert_text_allowed, decide_text
+    await ensure_user_allowed(db, user_id, "COMMENT_RESTRICTED")
+    from app.services.content_filter import moderate_text
 
-    await assert_text_allowed(db, request.content, field="纸飞机回复")
-    decision = await decide_text(db, request.content)
+    decision = await moderate_text(db, request.content, field="纸飞机回复")
     if decision.action == "reject":
         await _notify_moderation_rejected(db, user_id, "paper_plane_reply")
         if commit:
@@ -2014,6 +2026,11 @@ async def list_paper_plane_conversations(
             JOIN paper_plane p ON p.id = c.plane_id
             WHERE (c.owner_id = :user_id OR c.replier_id = :user_id)
               AND COALESCE(p.moderation_status, 1) = 1
+              AND NOT EXISTS (SELECT 1 FROM user_restriction ban
+                              WHERE ban.user_id IN (c.owner_id, c.replier_id)
+                                AND ban.restriction_type = 'TOTAL_BAN' AND ban.status = 1
+                                AND ban.starts_at <= UTC_TIMESTAMP()
+                                AND (ban.ends_at IS NULL OR ban.ends_at > UTC_TIMESTAMP()))
             ORDER BY COALESCE(c.last_message_at, c.created_at) DESC, c.id DESC
             LIMIT :limit OFFSET :offset"""
         ),
@@ -2088,12 +2105,12 @@ async def send_paper_plane_message(
     *,
     commit: bool = True,
 ) -> PaperPlaneMessageResponse:
-    from app.services.content_filter import assert_text_allowed, decide_text
+    await ensure_user_allowed(db, user_id, "MESSAGE_RESTRICTED")
+    from app.services.content_filter import moderate_text
 
     # 文本消息过滤敏感词；语音消息（type=3）content 为空，无需过滤
     if request.type == 1 and (request.content or "").strip():
-        await assert_text_allowed(db, request.content, field="会话消息")
-        decision = await decide_text(db, request.content)
+        decision = await moderate_text(db, request.content, field="会话消息")
         if decision.action == "reject":
             await _notify_moderation_rejected(db, user_id, "paper_plane_message")
             if commit:

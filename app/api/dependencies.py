@@ -20,6 +20,7 @@ class CurrentUser:
     phone: str | None
     status: int
     realname_status: int
+    face_verified: int | None = None
 
 
 async def get_current_user(
@@ -37,7 +38,8 @@ async def get_current_user(
 
     result = await db.execute(
         text(
-            """SELECT u.id, u.phone, u.status, COALESCE(ua.realname_status, 0) AS realname_status
+            """SELECT u.id, u.phone, u.status, COALESCE(ua.realname_status, 0) AS realname_status,
+                      COALESCE(ua.face_verified, 0) AS face_verified
                FROM users u LEFT JOIN user_auth ua ON ua.user_id = u.id
                JOIN user_session s ON s.user_id = u.id
                WHERE u.id = :user_id AND s.id = :session_id AND s.status = 1
@@ -55,7 +57,9 @@ async def get_current_user(
         {"id": session_id},
     )
     await db.commit()
-    return CurrentUser(**dict(row), session_id=session_id)
+    values = dict(row)
+    values.setdefault("face_verified", None)
+    return CurrentUser(**values, session_id=session_id)
 
 
 async def get_verified_user(current: CurrentUser = Depends(get_current_user)) -> CurrentUser:
@@ -70,6 +74,8 @@ async def get_realname_verified_user(
 ) -> CurrentUser:
     if current.realname_status != 2:
         raise HTTPException(status_code=403, detail="请先完成实名认证")
+    if current.face_verified is not None and current.face_verified != 1:
+        raise HTTPException(status_code=403, detail="璇峰厛瀹屾垚浜鸿劯璁よ瘉")
     return current
 
 

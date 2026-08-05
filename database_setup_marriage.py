@@ -299,6 +299,9 @@ class DatabaseManager:
                 'moderated_by': "`moderated_by` bigint unsigned DEFAULT NULL",
                 'moderated_at': "`moderated_at` datetime DEFAULT NULL",
             },
+            'community_moderation_task': {
+                'provider': "`provider` varchar(32) NOT NULL DEFAULT 'local' COMMENT 'local/aliyun_market/manual'",
+            },
             'config_sensitive_word': {
                 'action': "`action` varchar(24) NOT NULL DEFAULT 'replace' COMMENT 'reject/replace/manual_review'",
             },
@@ -1090,6 +1093,26 @@ class DatabaseManager:
                     PRIMARY KEY (`id`),
                     UNIQUE KEY `uk_pair` (`user_id`,`target_user_id`)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='拉黑记录'
+            """,
+
+            'user_restriction': """
+                CREATE TABLE IF NOT EXISTS `user_restriction` (
+                    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+                    `user_id` bigint unsigned NOT NULL,
+                    `restriction_type` varchar(32) NOT NULL COMMENT 'TOTAL_BAN/POST_RESTRICTED/COMMENT_RESTRICTED/MESSAGE_RESTRICTED/APPLICATION_RESTRICTED',
+                    `reason_code` varchar(64) NOT NULL,
+                    `reason` varchar(255) NOT NULL,
+                    `starts_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    `ends_at` datetime DEFAULT NULL,
+                    `status` tinyint NOT NULL DEFAULT '1' COMMENT '1生效 2已解除',
+                    `ended_at` datetime DEFAULT NULL,
+                    `created_by` bigint unsigned NOT NULL,
+                    `note` varchar(1000) DEFAULT NULL,
+                    `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (`id`),
+                    KEY `idx_user_restriction_active` (`user_id`, `status`, `restriction_type`, `ends_at`),
+                    KEY `idx_user_restriction_created` (`created_at`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='用户功能限制与封禁记录'
             """,
 
             # ============================================
@@ -2150,6 +2173,7 @@ class DatabaseManager:
                     `user_id` bigint unsigned NOT NULL,
                     `status` varchar(24) NOT NULL DEFAULT 'pending' COMMENT 'pending/approved/rejected/replaced/deleted/hidden',
                     `risk_level` tinyint NOT NULL DEFAULT '1',
+                    `provider` varchar(32) NOT NULL DEFAULT 'local' COMMENT 'local/aliyun_market/manual',
                     `matched_words` json DEFAULT NULL,
                     `raw_content` text,
                     `display_content` text,

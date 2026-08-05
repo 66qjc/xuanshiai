@@ -245,3 +245,81 @@ Query：`page>=1`（默认 1）、`page_size=1..100`（默认 20）、`status` �
 - 举报审核组合必须一致：`hide_content` / `restore_content` 只能搭配 `status=1`，`dismiss` 只能搭配 `status=2`；矛盾请求返回 `422`。
 
 错误补充：状态冲突或审核人冲突为 `409`；前端应刷新举报/申诉详情，不得自动重试审核写请求。
+
+## 用户限制与总封禁（2026-08-03）
+
+用户限制是服务端安全状态，不是前端隐藏状态。数据不物理删除；普通用户端和父母端公开接口必须隐藏总封禁用户及其公开内容，管理员保留治理和取证权限。
+
+### `GET /api/v1/admin/users/{user_id}/restrictions`
+
+- 权限：超级管理员。
+- Query：`page` 默认 `1`，范围 `1..1000`；`page_size` 默认 `20`，范围 `1..100`。
+- 请求体：无请求体。
+- 成功：`200`，返回包含已解除记录的分页列表。
+
+每个 `items[]` 包含：`id`、`user_id`、`restriction_type`、`reason_code`、`reason`、`starts_at`、`ends_at`、`status`、`ended_at`、`created_by`、`note`、`created_at`。`status=1` 为生效，`status=2` 为已解除。响应还包含 `page`、`page_size`、`total`、`has_more`。
+
+字段含义：`restriction_type` 为限制类型；`reason_code` 为后台原因字典编码；`starts_at/ends_at` 为生效窗口，`ends_at=null` 表示无结束时间；`ended_at` 为实际解除时间；`created_by` 为管理员 ID；`note` 为内部备注，不能返回普通用户。
+
+成功响应示例：
+
+```json
+{
+  "items": [],
+  "page": 1,
+  "page_size": 20,
+  "total": 0,
+  "has_more": false
+}
+```
+
+### `PATCH /api/v1/admin/users/{user_id}/restrictions`
+
+- 权限：超级管理员。
+- Content-Type：`application/json`。
+- 成功：`200`，返回新建限制记录。
+- `restriction_type`：`TOTAL_BAN`、`POST_RESTRICTED`、`COMMENT_RESTRICTED`、`MESSAGE_RESTRICTED`、`APPLICATION_RESTRICTED`。
+
+请求示例：
+
+```json
+{
+  "restriction_type": "TOTAL_BAN",
+  "reason_code": "SERIOUS_VIOLATION",
+  "reason": "人工审核确认严重违规",
+  "starts_at": "2026-08-03T10:00:00Z",
+  "ends_at": null,
+  "note": "保留证据，用户侧隐藏"
+}
+```
+
+结束时间必须晚于开始时间；同一用户同一限制存在生效记录时返回 `409`；每次设置都写入 `business_audit_log`。总封禁不删除用户、帖子、评论、聊天或举报证据。
+
+响应中的 `id` 为限制记录 ID，`status=1` 表示当前生效，`status=2` 表示已解除；`created_by` 和 `note` 仅供管理员使用。
+
+### `DELETE /api/v1/admin/users/{user_id}/restrictions/{restriction_id}`
+
+- 权限：超级管理员。
+- 请求体：无请求体。
+- 成功：`204 No Content`。
+- `restriction_id` 不属于路径中的 `user_id` 或记录不存在时返回 `404`；已解除时返回 `409`。
+
+解除只结束当前限制并写入审计，不删除历史限制记录。
+## 3.1 人工审核后的明确处罚动作（2026-08-03）
+
+`PATCH /api/v1/admin/reports/{report_id}/review` 支持 `action=restrict_user`。该动作不是自动处罚：只有管理员在人工审核确认后显式提交才会执行。
+
+请求体示例：
+
+```json
+{
+  "status": 1,
+  "result": "确认存在严重违规",
+  "action": "restrict_user",
+  "restriction_type": "MESSAGE_RESTRICTED",
+  "restriction_reason_code": "HARASSMENT",
+  "restriction_ends_at": "2026-08-10T00:00:00Z"
+}
+```
+
+`restriction_type` 可选 `TOTAL_BAN`、`POST_RESTRICTED`、`COMMENT_RESTRICTED`、`MESSAGE_RESTRICTED`、`APPLICATION_RESTRICTED`。`restriction_ends_at` 省略表示长期限制；已存在同类有效限制返回 `409`，校验失败返回 `422`。限制记录、举报结论和审计日志在同一事务中提交，失败时不留下半成品处罚。

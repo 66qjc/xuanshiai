@@ -2,7 +2,8 @@
 
 from typing import Literal
 
-from fastapi import APIRouter, Body, Depends, Path, Query
+from fastapi import APIRouter, Body, Depends, HTTPException, Path, Query
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies import CurrentUser, get_current_admin
@@ -23,6 +24,7 @@ from app.schemas.admin import (
     ReportAppealReviewRequest,
     ReportAppealReviewResponse,
 )
+from app.schemas.restrictions import RestrictionCreate, RestrictionPage, RestrictionResponse
 from app.services.profile import review_media
 from app.services.social import (
     get_admin_report,
@@ -34,8 +36,38 @@ from app.services.social import (
 )
 from app.services.certifications import review_certification
 from app.services.moderation import grant_admin, list_moderation_items, review_moderation_item
+from app.services.restrictions import create_restriction, end_restriction, list_restrictions
 
 router = APIRouter(prefix="/admin")
+
+
+@router.get("/users/{user_id}/restrictions", response_model=RestrictionPage, summary="查询用户限制记录")
+async def user_restrictions(
+    user_id: int = Path(..., ge=1), page: int = Query(1, ge=1, le=1000),
+    page_size: int = Query(20, ge=1, le=100), admin: CurrentUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+) -> RestrictionPage:
+    return await list_restrictions(db, user_id, page, page_size)
+
+
+@router.patch("/users/{user_id}/restrictions", response_model=RestrictionResponse, summary="设置用户限制或总封禁")
+async def restrict_user(
+    user_id: int = Path(..., ge=1), body: RestrictionCreate = Body(...),
+    admin: CurrentUser = Depends(get_current_admin), db: AsyncSession = Depends(get_db),
+) -> RestrictionResponse:
+    return await create_restriction(db, user_id, body, actor_id=admin.id)
+
+
+@router.delete("/users/{user_id}/restrictions/{restriction_id}", status_code=204, summary="解除用户限制")
+async def release_user_restriction(
+    user_id: int = Path(..., ge=1), restriction_id: int = Path(..., ge=1),
+    admin: CurrentUser = Depends(get_current_admin), db: AsyncSession = Depends(get_db),
+) -> None:
+    owner = await db.execute(text("SELECT user_id FROM user_restriction WHERE id = :id"), {"id": restriction_id})
+    row = owner.mappings().first()
+    if not row or int(row["user_id"]) != user_id:
+        raise HTTPException(status_code=404, detail="限制记录不存在")
+    await end_restriction(db, restriction_id, actor_id=admin.id)
 
 
 @router.get("/community/moderation-items", response_model=ModerationItemPage, summary="查看社区待审核内容")
