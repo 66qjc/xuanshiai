@@ -10,6 +10,7 @@ from app.services.profile import COMPLETION_RULES, IMAGE_MAX_PIXELS, _image_outp
 
 def test_completion_weights_total_100() -> None:
     assert sum(weight for _, _, weight in COMPLETION_RULES) == 100
+    assert {key for key, _, _ in COMPLETION_RULES} >= {"weight", "hometown", "album"}
 
 
 def test_profile_validates_mbti_height_and_tags() -> None:
