@@ -6,6 +6,12 @@ from app.api.routes import location
 
 from app.api.routes import (
     admin,
+    matchmaker_admin,
+    matchmaker_crm_admin,
+    customer_leads_admin,
+    matchmaker_dashboard_admin,
+    member_vip_admin,
+    activity_admin,
     auth,
     certifications,
     community,
@@ -52,6 +58,13 @@ api_router.include_router(social.router, tags=["消息"])
 api_router.include_router(community.router, tags=["社区"])
 api_router.include_router(media.router, tags=["社区"])
 api_router.include_router(admin.router, tags=["管理后台"])
+api_router.include_router(matchmaker_admin.router, tags=["红娘后台"])
+api_router.include_router(matchmaker_crm_admin.router, tags=["红娘后台"])
+api_router.include_router(customer_leads_admin.router, tags=["管理后台"])
+api_router.include_router(matchmaker_dashboard_admin.router, tags=["红娘后台"])
+api_router.include_router(member_vip_admin.router, tags=["管理后台"])
+api_router.include_router(activity_admin.router, tags=["管理后台"])
+api_router.include_router(activity_admin.signup_router, tags=["管理后台"])
 api_router.include_router(matchmaker.admin_router, tags=["管理后台"])
 api_router.include_router(meeting.admin_router, tags=["管理后台"])
 api_router.include_router(finance.admin_router, tags=["管理后台"])

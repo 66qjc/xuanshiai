@@ -8,6 +8,8 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import decode_access_token
+from app.services.matchmaker_admin_auth import decode_matchmaker_admin_token, get_session_account
+from app.schemas.matchmaker_admin import MatchmakerAdminAccount
 from app.db.session import get_db
 
 bearer = HTTPBearer(auto_error=False)
@@ -107,3 +109,26 @@ async def get_current_admin(
     if not result.scalar():
         raise HTTPException(status_code=403, detail="需要管理员权限")
     return current
+
+
+@dataclass(frozen=True)
+class CurrentMatchmakerAdmin:
+    account: MatchmakerAdminAccount
+    session_id: int
+
+
+async def get_current_matchmaker_admin(
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer),
+    db: AsyncSession = Depends(get_db),
+) -> CurrentMatchmakerAdmin:
+    """Require the independent red-matchmaker back-office session."""
+    if not credentials:
+        raise HTTPException(status_code=401, detail="请先登录红娘后台")
+    try:
+        payload = decode_matchmaker_admin_token(credentials.credentials)
+        account_id = int(payload["sub"])
+        session_id = int(payload["sid"])
+    except (ValueError, KeyError) as exc:
+        raise HTTPException(status_code=401, detail="无效或已过期的红娘后台访问令牌") from exc
+    account = await get_session_account(db, account_id, session_id)
+    return CurrentMatchmakerAdmin(account=account, session_id=session_id)

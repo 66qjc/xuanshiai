@@ -1,6 +1,80 @@
 """一期商业化和组织归属领域的数据库表定义。"""
 
 BUSINESS_TABLES = {
+    "customer_lead": """
+        CREATE TABLE IF NOT EXISTS `customer_lead` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `name` varchar(128) NOT NULL,
+            `phone` varchar(32) DEFAULT NULL,
+            `wechat` varchar(128) DEFAULT NULL,
+            `source` varchar(64) NOT NULL,
+            `intention_level` tinyint NOT NULL DEFAULT '1' COMMENT '1低 2中 3高',
+            `status` varchar(32) NOT NULL DEFAULT 'NEW' COMMENT 'NEW/CONTACTED/INTENDED/CONVERTED/LOST/CLOSED',
+            `matchmaker_id` bigint unsigned DEFAULT NULL,
+            `organization_id` bigint unsigned DEFAULT NULL,
+            `next_follow_at` datetime DEFAULT NULL,
+            `converted_user_id` bigint unsigned DEFAULT NULL,
+            `remark` varchar(2000) DEFAULT NULL,
+            `created_by` bigint unsigned NOT NULL,
+            `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`),
+            KEY `idx_customer_lead_status` (`status`, `created_at`),
+            KEY `idx_customer_lead_matchmaker` (`matchmaker_id`, `status`),
+            KEY `idx_customer_lead_phone` (`phone`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='后台客源线索'
+    """,
+    "customer_lead_follow_up": """
+        CREATE TABLE IF NOT EXISTS `customer_lead_follow_up` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `lead_id` bigint unsigned NOT NULL,
+            `method` varchar(32) NOT NULL COMMENT 'PHONE/WECHAT/VISIT/OTHER',
+            `content` varchar(2000) NOT NULL,
+            `intention_level` tinyint DEFAULT NULL,
+            `next_follow_at` datetime DEFAULT NULL,
+            `created_by` bigint unsigned NOT NULL,
+            `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`),
+            KEY `idx_lead_follow_up_lead` (`lead_id`, `created_at`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='客源线索跟进记录'
+    """,
+    "matchmaker_admin_account": """
+        CREATE TABLE IF NOT EXISTS `matchmaker_admin_account` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `username` varchar(64) NOT NULL,
+            `password_hash` varchar(255) NOT NULL,
+            `matchmaker_user_id` bigint unsigned DEFAULT NULL,
+            `display_name` varchar(128) NOT NULL,
+            `status` tinyint NOT NULL DEFAULT '1' COMMENT '1正常 2停用',
+            `failed_count` int unsigned NOT NULL DEFAULT '0',
+            `locked_until` datetime DEFAULT NULL,
+            `last_login_at` datetime DEFAULT NULL,
+            `last_login_ip` varchar(64) DEFAULT NULL,
+            `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`),
+            UNIQUE KEY `uk_matchmaker_admin_username` (`username`),
+            KEY `idx_matchmaker_admin_user` (`matchmaker_user_id`, `status`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='独立红娘后台账号'
+    """,
+    "matchmaker_admin_session": """
+        CREATE TABLE IF NOT EXISTS `matchmaker_admin_session` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `account_id` bigint unsigned NOT NULL,
+            `refresh_token_hash` char(64) NOT NULL,
+            `access_token_hash` char(64) DEFAULT NULL,
+            `ip` varchar(64) DEFAULT NULL,
+            `user_agent` varchar(255) DEFAULT NULL,
+            `access_expire_at` datetime NOT NULL,
+            `refresh_expire_at` datetime NOT NULL,
+            `last_used_at` datetime NOT NULL,
+            `status` tinyint NOT NULL DEFAULT '1' COMMENT '1有效 2注销 3轮换',
+            `revoked_at` datetime DEFAULT NULL,
+            PRIMARY KEY (`id`),
+            UNIQUE KEY `uk_matchmaker_admin_refresh` (`refresh_token_hash`),
+            KEY `idx_matchmaker_admin_session_account` (`account_id`, `status`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='红娘后台登录会话'
+    """,
     "organization": """
         CREATE TABLE IF NOT EXISTS `organization` (
             `id` bigint unsigned NOT NULL AUTO_INCREMENT,

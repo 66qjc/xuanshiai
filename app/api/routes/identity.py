@@ -3,7 +3,7 @@
 from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.dependencies import CurrentUser, get_current_admin, get_current_user
+from app.api.dependencies import CurrentMatchmakerAdmin, CurrentUser, get_current_user, get_current_matchmaker_admin
 from app.db.session import get_db
 from app.schemas.auth import (
     MatchmakerApplicationCreate,
@@ -77,8 +77,8 @@ async def my_matchmaker_applications(
 async def review_matchmaker_application_endpoint(
     application_id: int,
     body: MatchmakerReviewRequest,
-    admin: CurrentUser = Depends(get_current_admin),
+    admin: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     """管理员审核、驳回或暂停红娘及合伙人申请。"""
-    return await review_matchmaker_application(db, admin.id, application_id, body)
+    return await review_matchmaker_application(db, admin.account.id, application_id, body)
