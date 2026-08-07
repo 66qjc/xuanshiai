@@ -12,8 +12,36 @@ from app.schemas.points import CheckinResponse, ClaimTaskResponse, InvitePage, I
 TASKS = {"profile_complete": ("完成资料", "profile_complete_reward"), "realname_verified": ("完成实名认证", "realname_verified_reward")}
 
 
-def _task_definitions() -> dict[str, tuple[str, int]]:
+async def _task_definitions(db: AsyncSession) -> dict[str, tuple[str, int]]:
+    result = await db.execute(text("""SELECT task_code, task_name, reward_value FROM config_reward_rule
+        WHERE is_active = 1 AND reward_type = 1 AND task_code <> 'daily_login' ORDER BY sort, id"""))
+    configured = {row["task_code"]: (row["task_name"], int(row["reward_value"] or 0)) for row in result.mappings().all()}
+    if configured:
+        return configured
     return {code: (title, getattr(settings, f"point_{reward_name}")) for code, (title, reward_name) in TASKS.items()}
+
+
+async def _daily_login_reward(db: AsyncSession, user_id: int) -> int:
+    rule = (await db.execute(text("""SELECT reward_value FROM config_reward_rule
+        WHERE task_code = 'daily_login' AND reward_type = 1 AND is_active = 1 AND daily_limit <> 0
+        LIMIT 1"""))).mappings().first()
+    if not rule:
+        return 0
+    today = date.today()
+    exists = (await db.execute(text("SELECT id, points FROM user_checkin WHERE user_id = :id AND checkin_date = :day FOR UPDATE"), {"id": user_id, "day": today})).mappings().first()
+    if exists:
+        return int(exists["points"] or 0)
+    reward = int(rule["reward_value"] or 0)
+    if reward <= 0:
+        return 0
+    await _credit(db, user_id, reward, 1, "每日登录奖励")
+    await db.execute(text("INSERT INTO user_checkin (user_id, checkin_date, points) VALUES (:id, :day, :points)"), {"id": user_id, "day": today, "points": reward})
+    return reward
+
+
+async def auto_login_reward(db: AsyncSession, user_id: int) -> int:
+    """Grant the configured daily login reward; caller owns the transaction."""
+    return await _daily_login_reward(db, user_id)
 
 
 async def _balance(db: AsyncSession, user_id: int, lock: bool = False) -> int:
@@ -51,7 +79,8 @@ async def checkin(db: AsyncSession, user_id: int) -> CheckinResponse:
         if exists:
             balance = await _balance(db, user_id)
             return CheckinResponse(checked_in=True, points=int(exists["points"] or 0), balance=balance, checkin_date=today.isoformat())
-        reward = settings.point_checkin_reward
+        rule = (await db.execute(text("SELECT reward_value FROM config_reward_rule WHERE task_code = 'daily_login' AND reward_type = 1 AND is_active = 1 LIMIT 1"))).scalar()
+        reward = int(rule or settings.point_checkin_reward)
         balance = await _credit(db, user_id, reward, 1, "每日签到")
         await db.execute(text("INSERT INTO user_checkin (user_id,checkin_date,points) VALUES (:id,:day,:points)"), {"id": user_id, "day": today, "points": reward})
     return CheckinResponse(checked_in=True, points=reward, balance=balance, checkin_date=today.isoformat())
@@ -60,11 +89,12 @@ async def checkin(db: AsyncSession, user_id: int) -> CheckinResponse:
 async def tasks(db: AsyncSession, user_id: int) -> list[TaskItem]:
     result = await db.execute(text("SELECT task_code,status,completed_at FROM user_task WHERE user_id=:id"), {"id": user_id})
     saved = {r["task_code"]: r for r in result.mappings()}
-    return [TaskItem(task_code=code, title=title, reward=reward, status=int(saved.get(code, {}).get("status", 1)), completed_at=saved.get(code, {}).get("completed_at")) for code, (title, reward) in _task_definitions().items()]
+    definitions = await _task_definitions(db)
+    return [TaskItem(task_code=code, title=title, reward=reward, status=int(saved.get(code, {}).get("status", 1)), completed_at=saved.get(code, {}).get("completed_at")) for code, (title, reward) in definitions.items()]
 
 
 async def claim_task(db: AsyncSession, user_id: int, task_code: str) -> ClaimTaskResponse:
-    task_definitions = _task_definitions()
+    task_definitions = await _task_definitions(db)
     if task_code not in task_definitions:
         raise HTTPException(404, detail="任务不存在")
     title, reward = task_definitions[task_code]

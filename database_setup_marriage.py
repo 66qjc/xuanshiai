@@ -2505,6 +2505,14 @@ class DatabaseManager:
                 ('paper_plane_unlock', '纸飞机', 'right', 30, '1', 3, 1),
                 ('profile_detail_unlock', '完整资料卡解锁', 'right', 50, '1', 4, 1)
         """)
+        cursor.execute("""
+            INSERT IGNORE INTO config_reward_rule
+                (task_code, task_name, task_type, reward_type, reward_value, daily_limit, is_active, sort)
+            VALUES
+                ('daily_login', '每日登录', 2, 1, 5, 1, 1, 1),
+                ('profile_complete', '完成资料', 1, 1, 50, 1, 1, 2),
+                ('realname_verified', '完成实名认证', 1, 1, 100, 1, 1, 3)
+        """)
 
         # 兼容已存在的旧库：CREATE TABLE IF NOT EXISTS 不会补齐新增字段。
         self._ensure_required_columns(cursor)

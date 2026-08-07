@@ -65,3 +65,43 @@ class ResourceAssignmentPage(BaseModel):
     page_size: int
     total: int
     has_more: bool
+
+
+class RewardRule(BaseModel):
+    id: int
+    task_code: str
+    task_name: str
+    task_type: Literal[1, 2, 3]
+    reward_type: Literal[1, 2, 3, 4, 5]
+    reward_value: int
+    daily_limit: int
+    is_active: Literal[0, 1]
+    sort: int
+    created_at: datetime | None
+    updated_at: datetime | None
+
+
+class RewardRuleCreate(BaseModel):
+    task_code: str = Field(min_length=2, max_length=64, pattern=r"^[a-z][a-z0-9_]*$")
+    task_name: str = Field(min_length=1, max_length=64)
+    task_type: Literal[1, 2, 3] = 1
+    reward_type: Literal[1, 2, 3, 4, 5] = 1
+    reward_value: int = Field(default=0, ge=0, le=2147483647)
+    daily_limit: int = Field(default=0, ge=0, le=2147483647)
+    is_active: Literal[0, 1] = 1
+    sort: int = Field(default=0, ge=0, le=2147483647)
+
+
+class RewardRuleUpdate(BaseModel):
+    task_name: str | None = Field(default=None, min_length=1, max_length=64)
+    task_type: Literal[1, 2, 3] | None = None
+    reward_type: Literal[1, 2, 3, 4, 5] | None = None
+    reward_value: int | None = Field(default=None, ge=0, le=2147483647)
+    daily_limit: int | None = Field(default=None, ge=0, le=2147483647)
+    is_active: Literal[0, 1] | None = None
+    sort: int | None = Field(default=None, ge=0, le=2147483647)
+
+
+class RewardRuleDeleteResponse(BaseModel):
+    task_code: str
+    deleted: bool

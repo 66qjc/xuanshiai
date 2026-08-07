@@ -32,6 +32,7 @@ from app.schemas.auth import (
 from app.services.sms.providers import get_sms_provider
 from app.services.wechat.providers import get_wechat_provider
 from app.services.presence import mark_session_online
+from app.services.points import auto_login_reward
 
 
 def normalize_user_agent(user_agent: str | None) -> str | None:
@@ -165,6 +166,7 @@ async def create_session(
         {"hash": hash_token(access), "id": session_id},
     )
     await mark_session_online(db, user_id, int(session_id))
+    await auto_login_reward(db, user_id)
     return {"access_token": access, "refresh_token": refresh, "expires_in": settings.access_token_expire_minutes * 60,
             "user_id": user_id}
 
