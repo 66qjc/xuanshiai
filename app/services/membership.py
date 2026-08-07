@@ -1,6 +1,7 @@
 import json
 import secrets
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 
 from fastapi import HTTPException
 from sqlalchemy import text
@@ -96,6 +97,40 @@ async def get_order(db: AsyncSession, user_id: int, order_no: str) -> Membership
     if not row:
         raise HTTPException(404, detail="Order not found")
     return MembershipOrderResponse(order_no=row["order_no"], package_code=str(row["product_type"]), product_name=row["product_name"], amount=float(row["amount"]), pay_type=row["pay_type"], status=row["status"], expire_at=row["expire_at"], payment_required=row["status"] == 0)
+
+
+async def pay_order_with_balance(db: AsyncSession, user_id: int, order_no: str, idempotency_key: str) -> MembershipOrderResponse:
+    if not idempotency_key or len(idempotency_key) < 8 or len(idempotency_key) > 128:
+        raise HTTPException(422, detail="Idempotency-Key 长度必须为 8-128")
+    result = await db.execute(text("""SELECT po.id, po.order_no, po.product_type, po.product_name, po.amount,
+        po.pay_type, po.status, po.expire_at, cp.code, cp.duration_days
+        FROM payment_order po JOIN config_membership_package cp ON cp.code = po.product_type
+        WHERE po.user_id = :user_id AND po.order_no = :order_no AND po.type = 1 FOR UPDATE"""), {"user_id": user_id, "order_no": order_no})
+    order = result.mappings().first()
+    if not order:
+        raise HTTPException(404, detail="会员订单不存在")
+    if int(order["status"]) == 1:
+        return MembershipOrderResponse(order_no=order["order_no"], package_code=order["code"], product_name=order["product_name"], amount=float(order["amount"]), pay_type=order["pay_type"], status=1, expire_at=order["expire_at"], payment_required=False)
+    if int(order["status"]) != 0:
+        raise HTTPException(409, detail="订单当前不可支付")
+    if order["expire_at"] and order["expire_at"] <= datetime.now(UTC).replace(tzinfo=None):
+        raise HTTPException(409, detail="订单已过期")
+    await db.execute(text("SELECT id FROM account_ledger WHERE account_type = 'user' AND account_id = :user_id FOR UPDATE"), {"user_id": user_id})
+    balance = (await db.execute(text("""SELECT COALESCE(SUM(CASE WHEN state = 'AVAILABLE' AND direction = 'CREDIT' THEN amount
+        WHEN state = 'AVAILABLE' AND direction = 'DEBIT' THEN -amount ELSE 0 END), 0) FROM account_ledger WHERE account_type = 'user' AND account_id = :user_id"""), {"user_id": user_id})).scalar()
+    amount = Decimal(str(order["amount"]))
+    if Decimal(str(balance or 0)) < amount:
+        raise HTTPException(409, detail="余额不足")
+    await db.execute(text("""UPDATE payment_order SET status = 1, pay_type = 2, pay_time = UTC_TIMESTAMP(),
+        transaction_id = :transaction_id WHERE id = :id AND status = 0"""), {"transaction_id": f"BALANCE-{order['id']}-{idempotency_key[:32]}", "id": order["id"]})
+    await db.execute(text("""INSERT INTO account_ledger (account_type, account_id, direction, amount, state, source_type, source_id, idempotency_key)
+        VALUES ('user', :user_id, 'DEBIT', :amount, 'AVAILABLE', 'membership_order', :order_id, :ledger_key)
+        ON DUPLICATE KEY UPDATE id = id"""), {"user_id": user_id, "amount": amount, "order_id": order["id"], "ledger_key": f"membership-balance:{order['id']}"})
+    start_at = datetime.now(UTC).replace(tzinfo=None)
+    await db.execute(text("""INSERT INTO user_membership (user_id, package_type, amount, order_no, start_at, end_at, status)
+        VALUES (:user_id, :package_type, :amount, :order_no, :start_at, :end_at, 1)"""), {"user_id": user_id, "package_type": order["code"], "amount": amount, "order_no": order["order_no"], "start_at": start_at, "end_at": start_at + timedelta(days=int(order["duration_days"]))})
+    await db.commit()
+    return MembershipOrderResponse(order_no=order["order_no"], package_code=order["code"], product_name=order["product_name"], amount=float(amount), pay_type=2, status=1, expire_at=order["expire_at"], payment_required=False)
 
 
 async def handle_wechat_callback(db: AsyncSession, body) -> None:

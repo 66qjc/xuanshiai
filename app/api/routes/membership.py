@@ -5,7 +5,7 @@ from app.api.dependencies import CurrentUser, get_current_user
 from app.db.session import get_db
 from app.schemas.membership import CreateMembershipOrderRequest, MembershipHistoryPage, MembershipOrderResponse, MembershipPackage, MembershipStatus, WechatPaymentCallback
 from app.schemas.payments import TestPaymentRequest, TestPaymentResponse
-from app.services.membership import create_order, get_order, get_status, handle_wechat_callback, history, list_packages
+from app.services.membership import create_order, get_order, get_status, handle_wechat_callback, history, list_packages, pay_order_with_balance
 from app.services.payments import complete_test_payment
 
 router = APIRouter()
@@ -24,6 +24,10 @@ async def order(body: CreateMembershipOrderRequest, idempotency_key: str | None 
 
 @router.get("/membership/orders/{order_no}", response_model=MembershipOrderResponse, summary="查询会员订单")
 async def order_detail(order_no: str, current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> MembershipOrderResponse: return await get_order(db, current.id, order_no)
+
+@router.post("/membership/orders/{order_no}/pay-with-balance", response_model=MembershipOrderResponse, summary="使用个人余额支付会员订单")
+async def pay_with_balance(order_no: str, idempotency_key: str = Header(..., alias="Idempotency-Key", min_length=8, max_length=128), current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> MembershipOrderResponse:
+    return await pay_order_with_balance(db, current.id, order_no, idempotency_key)
 
 
 @router.post("/payments/wechat/callback", status_code=204, summary="微信支付回调")

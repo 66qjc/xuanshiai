@@ -6,9 +6,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies import CurrentMatchmakerAdmin, get_current_matchmaker_admin
 from app.db.session import get_db
-from app.schemas.member_vip_admin import AdminLoginLogItem, AdminLoginLogPage, AdminVipItem, AdminVipPage
+from app.schemas.member_vip_admin import AdminLoginLogItem, AdminLoginLogPage, AdminVipItem, AdminVipPage, AdminVipUpdate, AdminVipUpdateResponse
+from app.services.member_vip_admin import update_vip
 
 router = APIRouter(prefix="/admin/members")
+
+
+@router.patch("/{member_id}/vip", response_model=AdminVipUpdateResponse, summary="开通、续期或取消 VIP")
+async def update_member_vip(member_id: int = Path(..., ge=1), body: AdminVipUpdate = ..., current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> AdminVipUpdateResponse:
+    return await update_vip(db, current.account.id, member_id, body)
 
 
 @router.get("/vip", response_model=AdminVipPage, summary="查询 VIP 会员")
@@ -35,4 +41,3 @@ async def login_logs(member_id: int = Path(..., ge=1), page: int = Query(1, ge=1
     count = await db.execute(text(f"SELECT COUNT(*) {base} WHERE l.user_id = :user_id"), {"user_id": member_id})
     total = int(count.scalar() or 0)
     return AdminLoginLogPage(items=[AdminLoginLogItem(**dict(row)) for row in rows.mappings().all()], page=page, page_size=page_size, total=total, has_more=page * page_size < total)
-

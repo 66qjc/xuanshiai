@@ -12,6 +12,7 @@ from app.api.routes import (
     matchmaker_dashboard_admin,
     member_vip_admin,
     activity_admin,
+    member_follow_up_admin,
     auth,
     certifications,
     community,
@@ -65,6 +66,7 @@ api_router.include_router(matchmaker_dashboard_admin.router, tags=["红娘后台
 api_router.include_router(member_vip_admin.router, tags=["管理后台"])
 api_router.include_router(activity_admin.router, tags=["管理后台"])
 api_router.include_router(activity_admin.signup_router, tags=["管理后台"])
+api_router.include_router(member_follow_up_admin.router, tags=["管理后台"])
 api_router.include_router(matchmaker.admin_router, tags=["管理后台"])
 api_router.include_router(meeting.admin_router, tags=["管理后台"])
 api_router.include_router(finance.admin_router, tags=["管理后台"])

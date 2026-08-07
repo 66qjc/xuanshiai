@@ -38,6 +38,19 @@ BUSINESS_TABLES = {
             KEY `idx_lead_follow_up_lead` (`lead_id`, `created_at`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='客源线索跟进记录'
     """,
+    "member_follow_up": """
+        CREATE TABLE IF NOT EXISTS `member_follow_up` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `user_id` bigint unsigned NOT NULL,
+            `method` varchar(32) NOT NULL COMMENT 'PHONE/WECHAT/VISIT/OTHER',
+            `content` varchar(2000) NOT NULL,
+            `next_follow_at` datetime DEFAULT NULL,
+            `created_by` bigint unsigned NOT NULL,
+            `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`),
+            KEY `idx_member_follow_up_user` (`user_id`, `created_at`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='会员 CRM 跟进记录'
+    """,
     "matchmaker_admin_account": """
         CREATE TABLE IF NOT EXISTS `matchmaker_admin_account` (
             `id` bigint unsigned NOT NULL AUTO_INCREMENT,
