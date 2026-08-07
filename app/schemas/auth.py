@@ -93,6 +93,9 @@ class RealNameRequest(BaseModel):
 
 
 class ProfileUpdateRequest(BaseModel):
+    # Avatar is a multipart upload handled by POST /users/me/avatar, not a profile field.
+    model_config = ConfigDict(extra="forbid")
+
     gender: Literal[1, 2] | None = None
     birthday: date | None = None
     is_married: Literal[1, 2, 3] | None = None

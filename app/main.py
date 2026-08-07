@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import mimetypes
 import re
 import time
 from contextlib import asynccontextmanager
@@ -129,6 +130,13 @@ def create_app() -> FastAPI:
             return response
         finally:
             request_id_context.reset(context_token)
+
+    # Minimal Linux images may not register WebP in Python's MIME table.
+    mimetypes.add_type("image/webp", ".webp")
+    mimetypes.add_type("video/mp4", ".mp4")
+    mimetypes.add_type("audio/mpeg", ".mp3")
+    mimetypes.add_type("audio/ogg", ".ogg")
+    mimetypes.add_type("audio/wav", ".wav")
 
     Path(settings.upload_dir).mkdir(parents=True, exist_ok=True)
     application.mount("/storage/uploads", StaticFiles(directory=settings.upload_dir), name="uploads")
