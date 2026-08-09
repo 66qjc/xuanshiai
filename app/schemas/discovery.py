@@ -24,6 +24,7 @@ class DiscoveryFilters(BaseModel):
     income_min: float | None = Field(default=None, ge=0, le=1_000_000)
     income_max: float | None = Field(default=None, ge=0, le=1_000_000)
     pure_free: bool = False
+    cursor: str | None = Field(default=None, min_length=1, max_length=512)
     page: int = Field(default=1, ge=1, le=1000)
     page_size: int = Field(default=20, ge=1, le=20)
 
@@ -35,12 +36,15 @@ class DiscoveryFilters(BaseModel):
             raise ValueError("身高下限不能大于上限")
         if self.income_min is not None and self.income_max is not None and self.income_min > self.income_max:
             raise ValueError("收入下限不能大于上限")
+        if self.cursor is not None and self.page != 1:
+            raise ValueError("cursor cannot be combined with page > 1")
         return self
 
 
 class DiscoverySearch(BaseModel):
     nickname: str | None = Field(default=None, max_length=64)
     tag: str | None = Field(default=None, max_length=64)
+    cursor: str | None = Field(default=None, min_length=1, max_length=512)
     page: int = Field(default=1, ge=1, le=1000)
     page_size: int = Field(default=20, ge=1, le=20)
 
@@ -56,6 +60,8 @@ class DiscoverySearch(BaseModel):
     def validate_keywords(self):
         if not self.nickname and not self.tag:
             raise ValueError("昵称或标签至少填写一项")
+        if self.cursor is not None and self.page != 1:
+            raise ValueError("cursor cannot be combined with page > 1")
         return self
 
 
@@ -77,6 +83,8 @@ class DiscoveryCard(BaseModel):
     certification_tags: list[str]
     match_score: float
     match_reason: str
+    algorithm_version: str = "legacy-rule-v1"
+    match_score_source: str = "legacy-rule-v1"
     is_favorite: bool
     is_pure_free: bool
     is_boosted: bool
@@ -89,6 +97,9 @@ class DiscoveryPage(BaseModel):
     page_size: int
     total: int
     has_more: bool
+    next_cursor: str | None = None
+    sort_version: str | None = None
+    total_is_estimate: bool = False
 
 
 class FilterOptionsResponse(BaseModel):

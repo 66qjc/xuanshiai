@@ -111,6 +111,36 @@ class Settings(BaseSettings):
     point_cost_profile_detail_unlock: int | None = Field(default=None, gt=0)
     point_cost_membership_exchange: int | None = Field(default=None, gt=0)
     point_cost_service_coupon: int | None = Field(default=None, gt=0)
+
+    # ==================== AI 功能开关与门禁 ====================
+    # 一期全部默认关闭。生产环境只有在 ai_policy_approved、
+    # ai_provider_approved、ai_retention_policy_version 同时满足且
+    # Provider 不是 mock 时才允许打开（见 validate_ai_feature_gates）。
+    ai_master_enabled: bool = False
+    ai_profile_enabled: bool = False
+    ai_search_enabled: bool = False
+    ai_compatibility_shadow_enabled: bool = False
+    # 一期唯一 provider；生产环境启用 AI 时禁止使用 mock。
+    ai_provider: Literal["mock"] = "mock"
+    # 生产启用门禁（Task 1 冻结）：缺任一批准项则校验失败。
+    ai_policy_approved: bool = False
+    ai_provider_approved: bool = False
+    ai_retention_policy_version: str | None = None
+
+    # AI 任务/租约/重试/限流配置。
+    ai_lease_seconds: int = Field(default=300, gt=0, le=3600)
+    ai_max_attempts: int = Field(default=3, gt=0, le=10)
+    ai_search_parse_rate_per_minute: int = Field(default=5, gt=0, le=60)
+    ai_profile_session_expire_days: int = Field(default=7, gt=0)
+    ai_search_draft_expire_hours: int = Field(default=24, gt=0)
+    ai_compatibility_snapshot_ttl_minutes: int = Field(default=10, gt=0)
+    ai_gateway_timeout_seconds: float = Field(default=30.0, gt=0, le=120)
+
+    # Task 12 审计/指标开关（非敏感，不影响 production fail-closed）。
+    ai_audit_enabled: bool = True
+    # outbox/purge 积压指标触发本地告警的阈值。
+    ai_metrics_backlog_warn_threshold: int = Field(default=1000, ge=0)
+
     log_level: str = "INFO"
 
     @property
@@ -164,7 +194,44 @@ class Settings(BaseSettings):
             raise ValueError(
                 "生产环境启用阿里云敏感词服务时必须配置 AppCode"
             )
+        self._validate_ai_feature_gates()
         return self
+
+    def ai_approvals_complete(self) -> bool:
+        """Return whether all three production approval gates are satisfied."""
+        return bool(
+            self.ai_policy_approved
+            and self.ai_provider_approved
+            and self.ai_retention_policy_version
+        )
+
+    def _validate_ai_feature_gates(self) -> None:
+        """Fail closed when any AI switch is enabled without the full gates.
+
+        Production only: a real (non-mock) provider must be approved before any
+        AI feature may run.  Missing approval flags or a mock production
+        provider raise so ``Settings(...)`` construction fails with a
+        ``ValidationError``.
+        """
+        if self.environment != "production":
+            return
+        any_ai_enabled = any(
+            (
+                self.ai_master_enabled,
+                self.ai_profile_enabled,
+                self.ai_search_enabled,
+                self.ai_compatibility_shadow_enabled,
+            )
+        )
+        if not any_ai_enabled:
+            return
+        if not self.ai_approvals_complete():
+            raise ValueError(
+                "生产环境启用 AI 功能必须同时满足 ai_policy_approved、"
+                "ai_provider_approved 和 ai_retention_policy_version"
+            )
+        if self.ai_provider == "mock":
+            raise ValueError("生产环境禁止使用 mock AI Provider")
 
 
 @lru_cache

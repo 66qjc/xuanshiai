@@ -1,0 +1,1793 @@
+"""M03 AI 搜索服务（Task 10，统一方案 §8/§10.3/§11.2，执行计划 §3.1/§3.2）。
+
+本模块是 M03 搜索的事实源：
+
+- ``compile_search_conditions`` 把确认后的 AST 条件静态编译为现有
+  ``DiscoveryFilters`` 与 ``soft_terms``/``unknown``/``conflicts``，永远不产生
+  SQL 字符串、表名、列名或排序表达式；模型输出只能成为参数化筛选。
+- ``create_search_draft`` 写 ``parsing`` 草稿并入队 ``search_parse`` 任务；
+  每用户每分钟解析次数受 ``ai_search_parse_rate_per_minute`` 限流。
+- ``parse_search_draft``（Worker handler）调用 ``AIGateway.parse_search_query``，
+  把 allowlist 条件与未知原文逐行写入 ``ai_search_condition``，草稿转
+  ``awaiting_confirmation``；未知原文作为 off-allowlist 伪条件保存，重解析不会
+  恢复用户已删除的条件。
+- ``confirm_search_draft`` 要求所有未删除 hard 条件已 ``confirmed`` 且无区间
+  冲突，才在同一事务创建带 ``snapshot_hash``/``policy_revision``/
+  ``consent_snapshot``/五维 revision vector 的 ``ai_search_snapshot`` 并入队
+  ``search_execute`` 任务；编译失败不创建候选任务。
+- ``execute_search_snapshot`` 复用 ``CandidateQueryService`` 的
+  predicate/count/cursor，每次读取重新过 ``CandidateVisibilityService`` 门禁
+  （被拉黑/撤回对象排除），只把当前可见卡片引用与证据写入
+  ``ai_search_result``；软字段缺失记为 ``unknown``，不作为硬失败。
+- 结果读取路径完全以 MySQL 为事实源（不依赖 Redis），因此 Redis 断开时天然
+  从 MySQL 恢复。
+
+与 Task 6/7/8 一致，本模块函数**不**调用 ``commit()``——调用方（路由或 Worker）
+控制事务。S-06 语义召回 adapter 的 Phase 4 启动条件只记录在
+``docs/api/AI搜索.md``，本任务不实现语义召回主链路。
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import time
+import uuid
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from typing import Any
+
+from redis.exceptions import RedisError
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.config import settings
+from app.core.redis import redis_client
+from app.schemas.ai_common import CursorMeta
+from app.schemas.ai_search import (
+    SearchCondition,
+    SearchConditionRead,
+    SearchConditionUserAction,
+    SearchDraftRead,
+    SearchDraftStatus,
+    SearchResultItemRead,
+    SearchResultPageRead,
+    SearchSuggestionRead,
+)
+from app.schemas.discovery import DiscoveryFilters
+from app.services.ai.base import AITaskContext, SearchParseRequest
+from app.services.ai.gateway import AIGateway
+from app.services.ai.profile import CleanupTask, DraftVersionConflict
+from app.services.ai.tasks import (
+    AiTaskRecord,
+    TaskError,
+    enqueue_task,
+    fail_task,
+)
+from app.services.candidate_query import (
+    CandidateQueryService,
+    CandidateQuerySnapshot,
+    SORT_VERSION,
+    build_query_fingerprint,
+)
+from app.services.candidate_visibility import (
+    CandidateVisibilityService,
+    ViewerContext,
+    VisibilityScene,
+)
+from app.services.discovery import CARD_FROM, CARD_SELECT
+from app.services.revisions import RevisionVector
+
+logger = logging.getLogger(__name__)
+
+# ----------------------------------------------------------------------
+# 冻结常量（统一方案 §8/§10.3）
+# ----------------------------------------------------------------------
+
+SEARCH_SCHEMA_VERSION = "search-condition-v1"
+SEARCH_POLICY_REVISION = "ai-policy-2026-08-07-v1"
+SEARCH_CONSENT_SCOPE = "search_parse"
+SEARCH_PARSE_TASK_TYPE = "search_parse"
+SEARCH_EXECUTE_TASK_TYPE = "search_execute"
+SEARCH_CLEANUP_TASK_TYPE = "cleanup"
+# 结果证据 TTL：与统一方案 §8.3 示例的 result_expires_at（10 分钟）一致。
+SEARCH_RESULT_TTL_MINUTES = 10
+SEARCH_PAGE_SIZE_DEFAULT = 20
+
+# Task 1 冻结的 10 个 allowlist 字段 → operator/kind 静态映射（逐字，统一方案 §8.1）。
+FIELD_RULES: dict[str, dict[str, Any]] = {
+    "age": {"operators": {"between", "gte", "lte"}, "kind": "hard"},
+    "city_code": {"operators": {"eq", "in"}, "kind": "hard"},
+    "marriage_status": {"operators": {"eq", "in"}, "kind": "hard"},
+    "education_level": {"operators": {"gte"}, "kind": "hard"},
+    "height_cm": {"operators": {"between", "gte", "lte"}, "kind": "hard"},
+    "income_band": {"operators": {"between", "gte", "lte"}, "kind": "hard"},
+    "occupation_group": {"operators": {"eq"}, "kind": "soft"},
+    "interest_tags": {"operators": {"contains"}, "kind": "soft"},
+    "lifestyle_tags": {"operators": {"contains"}, "kind": "soft"},
+    "relationship_goal": {"operators": {"eq"}, "kind": "soft"},
+}
+
+# soft 标签字段（contains → 现有字面 DiscoverySearch.tag 语义，逐条编译）。
+_TAG_SOFT_FIELDS = frozenset({"interest_tags", "lifestyle_tags"})
+
+
+# ----------------------------------------------------------------------
+# 稳定业务错误（执行计划 §3.2 错误码注册表）
+# ----------------------------------------------------------------------
+
+
+class SearchPolicyDenied(ValueError):
+    """422 AI_POLICY_DENIED：越权字段、敏感推断或模型自创字段。"""
+
+    code = "AI_POLICY_DENIED"
+    status_code = 422
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.message = message
+
+
+class SearchInputInvalid(ValueError):
+    """400 AI_INPUT_INVALID：类型、长度、枚举或 operator 非法。"""
+
+    code = "AI_INPUT_INVALID"
+    status_code = 400
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.message = message
+
+
+class SearchQuotaExceeded(Exception):
+    """429 AI_QUOTA_EXCEEDED：每用户每分钟解析额度耗尽。"""
+
+    code = "AI_QUOTA_EXCEEDED"
+    status_code = 429
+    retryable = True
+
+    def __init__(self) -> None:
+        super().__init__("AI 搜索解析频率过高，请稍后重试")
+        self.message = "AI 搜索解析频率过高，请稍后重试"
+
+
+class SearchConsentRequired(Exception):
+    """403 AI_CONSENT_REQUIRED：search_parse 授权缺失或已撤回。"""
+
+    code = "AI_CONSENT_REQUIRED"
+    status_code = 403
+
+    def __init__(self) -> None:
+        super().__init__("尚未同意 AI 搜索解析授权")
+        self.message = "尚未同意 AI 搜索解析授权"
+
+
+class SearchDraftNotFound(Exception):
+    """404 SEARCH_DRAFT_NOT_FOUND：草稿不存在或非本人；不泄露归属。"""
+
+    code = "SEARCH_DRAFT_NOT_FOUND"
+    status_code = 404
+
+    def __init__(self) -> None:
+        super().__init__("搜索草稿不存在")
+        self.message = "搜索草稿不存在"
+
+
+class SearchSnapshotNotFound(Exception):
+    """404 SEARCH_SNAPSHOT_NOT_FOUND：快照不存在、非本人或已删除。"""
+
+    code = "SEARCH_SNAPSHOT_NOT_FOUND"
+    status_code = 404
+
+    def __init__(self) -> None:
+        super().__init__("搜索快照不存在")
+        self.message = "搜索快照不存在"
+
+
+class SearchDraftNotConfirmed(Exception):
+    """409 RESULT_STALE：草稿未确认/未就绪，不能创建候选查询任务。"""
+
+    code = "RESULT_STALE"
+    status_code = 409
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.message = message
+
+
+class SearchResultStale(Exception):
+    """409 RESULT_STALE：结果已过期，需重新确认生成新快照。"""
+
+    code = "RESULT_STALE"
+    status_code = 409
+
+    def __init__(self) -> None:
+        super().__init__("搜索结果已过期，请重新发起搜索")
+        self.message = "搜索结果已过期，请重新发起搜索"
+
+
+# ----------------------------------------------------------------------
+# 领域对象
+# ----------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CompiledSearch:
+    """服务器侧编译结果：只含现有 DiscoveryFilters 与受控条件。
+
+    永不携带 SQL 字符串、表名、列名、排序表达式或模型生成的字段；
+    ``sql_expression`` 恒为 ``None``（参数化 SQL 由 CandidateQueryService 负责）。
+    """
+
+    filters: DiscoveryFilters
+    soft_terms: tuple[tuple[str, Any], ...] = ()
+    unknown: tuple[SearchCondition, ...] = ()
+    conflicts: tuple[str, ...] = ()
+    sql_expression: None = None
+
+
+@dataclass(frozen=True)
+class SearchDraftParse:
+    """202 draft+parse task 结果（对应 ``SearchDraftParseRead``）。"""
+
+    draft_id: str
+    status: str
+    task_id: str
+    condition_schema_version: str = SEARCH_SCHEMA_VERSION
+    expires_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class SearchSnapshot:
+    """202 confirm 结果：不可变快照 + 已入队的 search_execute 任务。"""
+
+    snapshot_id: str
+    task_id: str
+    status: str
+    condition_schema_version: str = SEARCH_SCHEMA_VERSION
+    expires_at: datetime | None = None
+    degraded: bool = False
+    replayed: bool = False
+
+
+@dataclass(frozen=True)
+class SearchEvidence:
+    """一个候选的结果证据：满足数、证据引用与 source revision。"""
+
+    matched_condition_count: int
+    matched_conditions: list[str]
+    unknown_conditions: list[str]
+    reason_codes: list[str]
+    profile_revision: int
+
+
+# ----------------------------------------------------------------------
+# 编译（纯函数，禁止数据库查询）
+# ----------------------------------------------------------------------
+
+_MARRIAGE_VALUE_MAP = {"single": 1, "married": 2, "divorced": 3}
+
+
+def _int_value(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise SearchInputInvalid("条件 value 必须是整数") from exc
+
+
+def _float_value(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise SearchInputInvalid("条件 value 必须是数字") from exc
+
+
+def _dict_value(value: Any, key: str) -> Any:
+    if not isinstance(value, dict) or key not in value or value[key] is None:
+        raise SearchInputInvalid(f"条件 value 必须包含 {key}")
+    return value[key]
+
+
+def _single_city(value: Any) -> str:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    if (
+        isinstance(value, list)
+        and len(value) == 1
+        and isinstance(value[0], str)
+        and value[0].strip()
+    ):
+        return value[0].strip()
+    raise SearchInputInvalid("city_code 筛选一次仅支持一座城市")
+
+
+def _marriage_value(value: Any) -> int:
+    if isinstance(value, list):
+        if len(value) == 1:
+            value = value[0]
+        else:
+            raise SearchInputInvalid("marriage_status 一次仅支持一个取值")
+    if isinstance(value, int) and not isinstance(value, bool) and value in (1, 2, 3):
+        return value
+    if isinstance(value, str):
+        mapped = _MARRIAGE_VALUE_MAP.get(value.strip())
+        if mapped is not None:
+            return mapped
+    raise SearchInputInvalid("marriage_status 必须是 1/2/3 或 single/married/divorced")
+
+
+def _enum_value(value: Any) -> str:
+    """Return the raw string value of a str/Enum or a plain string."""
+    if hasattr(value, "value"):
+        return str(value.value)
+    return str(value)
+
+
+class CompiledFilters(DiscoveryFilters):
+    """``DiscoveryFilters`` 子类：AST 条件 → 筛选字段的静态映射。
+
+    使用 ``model_copy(update=...)`` 故意跳过基类的区间校验，使倒置区间
+    （如 ``age_min > age_max``）可被 ``detect_range_conflicts`` 报告为冲突，
+    而不是在编译期抛 ``ValueError``。本子类保持在 ai_search 模块内，不修改
+    ``app/schemas/discovery.py`` 的既有 Schema。
+    """
+
+    def with_condition(self, condition: SearchCondition) -> "CompiledFilters":
+        field_key = condition.field_key
+        operator = _enum_value(condition.operator)
+        value = condition.value
+        if field_key == "age":
+            if operator == "between":
+                return self.model_copy(
+                    update={
+                        "age_min": _int_value(_dict_value(value, "min")),
+                        "age_max": _int_value(_dict_value(value, "max")),
+                    }
+                )
+            if operator == "gte":
+                return self.model_copy(update={"age_min": _int_value(value)})
+            return self.model_copy(update={"age_max": _int_value(value)})
+        if field_key == "city_code":
+            return self.model_copy(update={"city_code": _single_city(value)})
+        if field_key == "marriage_status":
+            return self.model_copy(update={"marriage_status": _marriage_value(value)})
+        if field_key == "education_level":
+            return self.model_copy(update={"education_min": _int_value(value)})
+        if field_key == "height_cm":
+            if operator == "between":
+                return self.model_copy(
+                    update={
+                        "height_min": _int_value(_dict_value(value, "min")),
+                        "height_max": _int_value(_dict_value(value, "max")),
+                    }
+                )
+            if operator == "gte":
+                return self.model_copy(update={"height_min": _int_value(value)})
+            return self.model_copy(update={"height_max": _int_value(value)})
+        if field_key == "income_band":
+            if operator == "between":
+                return self.model_copy(
+                    update={
+                        "income_min": _float_value(_dict_value(value, "min")),
+                        "income_max": _float_value(_dict_value(value, "max")),
+                    }
+                )
+            if operator == "gte":
+                return self.model_copy(update={"income_min": _float_value(value)})
+            return self.model_copy(update={"income_max": _float_value(value)})
+        raise SearchInputInvalid(f"hard 字段 {field_key} 缺少静态映射")
+
+
+def detect_range_conflicts(filters: DiscoveryFilters) -> tuple[str, ...]:
+    """返回 age/height_cm/income_band 区间倒置冲突（统一方案 §8.1）。"""
+    conflicts: list[str] = []
+    if (
+        filters.age_min is not None
+        and filters.age_max is not None
+        and filters.age_min > filters.age_max
+    ):
+        conflicts.append("age 区间倒置：下限大于上限")
+    if (
+        filters.height_min is not None
+        and filters.height_max is not None
+        and filters.height_min > filters.height_max
+    ):
+        conflicts.append("height_cm 区间倒置：下限大于上限")
+    if (
+        filters.income_min is not None
+        and filters.income_max is not None
+        and filters.income_min > filters.income_max
+    ):
+        conflicts.append("income_band 区间倒置：下限大于上限")
+    return tuple(conflicts)
+
+
+def compile_search_conditions(conditions: list[SearchCondition]) -> CompiledSearch:
+    """把 AST 条件静态编译为现有 ``DiscoveryFilters`` 与受控 soft/unknown 列表。
+
+    - 未注册字段：confirmed → ``SearchPolicyDenied``；否则进 ``unknown``。
+    - 已注册字段用非法 operator → ``SearchInputInvalid``。
+    - 非 confirmed 条件不进入筛选/soft_terms（用户动作由 confirm 前置保证）。
+    - 永不生成 SQL；参数化 SQL 由 ``CandidateQueryService`` 负责。
+    """
+    filters = CompiledFilters()
+    soft_terms: list[tuple[str, Any]] = []
+    unknown: list[SearchCondition] = []
+    for condition in conditions:
+        rule = FIELD_RULES.get(condition.field_key)
+        if rule is None:
+            if condition.user_action == SearchConditionUserAction.CONFIRMED:
+                raise SearchPolicyDenied("AI_POLICY_DENIED")
+            unknown.append(condition)
+            continue
+        if _enum_value(condition.operator) not in rule["operators"]:
+            raise SearchInputInvalid("AI_INPUT_INVALID")
+        if condition.user_action != SearchConditionUserAction.CONFIRMED:
+            continue
+        if rule["kind"] == "hard":
+            filters = filters.with_condition(condition)
+        else:
+            soft_terms.append((condition.field_key, condition.value))
+    return CompiledSearch(
+        filters=filters,
+        soft_terms=tuple(soft_terms),
+        unknown=tuple(unknown),
+        conflicts=detect_range_conflicts(filters),
+        sql_expression=None,
+    )
+
+
+# ----------------------------------------------------------------------
+# 内部辅助（不 commit，由调用方控制事务）
+# ----------------------------------------------------------------------
+
+
+def _now_utc() -> datetime:
+    return datetime.now(UTC).replace(tzinfo=None)
+
+
+def _maybe_json(value: Any) -> Any:
+    if value is None or isinstance(value, (dict, list)):
+        return value
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except ValueError:
+            return None
+    return value
+
+
+async def _first_row(result: Any) -> dict[str, Any] | None:
+    return result.mappings().first()
+
+
+def _is_expired(expires_at: datetime | None) -> bool:
+    if expires_at is None:
+        return False
+    if isinstance(expires_at, datetime):
+        return expires_at.replace(tzinfo=None) < _now_utc()
+    return False
+
+
+def _consent_snapshot(row: dict[str, Any] | None) -> dict[str, Any]:
+    if not row:
+        return {}
+    granted_at = row.get("granted_at")
+    return {
+        "scope": str(row.get("scope") or SEARCH_CONSENT_SCOPE),
+        "version": str(row.get("version") or ""),
+        "policy_revision": str(row.get("policy_revision") or SEARCH_POLICY_REVISION),
+        "granted_at": granted_at.isoformat() if granted_at else None,
+    }
+
+
+async def _load_active_consent(
+    db: AsyncSession, user_id: int, scope: str
+) -> dict[str, Any] | None:
+    result = await db.execute(
+        text(
+            "SELECT user_id, scope, version, policy_revision, granted_at "
+            "FROM ai_consent_grant "
+            "WHERE user_id = :user_id AND scope = :scope AND revoked_at IS NULL "
+            "ORDER BY granted_at DESC LIMIT 1"
+        ),
+        {"user_id": user_id, "scope": scope},
+    )
+    return await _first_row(result)
+
+
+async def _load_revision_vector(db: AsyncSession, user_id: int) -> RevisionVector:
+    result = await db.execute(
+        text(
+            "SELECT profile_revision, preference_revision, privacy_revision, "
+            "relationship_revision, policy_revision "
+            "FROM user_revision_state WHERE user_id = :user_id"
+        ),
+        {"user_id": user_id},
+    )
+    row = await _first_row(result)
+    if row is None:
+        return RevisionVector()
+    return RevisionVector(
+        profile=int(row["profile_revision"] or 0),
+        preference=int(row["preference_revision"] or 0),
+        privacy=int(row["privacy_revision"] or 0),
+        relationship=int(row["relationship_revision"] or 0),
+        policy=int(row["policy_revision"] or 0),
+    )
+
+
+_DRAFT_COLUMNS = (
+    "draft_id, user_id, query_text, source, locale, status, condition_revision, "
+    "condition_schema_version, policy_revision, consent_snapshot_json, expires_at, "
+    "created_at, updated_at"
+)
+_CONDITION_COLUMNS = (
+    "id, draft_id, condition_revision, condition_no, field_key, operator, "
+    "value_json, condition_kind, confidence, source_span, user_action, "
+    "created_at, updated_at"
+)
+_SNAPSHOT_COLUMNS = (
+    "id, snapshot_id, user_id, draft_id, snapshot_hash, status, "
+    "condition_schema_version, policy_revision, consent_snapshot_json, "
+    "source_revision_json, expires_at, invalidated_at, created_at"
+)
+
+
+async def _load_draft_row(
+    db: AsyncSession, draft_id: str, *, for_update: bool = False
+) -> dict[str, Any] | None:
+    lock = " FOR UPDATE" if for_update else ""
+    result = await db.execute(
+        text(
+            f"SELECT {_DRAFT_COLUMNS} FROM ai_search_draft "
+            f"WHERE draft_id = :draft_id LIMIT 1{lock}"
+        ),
+        {"draft_id": draft_id},
+    )
+    return await _first_row(result)
+
+
+async def _load_condition_rows(
+    db: AsyncSession, draft_id: str
+) -> list[dict[str, Any]]:
+    result = await db.execute(
+        text(
+            f"SELECT {_CONDITION_COLUMNS} FROM ai_search_condition "
+            "WHERE draft_id = :draft_id ORDER BY condition_no ASC"
+        ),
+        {"draft_id": draft_id},
+    )
+    return list(result.mappings().all())
+
+
+async def _load_snapshot_row(
+    db: AsyncSession, snapshot_id: str, *, for_update: bool = False
+) -> dict[str, Any] | None:
+    lock = " FOR UPDATE" if for_update else ""
+    result = await db.execute(
+        text(
+            f"SELECT {_SNAPSHOT_COLUMNS} FROM ai_search_snapshot "
+            f"WHERE snapshot_id = :snapshot_id LIMIT 1{lock}"
+        ),
+        {"snapshot_id": snapshot_id},
+    )
+    return await _first_row(result)
+
+
+async def _find_snapshot_row_by_draft(
+    db: AsyncSession, draft_id: str
+) -> dict[str, Any] | None:
+    result = await db.execute(
+        text(
+            f"SELECT {_SNAPSHOT_COLUMNS} FROM ai_search_snapshot "
+            "WHERE draft_id = :draft_id AND invalidated_at IS NULL "
+            "ORDER BY id DESC LIMIT 1"
+        ),
+        {"draft_id": draft_id},
+    )
+    return await _first_row(result)
+
+
+async def _update_draft_status(
+    db: AsyncSession, draft_id: str, status: str
+) -> None:
+    await db.execute(
+        text(
+            "UPDATE ai_search_draft SET status = :status, "
+            "updated_at = UTC_TIMESTAMP() WHERE draft_id = :draft_id"
+        ),
+        {"status": status, "draft_id": draft_id},
+    )
+
+
+async def _bump_condition_revision(db: AsyncSession, draft_id: str) -> None:
+    await db.execute(
+        text(
+            "UPDATE ai_search_draft SET condition_revision = condition_revision + 1, "
+            "updated_at = UTC_TIMESTAMP() WHERE draft_id = :draft_id"
+        ),
+        {"draft_id": draft_id},
+    )
+
+
+async def _insert_condition(
+    db: AsyncSession,
+    draft_id: str,
+    revision_no: int,
+    condition_no: int,
+    field_key: str,
+    operator: str,
+    value: Any,
+    kind: str,
+    confidence: float,
+    source_span: str | None,
+    user_action: str,
+) -> None:
+    await db.execute(
+        text(
+            "INSERT INTO ai_search_condition "
+            "(draft_id, condition_revision, condition_no, field_key, operator, "
+            " value_json, condition_kind, confidence, source_span, user_action, "
+            " created_at, updated_at) "
+            "VALUES (:draft_id, :condition_revision, :condition_no, :field_key, "
+            " :operator, :value_json, :condition_kind, :confidence, :source_span, "
+            " :user_action, UTC_TIMESTAMP(), UTC_TIMESTAMP())"
+        ),
+        {
+            "draft_id": draft_id,
+            "condition_revision": revision_no,
+            "condition_no": condition_no,
+            "field_key": field_key,
+            "operator": operator,
+            "value_json": json.dumps(value, ensure_ascii=False) if value is not None else None,
+            "condition_kind": kind,
+            "confidence": float(confidence),
+            "source_span": source_span,
+            "user_action": user_action,
+        },
+    )
+
+
+async def _update_condition_action(
+    db: AsyncSession, draft_id: str, condition_no: int, action: str
+) -> None:
+    await db.execute(
+        text(
+            "UPDATE ai_search_condition SET user_action = :action, "
+            "updated_at = UTC_TIMESTAMP() "
+            "WHERE draft_id = :draft_id AND condition_no = :condition_no"
+        ),
+        {"action": action, "draft_id": draft_id, "condition_no": condition_no},
+    )
+
+
+async def _update_condition_value(
+    db: AsyncSession, draft_id: str, condition_no: int, value: Any
+) -> None:
+    await db.execute(
+        text(
+            "UPDATE ai_search_condition SET value_json = :value_json, "
+            "user_action = 'edited', updated_at = UTC_TIMESTAMP() "
+            "WHERE draft_id = :draft_id AND condition_no = :condition_no"
+        ),
+        {
+            "value_json": json.dumps(value, ensure_ascii=False),
+            "draft_id": draft_id,
+            "condition_no": condition_no,
+        },
+    )
+
+
+def _condition_from_row(row: dict[str, Any]) -> SearchCondition:
+    return SearchCondition(
+        field_key=str(row["field_key"]),
+        operator=str(row["operator"]),
+        value=_maybe_json(row.get("value_json")),
+        kind=str(row.get("condition_kind") or "soft"),
+        confidence=float(row.get("confidence") or 0.0),
+        source_span=row.get("source_span"),
+        user_action=str(row.get("user_action") or "pending"),
+    )
+
+
+def _condition_read_from_row(row: dict[str, Any]) -> SearchConditionRead:
+    return SearchConditionRead(
+        field_key=str(row["field_key"]),
+        operator=str(row["operator"]),
+        value=_maybe_json(row.get("value_json")),
+        kind=str(row.get("condition_kind") or "soft"),
+        confidence=float(row.get("confidence") or 0.0),
+        source_span=row.get("source_span"),
+        user_action=str(row.get("user_action") or "pending"),
+    )
+
+
+def _draft_conflicts(condition_rows: list[dict[str, Any]]) -> list[str]:
+    """从已确认条件重算区间冲突（草稿读取与 confirm 一致）。
+
+    只对 allowlist 内字段编译；off-allowlist（未知原文）条件即使被误确认，也只在
+    confirm 时以 422 AI_POLICY_DENIED 拒绝，不在只读 GET 中抛错。
+    """
+    confirmed = [
+        _condition_from_row(row)
+        for row in condition_rows
+        if str(row.get("user_action") or "pending") == "confirmed"
+        and str(row.get("field_key") or "") in FIELD_RULES
+    ]
+    return list(compile_search_conditions(confirmed).conflicts)
+
+
+async def _find_write_task(
+    db: AsyncSession, owner_user_id: int, task_type: str, idempotency_key: str
+) -> AiTaskRecord | None:
+    result = await db.execute(
+        text(
+            "SELECT id, task_id, owner_user_id, task_type, scene, idempotency_key, "
+            "request_digest, status, stage, attempt_count, max_attempts, next_run_at, "
+            "lease_owner, lease_until, consent_snapshot_json, source_revision_json, "
+            "payload_summary, error_code, error_message, result_ref, "
+            "created_at, updated_at, started_at, finished_at "
+            "FROM ai_task "
+            "WHERE owner_user_id = :owner_user_id AND task_type = :task_type "
+            "AND idempotency_key = :idempotency_key LIMIT 1"
+        ),
+        {
+            "owner_user_id": owner_user_id,
+            "task_type": task_type,
+            "idempotency_key": idempotency_key,
+        },
+    )
+    row = await _first_row(result)
+    return AiTaskRecord.from_row(row) if row else None
+
+
+def _replay_or_conflict(existing: AiTaskRecord, request_hash: str) -> AiTaskRecord:
+    if existing.request_digest != request_hash:
+        raise TaskError(
+            code="TASK_IDEMPOTENCY_CONFLICT",
+            message="Idempotency-Key 已用于不同请求内容",
+            status_code=409,
+        )
+    return existing
+
+
+def _hash_draft_request(draft_id: str, query_text: str) -> str:
+    payload = json.dumps(
+        {"draft_id": draft_id, "query_text": query_text},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _hash_confirm_request(draft_id: str, condition_revision: int) -> str:
+    payload = json.dumps(
+        {"draft_id": draft_id, "condition_revision": int(condition_revision)},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _hash_delete_request(snapshot_id: str) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            {"snapshot_id": snapshot_id},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+
+
+def _snapshot_hash(conditions: list[SearchCondition], policy_revision: str) -> str:
+    raw = json.dumps(
+        {
+            "policy_revision": policy_revision,
+            "conditions": [
+                {
+                    "field_key": condition.field_key,
+                    "operator": str(condition.operator),
+                    "value": condition.value,
+                    "kind": str(condition.kind),
+                    "user_action": str(condition.user_action),
+                }
+                for condition in conditions
+            ],
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+# ----------------------------------------------------------------------
+# 解析额度（每用户每分钟 ai_search_parse_rate_per_minute 次）
+# ----------------------------------------------------------------------
+
+_MINUTE_QUOTA_LUA = """
+local value = redis.call('INCR', KEYS[1])
+if value == 1 then redis.call('EXPIRE', KEYS[1], ARGV[2]) end
+if value > tonumber(ARGV[1]) then redis.call('DECR', KEYS[1]); return 0 end
+return 1
+"""
+
+_local_minute_quota: dict[str, int] = {}
+
+
+def reset_local_quota_for_testing() -> None:
+    """清空本地（无 Redis）分钟额度计数，仅测试使用。"""
+    _local_minute_quota.clear()
+
+
+def _parse_quota_window() -> int:
+    """当前分钟窗口号（测试可 monkeypatch 固定，避免跨分钟边界 flake，I-3）。"""
+    return int(time.time() // 60)
+
+
+async def _consume_parse_quota(db: AsyncSession, user_id: int) -> None:
+    limit = settings.ai_search_parse_rate_per_minute
+    window = _parse_quota_window()
+    key = f"ai:search:parse:{user_id}:{window}"
+    try:
+        consumed = await redis_client.eval(_MINUTE_QUOTA_LUA, 1, key, limit, 120)
+        if not consumed:
+            raise SearchQuotaExceeded()
+    except RedisError:
+        if settings.environment in {"development", "testing"}:
+            used = _local_minute_quota.get(key, 0)
+            if used >= limit:
+                raise SearchQuotaExceeded()
+            _local_minute_quota[key] = used + 1
+        else:
+            # Redis 不可用时对限流放行（尽力而为），不阻塞搜索主链路。
+            logger.warning("ai_search_quota_redis_unavailable user_id=%s", user_id)
+
+
+# ----------------------------------------------------------------------
+# 草稿创建与解析
+# ----------------------------------------------------------------------
+
+
+def normalize_search_query(query_text: str) -> str:
+    """Trim 并校验 query_text（1..1000 字符，统一方案 §8.3）。"""
+    normalized = query_text.strip()
+    if not 1 <= len(normalized) <= 1000:
+        raise SearchInputInvalid("query_text must contain 1..1000 characters")
+    return normalized
+
+
+async def create_search_draft(
+    db: AsyncSession,
+    owner_user_id: int,
+    query_text: str,
+    source: str | None,
+    locale: str | None,
+    idempotency_key: str,
+) -> SearchDraftParse:
+    """写 ``parsing`` 草稿并入队 ``search_parse`` 任务（202 draft+parse task）。
+
+    输入校验（query_text 长度）先于任何数据库查询；``search_parse`` 授权缺失 →
+    403 AI_CONSENT_REQUIRED；每分钟解析额度耗尽 → 429 AI_QUOTA_EXCEEDED。
+    不 commit。
+    """
+    normalized = normalize_search_query(query_text)
+    consent = await _load_active_consent(db, owner_user_id, SEARCH_CONSENT_SCOPE)
+    if consent is None:
+        raise SearchConsentRequired()
+    await _consume_parse_quota(db, owner_user_id)
+    consent_snapshot = _consent_snapshot(consent)
+    revision = await _load_revision_vector(db, owner_user_id)
+    draft_id = uuid.uuid4().hex
+    expires_at = _now_utc() + timedelta(hours=settings.ai_search_draft_expire_hours)
+    policy_revision = consent_snapshot.get("policy_revision") or SEARCH_POLICY_REVISION
+    await db.execute(
+        text(
+            "INSERT INTO ai_search_draft "
+            "(draft_id, user_id, query_text, source, locale, status, condition_revision, "
+            " condition_schema_version, policy_revision, consent_snapshot_json, "
+            " expires_at, created_at, updated_at) "
+            "VALUES (:draft_id, :user_id, :query_text, :source, :locale, 'parsing', 0, "
+            " :condition_schema_version, :policy_revision, :consent_snapshot_json, "
+            " :expires_at, UTC_TIMESTAMP(), UTC_TIMESTAMP())"
+        ),
+        {
+            "draft_id": draft_id,
+            "user_id": owner_user_id,
+            "query_text": normalized,
+            "source": (source or "")[:24] or None,
+            "locale": (locale or "")[:16] or None,
+            "condition_schema_version": SEARCH_SCHEMA_VERSION,
+            "policy_revision": policy_revision,
+            "consent_snapshot_json": json.dumps(consent_snapshot, ensure_ascii=False),
+            "expires_at": expires_at,
+        },
+    )
+    task = await enqueue_task(
+        db=db,
+        owner_user_id=owner_user_id,
+        task_type=SEARCH_PARSE_TASK_TYPE,
+        idempotency_key=idempotency_key,
+        request_hash=_hash_draft_request(draft_id, normalized),
+        revisions=revision,
+        consent=consent_snapshot,
+    )
+    await db.execute(
+        text(
+            "UPDATE ai_task SET payload_summary = :payload_summary, "
+            "updated_at = UTC_TIMESTAMP() WHERE task_id = :task_id"
+        ),
+        {
+            "payload_summary": json.dumps(
+                {
+                    "draft_id": draft_id,
+                    "source": source,
+                    "locale": locale,
+                },
+                ensure_ascii=False,
+            ),
+            "task_id": task.task_id,
+        },
+    )
+    await db.flush()
+    return SearchDraftParse(
+        draft_id=draft_id,
+        status=SearchDraftStatus.PARSING.value,
+        task_id=task.task_id,
+        condition_schema_version=SEARCH_SCHEMA_VERSION,
+        expires_at=expires_at,
+    )
+
+
+async def parse_search_draft(
+    db: AsyncSession, task: AiTaskRecord, worker_id: str
+) -> tuple[str, RevisionVector] | None:
+    """``search_parse`` Worker handler：调用 Gateway 并落条件行。
+
+    结果只写 ``pending`` 条件与 off-allowlist 未知原文伪条件；成功后草稿转
+    ``awaiting_confirmation``。已解析草稿（已有条件行）重复执行时直接推进状态
+    （幂等）。失败只改变任务状态，不产生条件。返回 ``(result_ref, revisions)``。
+    """
+    payload = task.payload_summary or {}
+    draft_id = payload.get("draft_id")
+    if not draft_id:
+        await fail_task(
+            db, task.task_id, worker_id,
+            error_code="AI_FEATURE_DISABLED", retryable=False,
+        )
+        return None
+    draft = await _load_draft_row(db, str(draft_id))
+    if draft is None or int(draft["user_id"]) != task.owner_user_id:
+        await fail_task(
+            db, task.task_id, worker_id,
+            error_code="AI_INPUT_INVALID", retryable=False,
+        )
+        return None
+    if str(draft["status"]) not in (
+        SearchDraftStatus.PARSING.value,
+        SearchDraftStatus.AWAITING_CONFIRMATION.value,
+    ):
+        await fail_task(
+            db, task.task_id, worker_id,
+            error_code="RESULT_STALE", retryable=False,
+        )
+        return None
+
+    existing = await _load_condition_rows(db, str(draft_id))
+    if not existing:
+        context = AITaskContext(
+            task_id=task.task_id,
+            request_id=uuid.uuid4().hex,
+            scene="search_parse",
+            provider="mock",
+            model="mock-model-v1",
+            prompt_version="search-parse-prompt-v1",
+            schema_version=SEARCH_SCHEMA_VERSION,
+            input_revision=task.source_revision_json or {},
+        )
+        request = SearchParseRequest(
+            query_text=str(draft["query_text"]),
+            locale=draft.get("locale"),
+        )
+        gateway = AIGateway(timeout_seconds=settings.ai_gateway_timeout_seconds)
+        outcome = await gateway.parse_search_query(context, request)
+        if outcome.result is None:
+            await fail_task(
+                db, task.task_id, worker_id,
+                error_code=outcome.error_code or "AI_TEMPORARILY_UNAVAILABLE",
+                retryable=outcome.retryable,
+            )
+            return None
+        revision_no = int(draft.get("condition_revision") or 0)
+        condition_no = 0
+        for condition in outcome.result.conditions:
+            await _insert_condition(
+                db,
+                str(draft_id),
+                revision_no,
+                condition_no,
+                str(condition.field_key),
+                str(condition.operator),
+                condition.value,
+                str(condition.kind),
+                float(condition.confidence),
+                condition.source_span,
+                SearchConditionUserAction.PENDING.value,
+            )
+            condition_no += 1
+        for term in outcome.result.unknown:
+            await _insert_condition(
+                db,
+                str(draft_id),
+                revision_no,
+                condition_no,
+                str(term),
+                "eq",
+                None,
+                "soft",
+                0.0,
+                str(term),
+                SearchConditionUserAction.PENDING.value,
+            )
+            condition_no += 1
+    if str(draft["status"]) == SearchDraftStatus.PARSING.value:
+        await _update_draft_status(
+            db, str(draft_id), SearchDraftStatus.AWAITING_CONFIRMATION.value
+        )
+    revisions = RevisionVector(**task.source_revision_json) if task.source_revision_json else RevisionVector()
+    return f"search-draft:{draft_id}", revisions
+
+
+# ----------------------------------------------------------------------
+# 草稿读取 / 条件编辑
+# ----------------------------------------------------------------------
+
+
+async def load_search_draft(
+    db: AsyncSession, draft_id: str, owner_user_id: int
+) -> SearchDraftRead:
+    """只读草稿 + AST 条件 + 未知项 + 冲突（仅本人；过期仍可读摘要）。"""
+    row = await _load_draft_row(db, draft_id)
+    if row is None or int(row["user_id"]) != owner_user_id:
+        raise SearchDraftNotFound()
+    condition_rows = await _load_condition_rows(db, draft_id)
+    conditions: list[SearchConditionRead] = []
+    unknown: list[str] = []
+    for condition_row in condition_rows:
+        if str(condition_row["field_key"]) not in FIELD_RULES:
+            if str(condition_row.get("user_action") or "pending") != "removed":
+                unknown.append(str(condition_row["field_key"]))
+        conditions.append(_condition_read_from_row(condition_row))
+    return SearchDraftRead(
+        draft_id=str(row["draft_id"]),
+        status=SearchDraftStatus(str(row["status"])),
+        condition_revision=int(row.get("condition_revision") or 0),
+        condition_schema_version=str(
+            row.get("condition_schema_version") or SEARCH_SCHEMA_VERSION
+        ),
+        conditions=conditions,
+        unknown=unknown,
+        conflicts=_draft_conflicts(condition_rows),
+        expires_at=row.get("expires_at"),
+    )
+
+
+async def patch_search_draft(
+    db: AsyncSession,
+    draft_id: str,
+    owner_user_id: int,
+    patches: list[Any],
+    expected_condition_revision: int,
+) -> SearchDraftRead:
+    """显式 confirm/edit/remove 条件（condition_revision 乐观锁）。
+
+    remove 只标记不可见，重解析不会恢复；edit 更新 value 并置 ``edited``（需再
+    confirm）；仅 ``awaiting_confirmation`` 草稿可编辑。不 commit。
+    """
+    draft = await _load_draft_row(db, draft_id, for_update=True)
+    if draft is None or int(draft["user_id"]) != owner_user_id:
+        raise SearchDraftNotFound()
+    if int(draft.get("condition_revision") or 0) != int(expected_condition_revision):
+        raise DraftVersionConflict()
+    if str(draft["status"]) != SearchDraftStatus.AWAITING_CONFIRMATION.value:
+        raise SearchDraftNotConfirmed("草稿当前不可编辑（需处于待确认状态）")
+    condition_rows = await _load_condition_rows(db, draft_id)
+    known_nos = {int(row["condition_no"]) for row in condition_rows}
+    applied = 0
+    for patch in patches:
+        condition_no = int(patch.condition_no)
+        if condition_no not in known_nos:
+            raise SearchInputInvalid(f"condition_no {condition_no} 不存在")
+        action = str(patch.action)
+        if action == "remove":
+            await _update_condition_action(db, draft_id, condition_no, "removed")
+            applied += 1
+        elif action == "confirm":
+            await _update_condition_action(db, draft_id, condition_no, "confirmed")
+            applied += 1
+        elif action == "edit":
+            if patch.value is None:
+                raise SearchInputInvalid("edit 必须提供 value")
+            await _update_condition_value(db, draft_id, condition_no, patch.value)
+            applied += 1
+        else:
+            raise SearchInputInvalid(f"action {action} 非法")
+    if applied:
+        await _bump_condition_revision(db, draft_id)
+    return await load_search_draft(db, draft_id, owner_user_id)
+
+
+# ----------------------------------------------------------------------
+# 确认 → 不可变快照 + search_execute 任务
+# ----------------------------------------------------------------------
+
+
+async def confirm_search_draft(
+    db: AsyncSession,
+    draft_id: str,
+    owner_user_id: int,
+    expected_condition_revision: int,
+    idempotency_key: str,
+) -> SearchSnapshot:
+    """用户确认全部 hard 条件且解决 conflicts 后才创建快照与候选查询任务。
+
+    未确认（仍 ``awaiting_confirmation`` 且无已确认条件）或非确认状态草稿 →
+    ``SearchDraftNotConfirmed``；编译失败不创建候选任务；同 key 同 payload 回放
+    既有任务与快照。不 commit。
+    """
+    request_hash = _hash_confirm_request(draft_id, int(expected_condition_revision))
+    existing_task = await _find_write_task(
+        db, owner_user_id, SEARCH_EXECUTE_TASK_TYPE, idempotency_key
+    )
+    if existing_task is not None:
+        _replay_or_conflict(existing_task, request_hash)
+        snapshot = await _find_snapshot_row_by_draft(db, draft_id)
+        if snapshot is not None:
+            return SearchSnapshot(
+                snapshot_id=str(snapshot["snapshot_id"]),
+                task_id=existing_task.task_id,
+                status=existing_task.status.value,
+                condition_schema_version=str(
+                    snapshot.get("condition_schema_version") or SEARCH_SCHEMA_VERSION
+                ),
+                expires_at=snapshot.get("expires_at"),
+                replayed=True,
+            )
+
+    draft = await _load_draft_row(db, draft_id, for_update=True)
+    if draft is None or int(draft["user_id"]) != owner_user_id:
+        raise SearchDraftNotFound()
+    if _is_expired(draft.get("expires_at")):
+        await _update_draft_status(db, draft_id, SearchDraftStatus.EXPIRED.value)
+        raise SearchDraftNotConfirmed("草稿已过期")
+    if str(draft["status"]) == SearchDraftStatus.CONFIRMED.value:
+        snapshot = await _find_snapshot_row_by_draft(db, draft_id)
+        if snapshot is not None:
+            return SearchSnapshot(
+                snapshot_id=str(snapshot["snapshot_id"]),
+                task_id=existing_task.task_id if existing_task else "",
+                status=existing_task.status.value if existing_task else "queued",
+                condition_schema_version=str(
+                    snapshot.get("condition_schema_version") or SEARCH_SCHEMA_VERSION
+                ),
+                expires_at=snapshot.get("expires_at"),
+                replayed=True,
+            )
+        raise SearchDraftNotConfirmed("草稿已确认但快照缺失")
+    if str(draft["status"]) != SearchDraftStatus.AWAITING_CONFIRMATION.value:
+        raise SearchDraftNotConfirmed("草稿未处于待确认状态")
+    if int(draft.get("condition_revision") or 0) != int(expected_condition_revision):
+        raise DraftVersionConflict()
+
+    condition_rows = await _load_condition_rows(db, draft_id)
+    condition_objects = [_condition_from_row(row) for row in condition_rows]
+    compiled = compile_search_conditions(condition_objects)
+    if compiled.conflicts:
+        raise SearchDraftNotConfirmed("存在未解决的区间冲突")
+
+    active_hard = [
+        condition
+        for condition in condition_objects
+        if condition.field_key in FIELD_RULES
+        and FIELD_RULES[condition.field_key]["kind"] == "hard"
+        and condition.user_action != SearchConditionUserAction.REMOVED
+    ]
+    missing_hard = [
+        condition.field_key
+        for condition in active_hard
+        if condition.user_action != SearchConditionUserAction.CONFIRMED
+    ]
+    if missing_hard:
+        raise SearchDraftNotConfirmed(
+            f"存在未确认的硬条件: {', '.join(sorted(set(missing_hard)))}"
+        )
+    if not any(
+        condition.user_action == SearchConditionUserAction.CONFIRMED
+        for condition in condition_objects
+        if condition.field_key in FIELD_RULES
+    ):
+        raise SearchDraftNotConfirmed("没有可执行的已确认条件")
+
+    consent_snapshot = _consent_snapshot(await _load_active_consent(
+        db, owner_user_id, SEARCH_CONSENT_SCOPE
+    ))
+    revision = await _load_revision_vector(db, owner_user_id)
+    policy_revision = str(draft.get("policy_revision") or SEARCH_POLICY_REVISION)
+    snapshot_id = uuid.uuid4().hex
+    snapshot_hash = _snapshot_hash(condition_objects, policy_revision)
+    expires_at = _now_utc() + timedelta(hours=settings.ai_search_draft_expire_hours)
+    await db.execute(
+        text(
+            "INSERT INTO ai_search_snapshot "
+            "(snapshot_id, user_id, draft_id, snapshot_hash, status, "
+            " condition_schema_version, policy_revision, consent_snapshot_json, "
+            " source_revision_json, expires_at, invalidated_at, created_at) "
+            "VALUES (:snapshot_id, :user_id, :draft_id, :snapshot_hash, 'completed', "
+            " :condition_schema_version, :policy_revision, :consent_snapshot_json, "
+            " :source_revision_json, :expires_at, NULL, UTC_TIMESTAMP())"
+        ),
+        {
+            "snapshot_id": snapshot_id,
+            "user_id": owner_user_id,
+            "draft_id": draft_id,
+            "snapshot_hash": snapshot_hash,
+            "condition_schema_version": SEARCH_SCHEMA_VERSION,
+            "policy_revision": policy_revision,
+            "consent_snapshot_json": json.dumps(consent_snapshot, ensure_ascii=False),
+            "source_revision_json": json.dumps(revision.as_dict(), ensure_ascii=False),
+            "expires_at": expires_at,
+        },
+    )
+    task = await enqueue_task(
+        db=db,
+        owner_user_id=owner_user_id,
+        task_type=SEARCH_EXECUTE_TASK_TYPE,
+        idempotency_key=idempotency_key,
+        request_hash=request_hash,
+        revisions=revision,
+        consent=consent_snapshot,
+    )
+    await db.execute(
+        text(
+            "UPDATE ai_task SET payload_summary = :payload_summary, "
+            "updated_at = UTC_TIMESTAMP() WHERE task_id = :task_id"
+        ),
+        {
+            "payload_summary": json.dumps(
+                {"snapshot_id": snapshot_id, "draft_id": draft_id},
+                ensure_ascii=False,
+            ),
+            "task_id": task.task_id,
+        },
+    )
+    await _update_draft_status(db, draft_id, SearchDraftStatus.CONFIRMED.value)
+    await db.flush()
+    return SearchSnapshot(
+        snapshot_id=snapshot_id,
+        task_id=task.task_id,
+        status=task.status.value,
+        condition_schema_version=SEARCH_SCHEMA_VERSION,
+        expires_at=expires_at,
+    )
+
+
+# ----------------------------------------------------------------------
+# 候选查询构造与执行（复用 CandidateQueryService / CandidateVisibilityService）
+# ----------------------------------------------------------------------
+
+candidate_query_service = CandidateQueryService(secret_key=settings.secret_key)
+candidate_visibility_service = CandidateVisibilityService()
+
+
+def _hard_filter_clauses(
+    filters: DiscoveryFilters, params: dict[str, Any]
+) -> list[str]:
+    """把编译后的 hard 筛选映射为参数化 SQL（与 discovery._filter_sql 同源口径）。
+
+    参数全部来自服务器侧编译结果，模型输出永远不能成为 SQL 文本。
+    """
+    clauses: list[str] = []
+    if filters.age_min is not None:
+        clauses.append(
+            f"u.birthday <= DATE_SUB(CURDATE(), INTERVAL {int(filters.age_min)} YEAR)"
+        )
+    if filters.age_max is not None:
+        clauses.append(
+            f"u.birthday >= DATE_SUB(CURDATE(), INTERVAL {int(filters.age_max) + 1} YEAR)"
+        )
+    if filters.city_code:
+        clauses.append("p.residence_city_code = :filter_city_code")
+        params["filter_city_code"] = filters.city_code
+    if filters.marriage_status:
+        clauses.append("u.is_married = :filter_marriage")
+        params["filter_marriage"] = int(filters.marriage_status)
+    if filters.education_min:
+        clauses.append("p.education_level >= :filter_education")
+        params["filter_education"] = int(filters.education_min)
+    if filters.height_min:
+        clauses.append("p.height >= :filter_height_min")
+        params["filter_height_min"] = int(filters.height_min)
+    if filters.height_max:
+        clauses.append("p.height <= :filter_height_max")
+        params["filter_height_max"] = int(filters.height_max)
+    if filters.income_min is not None:
+        clauses.append("p.income >= :filter_income_min")
+        params["filter_income_min"] = float(filters.income_min)
+    if filters.income_max is not None:
+        clauses.append("p.income <= :filter_income_max")
+        params["filter_income_max"] = float(filters.income_max)
+    return clauses
+
+
+def build_search_query_snapshot(
+    *,
+    viewer_id: int,
+    viewer: dict[str, Any],
+    viewer_is_vip: bool,
+    compiled: CompiledSearch,
+    page: int = 1,
+) -> CandidateQuerySnapshot:
+    """用 CompiledSearch 构造 CandidateQueryService 的候选查询快照。
+
+    复用 ``CandidateVisibilityService.predicate``（SEARCH 场景）与
+    ``CARD_SELECT/CARD_FROM``；soft 标签（interest_tags/lifestyle_tags）按字面
+    JSON_CONTAINS 逐条编译；fingerprint 绑定 cursor 与查询身份。不包含任何
+    模型生成的 SQL。
+    """
+    visibility = candidate_visibility_service.predicate(
+        ViewerContext(
+            user_id=viewer_id,
+            realname_status=int(viewer.get("realname_status") or 0),
+            is_vip=viewer_is_vip,
+        ),
+        VisibilityScene.SEARCH,
+    )
+    params: dict[str, Any] = {"viewer_id": viewer_id, **visibility.params}
+    clauses = [visibility.clause]
+    clauses.extend(_hard_filter_clauses(compiled.filters, params))
+    tag_terms = [
+        value
+        for field_key, value in compiled.soft_terms
+        if field_key in _TAG_SOFT_FIELDS and isinstance(value, str) and value.strip()
+    ]
+    for index, tag in enumerate(tag_terms):
+        param = f"search_tag_{index}"
+        clauses.append(
+            "(JSON_CONTAINS(p.interest_tags, JSON_QUOTE(:%s)) "
+            "OR JSON_CONTAINS(p.personality_tags, JSON_QUOTE(:%s)) "
+            "OR JSON_SEARCH(p.tags, 'one', :%s) IS NOT NULL)" % (param, param, param)
+        )
+        params[param] = tag
+    filter_facts = compiled.filters.model_dump(mode="json")
+    for key in ("cursor", "page", "page_size"):
+        filter_facts.pop(key, None)
+    query_fingerprint = build_query_fingerprint(
+        {
+            "viewer_id": viewer_id,
+            "viewer_realname_status": int(viewer.get("realname_status") or 0),
+            "viewer_is_vip": viewer_is_vip,
+            "scene": VisibilityScene.SEARCH.value,
+            "filters": filter_facts,
+            "soft_terms": compiled.soft_terms,
+            "policy_revision": visibility.policy_revision,
+            "sort_version": SORT_VERSION,
+        }
+    )
+    return CandidateQuerySnapshot(
+        select_sql=CARD_SELECT + CARD_FROM,
+        count_sql="SELECT COUNT(DISTINCT u.id)" + CARD_FROM,
+        where_sql=" AND ".join(clauses),
+        params=params,
+        query_fingerprint=query_fingerprint,
+        page=page,
+    )
+
+
+async def _load_viewer_context(db: AsyncSession, user_id: int) -> dict[str, Any]:
+    result = await db.execute(
+        text(
+            "SELECT u.gender, u.birthday, "
+            "COALESCE(c.score, 0) AS completion_score, "
+            "COALESCE(ua.realname_status, 0) AS realname_status, "
+            "COALESCE(pr.only_vip_can_see_detail, 0) AS only_vip_can_see_detail "
+            "FROM users u "
+            "LEFT JOIN user_profile_completion c ON c.user_id = u.id "
+            "LEFT JOIN user_auth ua ON ua.user_id = u.id "
+            "LEFT JOIN user_privacy pr ON pr.user_id = u.id "
+            "WHERE u.id = :user_id"
+        ),
+        {"user_id": user_id},
+    )
+    row = await _first_row(result)
+    if row is None:
+        raise SearchDraftNotFound()
+    return dict(row)
+
+
+async def _is_vip(db: AsyncSession, user_id: int) -> bool:
+    result = await db.execute(
+        text(
+            "SELECT EXISTS (SELECT 1 FROM user_membership "
+            "WHERE user_id = :user_id AND status = 1 "
+            "AND (start_at IS NULL OR start_at <= UTC_TIMESTAMP()) "
+            "AND (end_at IS NULL OR end_at > UTC_TIMESTAMP()))"
+        ),
+        {"user_id": user_id},
+    )
+    return bool(result.scalar())
+
+
+async def _load_projections(
+    db: AsyncSession, user_ids: list[int]
+) -> dict[int, dict[str, Any]]:
+    if not user_ids:
+        return {}
+    placeholders = ", ".join(f":uid{i}" for i in range(len(user_ids)))
+    result = await db.execute(
+        text(
+            "SELECT subject_user_id, fields_json, profile_revision, status, expires_at "
+            "FROM ai_feature_projection "
+            f"WHERE subject_user_id IN ({placeholders}) "
+            "AND projection_kind = 'personal_searchable' AND status = 'active'"
+        ),
+        {f"uid{i}": uid for i, uid in enumerate(user_ids)},
+    )
+    projections: dict[int, dict[str, Any]] = {}
+    for row in result.mappings().all():
+        projections[int(row["subject_user_id"])] = {
+            "fields": _maybe_json(row.get("fields_json")) or {},
+            "profile_revision": int(row.get("profile_revision") or 0),
+        }
+    return projections
+
+
+def _soft_matches(field_key: str, expected: Any, actual: Any) -> bool:
+    expected_text = str(expected)
+    if field_key in _TAG_SOFT_FIELDS:
+        candidates: list[str] = []
+        for value in (actual if isinstance(actual, list) else [actual]):
+            candidates.append(str(value))
+        return expected_text in candidates
+    return str(actual) == expected_text
+
+
+def _evidence_for_row(
+    row: dict[str, Any],
+    condition_objects: list[SearchCondition],
+    compiled: CompiledSearch,
+    projection: dict[str, Any] | None,
+) -> SearchEvidence:
+    hard_keys = sorted(
+        {
+            condition.field_key
+            for condition in condition_objects
+            if condition.field_key in FIELD_RULES
+            and FIELD_RULES[condition.field_key]["kind"] == "hard"
+            and condition.user_action == SearchConditionUserAction.CONFIRMED
+        }
+    )
+    matched = list(hard_keys)
+    reason_codes = ["HARD_CONDITION_MATCH"] if hard_keys else []
+    unknown: list[str] = []
+    fields = (projection or {}).get("fields") or {}
+    profile_revision = int((projection or {}).get("profile_revision") or 0)
+    for field_key, value in compiled.soft_terms:
+        field_value = fields.get(field_key)
+        if field_value is None:
+            unknown.append(field_key)
+            reason_codes.append("SOFT_FIELD_UNKNOWN")
+            continue
+        if _soft_matches(field_key, value, field_value):
+            matched.append(field_key)
+            reason_codes.append("SOFT_FIELD_MATCH")
+        else:
+            reason_codes.append("SOFT_FIELD_NO_MATCH")
+    return SearchEvidence(
+        matched_condition_count=len(matched),
+        matched_conditions=matched,
+        unknown_conditions=unknown,
+        reason_codes=reason_codes,
+        profile_revision=profile_revision,
+    )
+
+
+def _result_card(row: dict[str, Any]) -> dict[str, Any]:
+    """只返回当前可见卡片字段；detail_locked 隐私字段不进入结果卡片。"""
+    from datetime import date
+
+    from app.services.profile import _calculate_age
+
+    birthday = row.get("birthday")
+    if isinstance(birthday, str):
+        try:
+            birthday = date.fromisoformat(birthday)
+        except ValueError:
+            birthday = None
+    return {
+        "user_id": int(row["user_id"]),
+        "nickname": row.get("nickname"),
+        "avatar": row.get("avatar"),
+        "age": _calculate_age(birthday) if birthday else None,
+        "city_code": row.get("residence_city_code"),
+        "education_level": row.get("education_level"),
+        "height": row.get("height"),
+        "occupation": row.get("occupation"),
+        "income": float(row["income"]) if row.get("income") is not None else None,
+        "is_married": row.get("is_married"),
+        "interest_tags": _maybe_json(row.get("interest_tags")) or [],
+    }
+
+
+async def _upsert_result_row(
+    db: AsyncSession,
+    snapshot_id: str,
+    target_user_id: int,
+    rank_position: int,
+    evidence: SearchEvidence,
+    result_expires_at: datetime,
+) -> None:
+    await db.execute(
+        text(
+            "INSERT INTO ai_search_result "
+            "(snapshot_id, target_user_id, rank_position, matched_condition_count, "
+            " matched_conditions, unknown_conditions, reason_codes, profile_revision, "
+            " result_expires_at, stale, created_at) "
+            "VALUES (:snapshot_id, :target_user_id, :rank_position, "
+            " :matched_condition_count, :matched_conditions, :unknown_conditions, "
+            " :reason_codes, :profile_revision, :result_expires_at, 0, UTC_TIMESTAMP()) "
+            "ON DUPLICATE KEY UPDATE "
+            " rank_position = VALUES(rank_position), "
+            " matched_condition_count = VALUES(matched_condition_count), "
+            " matched_conditions = VALUES(matched_conditions), "
+            " unknown_conditions = VALUES(unknown_conditions), "
+            " reason_codes = VALUES(reason_codes), "
+            " profile_revision = VALUES(profile_revision), "
+            " result_expires_at = VALUES(result_expires_at), "
+            " stale = 0"
+        ),
+        {
+            "snapshot_id": snapshot_id,
+            "target_user_id": target_user_id,
+            "rank_position": rank_position,
+            "matched_condition_count": evidence.matched_condition_count,
+            "matched_conditions": json.dumps(
+                evidence.matched_conditions, ensure_ascii=False
+            ),
+            "unknown_conditions": json.dumps(
+                evidence.unknown_conditions, ensure_ascii=False
+            ),
+            "reason_codes": json.dumps(evidence.reason_codes, ensure_ascii=False),
+            "profile_revision": evidence.profile_revision,
+            "result_expires_at": result_expires_at,
+        },
+    )
+
+
+async def execute_search_snapshot(
+    db: AsyncSession,
+    snapshot_id: str,
+    owner_user_id: int,
+    cursor: str | None,
+    page_size: int,
+) -> SearchResultPageRead:
+    """执行确认后的快照并返回 cursor 结果页（GET 读取路径）。
+
+    每次读取重新过 ``CandidateVisibilityService.decide`` 门禁（被拉黑/撤回对象
+    排除），软字段缺失记为 ``unknown`` 不当硬失败；当前可见卡片引用与证据写入
+    ``ai_search_result``；快照过期返回 stale 页。结果读取以 MySQL 为事实源，
+    Redis 断开时天然恢复。
+    """
+    snapshot = await _load_snapshot_row(db, snapshot_id)
+    if snapshot is None or int(snapshot["user_id"]) != owner_user_id:
+        raise SearchSnapshotNotFound()
+    if snapshot.get("invalidated_at") is not None:
+        raise SearchSnapshotNotFound()
+    if _is_expired(snapshot.get("expires_at")):
+        return SearchResultPageRead(
+            snapshot_id=snapshot_id,
+            status="stale",
+            items=[],
+            next_cursor=None,
+            total=0,
+            total_is_estimate=False,
+            degraded=False,
+        )
+
+    draft_id = str(snapshot.get("draft_id") or "")
+    condition_rows = await _load_condition_rows(db, draft_id) if draft_id else []
+    condition_objects = [_condition_from_row(row) for row in condition_rows]
+    compiled = compile_search_conditions(condition_objects)
+
+    viewer = await _load_viewer_context(db, owner_user_id)
+    viewer_is_vip = await _is_vip(db, owner_user_id)
+    query_snapshot = build_search_query_snapshot(
+        viewer_id=owner_user_id,
+        viewer=viewer,
+        viewer_is_vip=viewer_is_vip,
+        compiled=compiled,
+        page=1,
+    )
+    page = await candidate_query_service.fetch_page(
+        db, query_snapshot, cursor=cursor, page_size=page_size
+    )
+    user_ids = [int(row["user_id"]) for row in page.items]
+    projections = await _load_projections(db, user_ids)
+    now = _now_utc()
+    result_expires_at = now + timedelta(minutes=SEARCH_RESULT_TTL_MINUTES)
+
+    items: list[SearchResultItemRead] = []
+    rank = 0
+    for row in page.items:
+        candidate_id = int(row["user_id"])
+        decision = await candidate_visibility_service.decide(
+            db, owner_user_id, candidate_id, VisibilityScene.SEARCH
+        )
+        if not decision.allowed:
+            continue
+        evidence = _evidence_for_row(
+            row, condition_objects, compiled, projections.get(candidate_id)
+        )
+        rank += 1
+        await _upsert_result_row(
+            db, snapshot_id, candidate_id, rank, evidence, result_expires_at
+        )
+        items.append(
+            SearchResultItemRead(
+                user_id=candidate_id,
+                card=_result_card(row),
+                matched_condition_count=evidence.matched_condition_count,
+                matched_conditions=evidence.matched_conditions,
+                unknown_conditions=evidence.unknown_conditions,
+                reason_codes=evidence.reason_codes,
+                profile_revision=evidence.profile_revision,
+                result_expires_at=result_expires_at,
+            )
+        )
+    return SearchResultPageRead(
+        snapshot_id=snapshot_id,
+        status="completed",
+        items=items,
+        next_cursor=page.next_cursor,
+        total=page.total,
+        total_is_estimate=page.total_is_estimate,
+        degraded=False,
+    )
+
+
+async def search_execute_handler(
+    db: AsyncSession, task: AiTaskRecord, worker_id: str
+) -> tuple[str, RevisionVector] | None:
+    """``search_execute`` Worker handler：预执行快照并持久化首屏结果。"""
+    payload = task.payload_summary or {}
+    snapshot_id = payload.get("snapshot_id")
+    if not snapshot_id:
+        await fail_task(
+            db, task.task_id, worker_id,
+            error_code="AI_INPUT_INVALID", retryable=False,
+        )
+        return None
+    snapshot = await _load_snapshot_row(db, str(snapshot_id))
+    if snapshot is None or int(snapshot["user_id"]) != task.owner_user_id:
+        await fail_task(
+            db, task.task_id, worker_id,
+            error_code="AI_INPUT_INVALID", retryable=False,
+        )
+        return None
+    try:
+        await execute_search_snapshot(
+            db,
+            str(snapshot_id),
+            task.owner_user_id,
+            cursor=None,
+            page_size=SEARCH_PAGE_SIZE_DEFAULT,
+        )
+    except (SearchSnapshotNotFound, SearchDraftNotConfirmed):
+        await fail_task(
+            db, task.task_id, worker_id,
+            error_code="RESULT_STALE", retryable=False,
+        )
+        return None
+    revisions = (
+        RevisionVector(**task.source_revision_json)
+        if task.source_revision_json
+        else RevisionVector()
+    )
+    return f"search-snapshot:{snapshot_id}", revisions
+
+
+# ----------------------------------------------------------------------
+# 建议标签 / 删除
+# ----------------------------------------------------------------------
+
+
+async def get_search_suggestions(
+    db: AsyncSession, owner_user_id: int
+) -> SearchSuggestionRead:
+    """只读本人已确认且允许搜索的标签（interest_tags/lifestyle_tags）。
+
+    数据源为 ``personal_searchable`` 特征投影（仅已确认字段）；无投影时返回
+    空数组。
+    """
+    result = await db.execute(
+        text(
+            "SELECT subject_user_id, fields_json, status, expires_at "
+            "FROM ai_feature_projection "
+            "WHERE subject_user_id = :user_id "
+            "AND projection_kind = 'personal_searchable' AND status = 'active' "
+            "ORDER BY id DESC LIMIT 1"
+        ),
+        {"user_id": owner_user_id},
+    )
+    row = await _first_row(result)
+    if row is None:
+        return SearchSuggestionRead(items=[], page=CursorMeta())
+    fields = _maybe_json(row.get("fields_json")) or {}
+    tags: list[str] = []
+    for key in ("interest_tags", "lifestyle_tags"):
+        value = fields.get(key)
+        values = value if isinstance(value, list) else [value]
+        for item in values:
+            if isinstance(item, str) and item.strip() and item.strip() not in tags:
+                tags.append(item.strip())
+    return SearchSuggestionRead(items=tags, page=CursorMeta())
+
+
+async def delete_search_snapshot(
+    db: AsyncSession,
+    snapshot_id: str,
+    owner_user_id: int,
+    idempotency_key: str,
+) -> CleanupTask:
+    """软删除快照：同步不可读 + 入队 cleanup 任务（202）。"""
+    request_hash = _hash_delete_request(snapshot_id)
+    snapshot = await _load_snapshot_row(db, snapshot_id)
+    if snapshot is None or int(snapshot["user_id"]) != owner_user_id:
+        raise SearchSnapshotNotFound()
+    if snapshot.get("invalidated_at") is None:
+        await db.execute(
+            text(
+                "UPDATE ai_search_snapshot SET invalidated_at = UTC_TIMESTAMP(), "
+                "updated_at = UTC_TIMESTAMP() WHERE snapshot_id = :snapshot_id"
+            ),
+            {"snapshot_id": snapshot_id},
+        )
+    task = await enqueue_task(
+        db=db,
+        owner_user_id=owner_user_id,
+        task_type=SEARCH_CLEANUP_TASK_TYPE,
+        idempotency_key=idempotency_key,
+        request_hash=request_hash,
+        revisions=RevisionVector(),
+        consent=None,
+    )
+    return CleanupTask(
+        task_id=task.task_id,
+        status=task.status.value,
+        subject="search",
+    )
+
+
+# ----------------------------------------------------------------------
+# Worker handler 注册（本任务注册 search 相关 handler）
+# ----------------------------------------------------------------------
+
+
+def register_search_handlers() -> None:
+    """把 ``search_parse`` / ``search_execute`` 注册进 AI Worker 的 TASK_HANDLERS。
+
+    模块导入时自动注册（路由导入本模块即生效）；幂等，可在测试中重复调用。
+    """
+    from app.workers import ai_worker as worker_module
+
+    worker_module.TASK_HANDLERS.setdefault(SEARCH_PARSE_TASK_TYPE, parse_search_draft)
+    worker_module.TASK_HANDLERS.setdefault(
+        SEARCH_EXECUTE_TASK_TYPE, search_execute_handler
+    )
+
+
+register_search_handlers()

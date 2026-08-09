@@ -2482,6 +2482,17 @@ class DatabaseManager:
         # 本次一期商业化领域表与基础用户表保持同一初始化入口。
         tables.update(BUSINESS_TABLES)
 
+        # AI 派生投影（revision/outbox/消费收据）与业务表同一入口。
+        from app.db.derivation_schema import DERIVATION_TABLES
+
+        tables.update(DERIVATION_TABLES)
+
+        # AI-CORE/M04/M03/M06 表（ai_consent_grant、ai_task、ai_generation_audit
+        # 及 13 张画像/搜索/投影/兼容度表）只做幂等建表，不做生产自动迁移。
+        from app.db.ai_schema import AI_TABLES, ensure_ai_projection_columns
+
+        tables.update(AI_TABLES)
+
         # 创建所有表
         for table_name, sql in tables.items():
             cursor.execute(sql)
@@ -2516,6 +2527,11 @@ class DatabaseManager:
 
         # 兼容已存在的旧库：CREATE TABLE IF NOT EXISTS 不会补齐新增字段。
         self._ensure_required_columns(cursor)
+
+        # 旧库的 ai_feature_projection 不会由 CREATE TABLE IF NOT EXISTS 补齐
+        # Task 9 新增列（版本向量/可见性/失效原因等），与上面同模式幂等补列
+        # （SHOW COLUMNS→ALTER TABLE ADD COLUMN；表不存在时由 helper 静默跳过）。
+        ensure_ai_projection_columns(cursor)
 
         self._backfill_comment_roots(cursor)
 
