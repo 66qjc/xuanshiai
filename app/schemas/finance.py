@@ -102,6 +102,43 @@ class FinanceReportRow(BaseModel):
     available_amount: Decimal
 
 
+class PaymentOrderAdminPage(BaseModel):
+    items: list["PaymentOrderResponse"]
+    page: int
+    page_size: int
+    total: int
+    has_more: bool
+
+
+class WithdrawalAdminPage(BaseModel):
+    items: list["WithdrawalResponse"]
+    page: int
+    page_size: int
+    total: int
+    has_more: bool
+
+
+class LedgerEntryResponse(BaseModel):
+    id: int
+    account_type: str
+    account_id: int
+    direction: str
+    amount: Decimal
+    state: str
+    source_type: str
+    source_id: int
+    idempotency_key: str
+    created_at: datetime
+
+
+class LedgerEntryPage(BaseModel):
+    items: list[LedgerEntryResponse]
+    page: int
+    page_size: int
+    total: int
+    has_more: bool
+
+
 class AccountBalanceResponse(BaseModel):
     account_type: str
     account_id: int

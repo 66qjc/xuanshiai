@@ -1,6 +1,6 @@
 """一期订单、分成、余额和提现接口。"""
 
-from fastapi import APIRouter, Body, Depends, Path
+from fastapi import APIRouter, Body, Depends, Path, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies import CurrentMatchmakerAdmin, CurrentUser, get_current_user, get_current_matchmaker_admin
@@ -19,6 +19,9 @@ from app.schemas.finance import (
     WithdrawalCreate,
     WithdrawalResponse,
     WithdrawalReview,
+    LedgerEntryPage,
+    PaymentOrderAdminPage,
+    WithdrawalAdminPage,
 )
 from app.services.finance import (
     create_order,
@@ -33,6 +36,9 @@ from app.services.finance import (
     request_withdrawal,
     review_withdrawal,
     create_product_commission_config,
+    admin_list_ledger,
+    admin_list_orders,
+    admin_list_withdrawals,
 )
 
 router = APIRouter(prefix="/finance")
@@ -84,6 +90,38 @@ async def product_commission_rule(
 @admin_router.get("/report", response_model=list[FinanceReportRow], summary="查询分成汇总报表")
 async def report(admin: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> list[FinanceReportRow]:
     return await admin_finance_report(db)
+
+
+@admin_router.get("/orders", response_model=PaymentOrderAdminPage, summary="后台分页查询订单")
+async def admin_orders(
+    page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100),
+    status: int | None = Query(None, ge=0, le=3), user_id: int | None = Query(None, ge=1),
+    order_no: str | None = Query(None, min_length=1, max_length=64),
+    _: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
+    db: AsyncSession = Depends(get_db),
+) -> PaymentOrderAdminPage:
+    return await admin_list_orders(db, page, page_size, status, user_id, order_no)
+
+
+@admin_router.get("/withdrawals", response_model=WithdrawalAdminPage, summary="后台分页查询提现")
+async def admin_withdrawals(
+    page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100),
+    status: str | None = Query(None, max_length=32),
+    _: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
+    db: AsyncSession = Depends(get_db),
+) -> WithdrawalAdminPage:
+    return await admin_list_withdrawals(db, page, page_size, status)
+
+
+@admin_router.get("/ledger", response_model=LedgerEntryPage, summary="后台分页查询资金流水")
+async def admin_ledger(
+    page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100),
+    account_type: str | None = Query(None, max_length=32),
+    account_id: int | None = Query(None, ge=1),
+    _: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
+    db: AsyncSession = Depends(get_db),
+) -> LedgerEntryPage:
+    return await admin_list_ledger(db, page, page_size, account_type, account_id)
 
 
 @admin_router.post("/orders/{order_id}/settle", response_model=list[CommissionEntryResponse], summary="结算已支付订单分成")

@@ -60,11 +60,26 @@ async def login(db: AsyncSession, request: MatchmakerAdminLoginRequest, ip: str 
     row = result.mappings().first()
     now = datetime.now(UTC).replace(tzinfo=None)
     if not row or int(row["status"]) != 1 or (row["locked_until"] and row["locked_until"] > now) or not verify_password(request.password, row["password_hash"]):
+        await db.execute(text("""INSERT INTO matchmaker_admin_login_log
+            (account_id, username, login_status, ip, user_agent, failure_reason)
+            VALUES (:account_id, :username, 0, :ip, :user_agent, :failure_reason)"""), {
+            "account_id": row["id"] if row else None,
+            "username": request.username,
+            "ip": ip,
+            "user_agent": user_agent[:255] if user_agent else None,
+            "failure_reason": "invalid_credentials_or_locked",
+        })
         if row:
             await db.execute(text("UPDATE matchmaker_admin_account SET failed_count = failed_count + 1, locked_until = CASE WHEN failed_count + 1 >= 5 THEN DATE_ADD(UTC_TIMESTAMP(), INTERVAL 15 MINUTE) ELSE locked_until END WHERE id = :id"), {"id": row["id"]})
             await db.commit()
         raise HTTPException(401, detail="账号或密码错误")
     await db.execute(text("UPDATE matchmaker_admin_account SET failed_count = 0, locked_until = NULL, last_login_at = UTC_TIMESTAMP(), last_login_ip = :ip WHERE id = :id"), {"id": row["id"], "ip": ip})
+    await db.execute(text("""INSERT INTO matchmaker_admin_login_log
+        (account_id, username, login_status, ip, user_agent)
+        VALUES (:account_id, :username, 1, :ip, :user_agent)"""), {
+        "account_id": row["id"], "username": request.username, "ip": ip,
+        "user_agent": user_agent[:255] if user_agent else None,
+    })
     await db.commit()
     row = dict(row)
     row["last_login_at"] = now

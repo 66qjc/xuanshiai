@@ -88,6 +88,42 @@ BUSINESS_TABLES = {
             KEY `idx_matchmaker_admin_session_account` (`account_id`, `status`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='红娘后台登录会话'
     """,
+    "matchmaker_admin_permission": """
+        CREATE TABLE IF NOT EXISTS `matchmaker_admin_permission` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `account_id` bigint unsigned NOT NULL,
+            `permission` varchar(128) NOT NULL,
+            PRIMARY KEY (`id`),
+            UNIQUE KEY `uk_matchmaker_admin_permission` (`account_id`, `permission`),
+            KEY `idx_matchmaker_admin_permission_account` (`account_id`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='独立红娘后台账号权限'
+    """,
+    "matchmaker_admin_login_log": """
+        CREATE TABLE IF NOT EXISTS `matchmaker_admin_login_log` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `account_id` bigint unsigned DEFAULT NULL,
+            `username` varchar(64) NOT NULL,
+            `login_status` tinyint NOT NULL COMMENT '0失败 1成功',
+            `ip` varchar(64) DEFAULT NULL,
+            `user_agent` varchar(255) DEFAULT NULL,
+            `device_id` varchar(128) DEFAULT NULL,
+            `failure_reason` varchar(255) DEFAULT NULL,
+            `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`),
+            KEY `idx_matchmaker_admin_login_account` (`account_id`, `created_at`),
+            KEY `idx_matchmaker_admin_login_username` (`username`, `created_at`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='独立红娘后台登录日志'
+    """,
+    "matchmaker_admin_member_note": """
+        CREATE TABLE IF NOT EXISTS `matchmaker_admin_member_note` (
+            `user_id` bigint unsigned NOT NULL,
+            `note` varchar(2000) DEFAULT NULL,
+            `updated_by` bigint unsigned DEFAULT NULL,
+            `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (`user_id`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='后台会员备注'
+    """,
     "organization": """
         CREATE TABLE IF NOT EXISTS `organization` (
             `id` bigint unsigned NOT NULL AUTO_INCREMENT,
