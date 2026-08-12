@@ -266,6 +266,14 @@ class DatabaseManager:
                 'moderated_by': "`moderated_by` bigint unsigned DEFAULT NULL",
                 'moderated_at': "`moderated_at` datetime DEFAULT NULL",
             },
+            'chat_session': {
+                'user1_pinned_at': "`user1_pinned_at` datetime DEFAULT NULL",
+                'user2_pinned_at': "`user2_pinned_at` datetime DEFAULT NULL",
+            },
+            'matchmaker_admin_account': {
+                'data_scope': "`data_scope` varchar(16) NOT NULL DEFAULT 'SELF' COMMENT 'SELF/STORE/ORGANIZATION/ALL'",
+                'organization_id': "`organization_id` bigint unsigned DEFAULT NULL",
+            },
             'user_notification': {
                 'target_type': "`target_type` varchar(32) DEFAULT NULL COMMENT '前端导航目标类型'",
                 'target_id': "`target_id` bigint unsigned DEFAULT NULL COMMENT '前端导航目标ID'",
@@ -2486,6 +2494,14 @@ class DatabaseManager:
         for table_name, sql in tables.items():
             cursor.execute(sql)
             logger.debug(f"表 `{table_name}` 已创建/确认")
+
+        # Keep one explicit bootstrap super-admin for upgraded installations.
+        cursor.execute("""
+            INSERT IGNORE INTO matchmaker_admin_permission (account_id, permission)
+            SELECT first_account.id, '*'
+            FROM matchmaker_admin_account first_account
+            WHERE first_account.id = (SELECT MIN(id) FROM matchmaker_admin_account)
+        """)
 
         # Publish the three initial packages and quota products once. Existing
         # rows remain operator-controlled and are never overwritten.

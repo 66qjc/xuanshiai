@@ -82,6 +82,40 @@ class ChatMessageResponse(BaseModel):
     created_at: datetime
 
 
+class ChatMessagePage(BaseModel):
+    items: list[ChatMessageResponse]
+    next_cursor: int | None
+    has_more: bool
+
+
+class ChatSessionRequestCreate(BaseModel):
+    request_type: Literal["ANSWER_EXCHANGE", "LOVE_MODE", "WECHAT", "PHONE"]
+    payload: dict | None = None
+    expire_hours: int = Field(default=48, ge=1, le=168)
+
+
+class ChatSessionRequestAction(BaseModel):
+    action: Literal["ACCEPT", "REJECT", "WITHDRAW"]
+
+
+class ChatSessionRequestResponse(BaseModel):
+    id: int
+    session_id: int
+    requester_id: int
+    responder_id: int
+    request_type: str
+    payload: dict | None
+    status: str
+    expire_at: datetime | None
+    responded_at: datetime | None
+    created_at: datetime
+
+
+class NotificationUnreadSummary(BaseModel):
+    total: int
+    categories: dict[str, int]
+
+
 class NotificationItem(BaseModel):
     id: int
     notification_type: str

@@ -29,7 +29,7 @@ def _permissions(row: dict) -> list[str]:
 def _account_item(row: dict) -> MatchmakerAdminAccountItem:
     return MatchmakerAdminAccountItem(
         **{key: row[key] for key in (
-            "id", "username", "display_name", "matchmaker_user_id", "status",
+            "id", "username", "display_name", "matchmaker_user_id", "data_scope", "organization_id", "status",
             "failed_count", "locked_until", "last_login_at", "last_login_ip",
             "created_at", "updated_at",
         )},
@@ -105,12 +105,14 @@ async def create_account(db: AsyncSession, body: MatchmakerAdminAccountCreate, a
     if duplicate.scalar():
         raise HTTPException(409, detail="后台账号用户名已存在")
     result = await db.execute(text("""INSERT INTO matchmaker_admin_account
-        (username, password_hash, matchmaker_user_id, display_name)
-        VALUES (:username, :password_hash, :matchmaker_user_id, :display_name)"""), {
+        (username, password_hash, matchmaker_user_id, display_name, data_scope, organization_id)
+        VALUES (:username, :password_hash, :matchmaker_user_id, :display_name, :data_scope, :organization_id)"""), {
         "username": body.username,
         "password_hash": hash_password(body.password),
         "matchmaker_user_id": body.matchmaker_user_id,
         "display_name": body.display_name,
+        "data_scope": body.data_scope,
+        "organization_id": body.organization_id,
     })
     account_id = int(result.lastrowid)
     for permission in set(body.permissions):
@@ -132,9 +134,15 @@ async def update_account(db: AsyncSession, account_id: int, body: MatchmakerAdmi
     if body.display_name is not None:
         updates.append("display_name = :display_name")
         params["display_name"] = body.display_name
-    if body.matchmaker_user_id is not None:
+    if "matchmaker_user_id" in body.model_fields_set:
         updates.append("matchmaker_user_id = :matchmaker_user_id")
         params["matchmaker_user_id"] = body.matchmaker_user_id
+    if body.data_scope is not None:
+        updates.append("data_scope = :data_scope")
+        params["data_scope"] = body.data_scope
+    if "organization_id" in body.model_fields_set:
+        updates.append("organization_id = :organization_id")
+        params["organization_id"] = body.organization_id
     if updates:
         updates.append("updated_at = UTC_TIMESTAMP()")
         await db.execute(text(f"UPDATE matchmaker_admin_account SET {', '.join(updates)} WHERE id = :id"), params)

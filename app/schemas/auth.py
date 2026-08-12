@@ -435,6 +435,14 @@ class MatchmakerApplicationResponse(BaseModel):
     reviewed_at: str | None
 
 
+class MatchmakerApplicationAdminPage(BaseModel):
+    items: list[MatchmakerApplicationResponse]
+    page: int
+    page_size: int
+    total: int
+    has_more: bool
+
+
 class MatchmakerReviewRequest(BaseModel):
     status: Literal[1, 2, 3]
     fail_reason: str | None = Field(default=None, max_length=255)

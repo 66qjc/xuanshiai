@@ -41,6 +41,7 @@ async def accounts(
     current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
     db: AsyncSession = Depends(get_db),
 ) -> MatchmakerAdminAccountPage:
+    current.require("matchmaker.account.manage")
     return await list_accounts(db, page, page_size, username, display_name, status, matchmaker_user_id)
 
 
@@ -50,6 +51,7 @@ async def create_admin_account(
     current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
     db: AsyncSession = Depends(get_db),
 ) -> MatchmakerAdminAccountItem:
+    current.require("matchmaker.account.manage")
     return await create_account(db, body, current.account.id)
 
 
@@ -61,6 +63,7 @@ async def login_logs(
     current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
     db: AsyncSession = Depends(get_db),
 ) -> MatchmakerAdminLoginLogPage:
+    current.require("matchmaker.account.manage")
     return await list_login_logs(db, page, page_size, account_id)
 
 
@@ -70,6 +73,7 @@ async def account_detail(
     current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
     db: AsyncSession = Depends(get_db),
 ):
+    current.require("matchmaker.account.manage")
     return await get_account(db, account_id)
 
 
@@ -80,6 +84,7 @@ async def edit_account(
     current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
     db: AsyncSession = Depends(get_db),
 ) -> MatchmakerAdminAccountItem:
+    current.require("matchmaker.account.manage")
     return await update_account(db, account_id, body, current.account.id)
 
 
@@ -90,6 +95,7 @@ async def change_account_status(
     current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
     db: AsyncSession = Depends(get_db),
 ) -> MatchmakerAdminAccountItem:
+    current.require("matchmaker.account.manage")
     return await update_account_status(db, account_id, body, current.account.id)
 
 
@@ -100,6 +106,7 @@ async def reset_account_password(
     current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
     db: AsyncSession = Depends(get_db),
 ) -> MatchmakerAdminAccountItem:
+    current.require("matchmaker.account.manage")
     return await reset_password(db, account_id, body, current.account.id)
 
 
@@ -111,6 +118,7 @@ async def account_sessions(
     current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
     db: AsyncSession = Depends(get_db),
 ) -> MatchmakerAdminSessionPage:
+    current.require("matchmaker.account.manage")
     return await list_sessions(db, account_id, page, page_size)
 
 
