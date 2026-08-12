@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from fastapi import HTTPException
@@ -13,6 +14,10 @@ from app.schemas.social import (
     BlockRequest,
     ChatMessageCreate,
     ChatMessageResponse,
+    ChatMessagePage,
+    ChatSessionRequestCreate,
+    ChatSessionRequestResponse,
+    NotificationUnreadSummary,
     ChatSessionPage,
     ChatSessionResponse,
     NotificationItem,
@@ -188,7 +193,8 @@ async def list_chat_sessions(db: AsyncSession, user_id: int, page: int, page_siz
                       AND ub.user_id = CASE WHEN s.user1_id = :user_id THEN s.user2_id ELSE s.user1_id END))"""), {"user_id": user_id})
     total = int(count_result.scalar() or 0)
     result = await db.execute(text("""SELECT s.*, u.id AS target_id, u.nickname, u.avatar, u.birthday,
-        CASE WHEN s.user1_id = :user_id THEN s.unread_count_user1 ELSE s.unread_count_user2 END AS unread_count
+        CASE WHEN s.user1_id = :user_id THEN s.unread_count_user1 ELSE s.unread_count_user2 END AS unread_count,
+        CASE WHEN s.user1_id = :user_id THEN s.user1_pinned_at ELSE s.user2_pinned_at END AS pinned_at
         FROM chat_session s JOIN users u ON u.id = CASE WHEN s.user1_id = :user_id THEN s.user2_id ELSE s.user1_id END
         WHERE ((s.user1_id = :user_id AND s.is_user1_hidden = 0) OR (s.user2_id = :user_id AND s.is_user2_hidden = 0))
           AND EXISTS (SELECT 1 FROM user_match um WHERE um.user_id = :user_id
@@ -203,8 +209,10 @@ async def list_chat_sessions(db: AsyncSession, user_id: int, page: int, page_siz
                       AND ub.target_user_id = CASE WHEN s.user1_id = :user_id THEN s.user2_id ELSE s.user1_id END)
                    OR (ub.target_user_id = :user_id
                       AND ub.user_id = CASE WHEN s.user1_id = :user_id THEN s.user2_id ELSE s.user1_id END))
-        ORDER BY COALESCE(s.last_message_time, s.created_at) DESC LIMIT :limit OFFSET :offset"""), {"user_id": user_id, "limit": page_size, "offset": (page - 1) * page_size})
-    items = [ChatSessionResponse(id=int(row["id"]), target=SocialUser(user_id=int(row["target_id"]), nickname=row["nickname"], avatar=row["avatar"], age=_calculate_age(row["birthday"]) if row["birthday"] else None), last_message=row["last_message"], last_message_time=row["last_message_time"], unread_count=int(row["unread_count"] or 0)) for row in result.mappings().all()]
+        ORDER BY (CASE WHEN s.user1_id = :user_id THEN s.user1_pinned_at ELSE s.user2_pinned_at END) IS NOT NULL DESC,
+        COALESCE(CASE WHEN s.user1_id = :user_id THEN s.user1_pinned_at ELSE s.user2_pinned_at END, s.last_message_time, s.created_at) DESC
+        LIMIT :limit OFFSET :offset"""), {"user_id": user_id, "limit": page_size, "offset": (page - 1) * page_size})
+    items = [ChatSessionResponse(id=int(row["id"]), target=SocialUser(user_id=int(row["target_id"]), nickname=row["nickname"], avatar=row["avatar"], age=_calculate_age(row["birthday"]) if row["birthday"] else None), last_message=row["last_message"], last_message_time=row["last_message_time"], unread_count=int(row["unread_count"] or 0), pinned=row["pinned_at"] is not None) for row in result.mappings().all()]
     return ChatSessionPage(items=items, page=page, page_size=page_size, total=total, has_more=page * page_size < total)
 
 
@@ -241,7 +249,11 @@ async def send_message(db: AsyncSession, user_id: int, session_id: int, request:
     unread_field = "unread_count_user1" if session["user1_id"] == target_id else "unread_count_user2"
     await db.execute(text(f"""UPDATE chat_session SET last_message = :last_message,
         last_message_time = UTC_TIMESTAMP(), {unread_field} = {unread_field} + 1,
-        updated_at = UTC_TIMESTAMP() WHERE id = :session_id"""), {"last_message": preview, "session_id": session_id})
+        is_user1_hidden = CASE WHEN user1_id = :target_id THEN 0 ELSE is_user1_hidden END,
+        is_user2_hidden = CASE WHEN user2_id = :target_id THEN 0 ELSE is_user2_hidden END,
+        updated_at = UTC_TIMESTAMP() WHERE id = :session_id"""), {
+            "last_message": preview, "session_id": session_id, "target_id": target_id,
+        })
     await db.commit()
     created = await db.execute(text("SELECT id, session_id, from_user_id, to_user_id, type, content, media_url, is_read, revoked_at, created_at FROM chat_message WHERE id = :id"), {"id": result.lastrowid})
     return _message(dict(created.mappings().one()))
@@ -277,9 +289,21 @@ async def revoke_message(db: AsyncSession, user_id: int, message_id: int) -> Non
     await recall_message(db, user_id, message_id)
 
 
-async def list_notifications(db: AsyncSession, user_id: int, page: int, page_size: int) -> NotificationPage:
-    params = {"user_id": user_id, "limit": page_size, "offset": (page - 1) * page_size}
-    result = await db.execute(text("SELECT id, notification_type, title, content, payload, related_user_id, related_id, target_type, target_id, is_read, created_at FROM user_notification WHERE user_id = :user_id ORDER BY created_at DESC, id DESC LIMIT :limit OFFSET :offset"), params)
+async def list_notifications(
+    db: AsyncSession,
+    user_id: int,
+    page: int,
+    page_size: int,
+    notification_type: str | None = None,
+) -> NotificationPage:
+    condition = " AND notification_type = :notification_type" if notification_type else ""
+    params: dict[str, Any] = {"user_id": user_id, "limit": page_size, "offset": (page - 1) * page_size}
+    if notification_type:
+        params["notification_type"] = notification_type
+    result = await db.execute(text(f"""SELECT id, notification_type, title, content, payload,
+        related_user_id, related_id, target_type, target_id, is_read, created_at
+        FROM user_notification WHERE user_id = :user_id{condition}
+        ORDER BY created_at DESC, id DESC LIMIT :limit OFFSET :offset"""), params)
     items = []
     for row in result.mappings().all():
         payload = row["payload"]
@@ -288,9 +312,16 @@ async def list_notifications(db: AsyncSession, user_id: int, page: int, page_siz
                 payload = json.loads(payload)
             except json.JSONDecodeError:
                 payload = None
-        items.append(NotificationItem(id=int(row["id"]), notification_type=row["notification_type"], title=row["title"], content=row["content"] or "", payload=payload, related_user_id=row["related_user_id"], related_id=row["related_id"], target_type=row.get("target_type"), target_id=row.get("target_id"), actor_user_id=row["related_user_id"], action=row["notification_type"], is_read=bool(row["is_read"]), created_at=row["created_at"]))
-    total = int((await db.execute(text("SELECT COUNT(*) FROM user_notification WHERE user_id = :user_id"), {"user_id": user_id})).scalar() or 0)
-    unread = int((await db.execute(text("SELECT COUNT(*) FROM user_notification WHERE user_id = :user_id AND is_read = 0"), {"user_id": user_id})).scalar() or 0)
+        items.append(NotificationItem(
+            id=int(row["id"]), notification_type=row["notification_type"], title=row["title"],
+            content=row["content"] or "", payload=payload, related_user_id=row["related_user_id"],
+            related_id=row["related_id"], target_type=row.get("target_type"), target_id=row.get("target_id"),
+            actor_user_id=row["related_user_id"], action=row["notification_type"],
+            is_read=bool(row["is_read"]), created_at=row["created_at"],
+        ))
+    count_params = {key: value for key, value in params.items() if key not in ("limit", "offset")}
+    total = int((await db.execute(text(f"SELECT COUNT(*) FROM user_notification WHERE user_id = :user_id{condition}"), count_params)).scalar() or 0)
+    unread = int((await db.execute(text(f"SELECT COUNT(*) FROM user_notification WHERE user_id = :user_id AND is_read = 0{condition}"), count_params)).scalar() or 0)
     return NotificationPage(items=items, page=page, page_size=page_size, total=total, unread_count=unread)
 
 
@@ -1024,3 +1055,98 @@ async def review_report_appeal(
         result=request.result,
         content_restored=content_restored,
     )
+
+
+async def set_chat_session_visibility(db: AsyncSession, user_id: int, session_id: int, *, hidden: bool | None = None, pinned: bool | None = None) -> None:
+    session, _ = await _session(db, user_id, session_id)
+    updates: list[str] = []
+    if hidden is not None:
+        field = "is_user1_hidden" if int(session["user1_id"]) == user_id else "is_user2_hidden"
+        updates.append(f"{field} = {1 if hidden else 0}")
+    if pinned is not None:
+        field = "user1_pinned_at" if int(session["user1_id"]) == user_id else "user2_pinned_at"
+        updates.append(f"{field} = {'UTC_TIMESTAMP()' if pinned else 'NULL'}")
+    if not updates:
+        return
+    await db.execute(text(f"UPDATE chat_session SET {', '.join(updates)}, updated_at = UTC_TIMESTAMP() WHERE id = :id"), {"id": session_id})
+    await db.commit()
+
+
+async def list_messages_cursor(db: AsyncSession, user_id: int, session_id: int, cursor: int | None, page_size: int) -> ChatMessagePage:
+    await _session(db, user_id, session_id)
+    condition = "AND id < :cursor" if cursor is not None else ""
+    params = {"session_id": session_id, "cursor": cursor, "limit": page_size + 1}
+    rows = (await db.execute(text(f"""SELECT id, session_id, from_user_id, to_user_id, type, content, media_url,
+        is_read, revoked_at, created_at FROM chat_message WHERE session_id = :session_id {condition}
+        ORDER BY id DESC LIMIT :limit"""), params)).mappings().all()
+    has_more = len(rows) > page_size
+    selected = rows[:page_size]
+    items = [_message(dict(row)) for row in reversed(selected)]
+    return ChatMessagePage(items=items, next_cursor=int(selected[-1]["id"]) if has_more and selected else None, has_more=has_more)
+
+
+def _request_response(row: Any) -> ChatSessionRequestResponse:
+    payload = row.get("payload")
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except json.JSONDecodeError:
+            payload = None
+    return ChatSessionRequestResponse(**{**dict(row), "payload": payload})
+
+
+async def create_chat_session_request(db: AsyncSession, user_id: int, session_id: int, request: ChatSessionRequestCreate) -> ChatSessionRequestResponse:
+    _, target_id = await _session(db, user_id, session_id)
+    existing = await db.execute(text("""SELECT id FROM chat_session_request WHERE session_id = :session_id
+        AND requester_id = :user_id AND request_type = :request_type AND status = 'PENDING'
+        AND (expire_at IS NULL OR expire_at > UTC_TIMESTAMP()) LIMIT 1"""),
+        {"session_id": session_id, "user_id": user_id, "request_type": request.request_type})
+    if existing.scalar():
+        raise HTTPException(409, detail="同类型请求正在等待处理")
+    expire_at = datetime.now(UTC).replace(tzinfo=None) + timedelta(hours=request.expire_hours)
+    result = await db.execute(text("""INSERT INTO chat_session_request
+        (session_id, requester_id, responder_id, request_type, payload, expire_at)
+        VALUES (:session_id, :requester_id, :responder_id, :request_type, :payload, :expire_at)"""),
+        {"session_id": session_id, "requester_id": user_id, "responder_id": target_id,
+         "request_type": request.request_type, "payload": json.dumps(request.payload, ensure_ascii=False) if request.payload else None,
+         "expire_at": expire_at})
+    await db.commit()
+    row = (await db.execute(text("SELECT * FROM chat_session_request WHERE id = :id"), {"id": result.lastrowid})).mappings().one()
+    return _request_response(row)
+
+
+async def list_chat_session_requests(db: AsyncSession, user_id: int, session_id: int) -> list[ChatSessionRequestResponse]:
+    await _session(db, user_id, session_id)
+    await db.execute(text("UPDATE chat_session_request SET status = 'EXPIRED' WHERE session_id = :id AND status = 'PENDING' AND expire_at <= UTC_TIMESTAMP()"), {"id": session_id})
+    rows = (await db.execute(text("""SELECT * FROM chat_session_request WHERE session_id = :id
+        AND (requester_id = :user_id OR responder_id = :user_id) ORDER BY id DESC"""), {"id": session_id, "user_id": user_id})).mappings().all()
+    await db.commit()
+    return [_request_response(row) for row in rows]
+
+
+async def respond_chat_session_request(db: AsyncSession, user_id: int, request_id: int, action: str) -> ChatSessionRequestResponse:
+    row = (await db.execute(text("SELECT * FROM chat_session_request WHERE id = :id FOR UPDATE"), {"id": request_id})).mappings().first()
+    if not row:
+        raise HTTPException(404, detail="会话请求不存在")
+    await _session(db, user_id, int(row["session_id"]))
+    if row["status"] != "PENDING" or (row["expire_at"] and row["expire_at"] <= datetime.now(UTC).replace(tzinfo=None)):
+        raise HTTPException(409, detail="会话请求已处理或已过期")
+    if action == "WITHDRAW":
+        if int(row["requester_id"]) != user_id:
+            raise HTTPException(403, detail="只有发起人可以撤回")
+        status = "WITHDRAWN"
+    else:
+        if int(row["responder_id"]) != user_id:
+            raise HTTPException(403, detail="只有接收人可以处理")
+        status = "ACCEPTED" if action == "ACCEPT" else "REJECTED"
+    await db.execute(text("UPDATE chat_session_request SET status = :status, responded_at = UTC_TIMESTAMP(), updated_at = UTC_TIMESTAMP() WHERE id = :id"), {"status": status, "id": request_id})
+    await db.commit()
+    updated = (await db.execute(text("SELECT * FROM chat_session_request WHERE id = :id"), {"id": request_id})).mappings().one()
+    return _request_response(updated)
+
+
+async def notification_unread_summary(db: AsyncSession, user_id: int) -> NotificationUnreadSummary:
+    rows = (await db.execute(text("""SELECT notification_type, COUNT(*) AS count FROM user_notification
+        WHERE user_id = :user_id AND is_read = 0 GROUP BY notification_type"""), {"user_id": user_id})).mappings().all()
+    categories = {str(row["notification_type"]): int(row["count"]) for row in rows}
+    return NotificationUnreadSummary(total=sum(categories.values()), categories=categories)

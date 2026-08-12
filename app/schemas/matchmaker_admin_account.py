@@ -11,6 +11,8 @@ class MatchmakerAdminAccountItem(BaseModel):
     username: str
     display_name: str
     matchmaker_user_id: int | None
+    data_scope: Literal["SELF", "STORE", "ORGANIZATION", "ALL"] = "SELF"
+    organization_id: int | None = None
     status: Literal[1, 2, 3]
     failed_count: int
     locked_until: datetime | None
@@ -34,12 +36,16 @@ class MatchmakerAdminAccountCreate(BaseModel):
     password: str = Field(min_length=8, max_length=128)
     display_name: str = Field(min_length=1, max_length=128)
     matchmaker_user_id: int | None = Field(default=None, ge=1)
+    data_scope: Literal["SELF", "STORE", "ORGANIZATION", "ALL"] = "SELF"
+    organization_id: int | None = Field(default=None, ge=1)
     permissions: list[str] = Field(default_factory=list, max_length=50)
 
 
 class MatchmakerAdminAccountUpdate(BaseModel):
     display_name: str | None = Field(default=None, min_length=1, max_length=128)
     matchmaker_user_id: int | None = Field(default=None, ge=1)
+    data_scope: Literal["SELF", "STORE", "ORGANIZATION", "ALL"] | None = None
+    organization_id: int | None = Field(default=None, ge=1)
     permissions: list[str] | None = Field(default=None, max_length=50)
 
 

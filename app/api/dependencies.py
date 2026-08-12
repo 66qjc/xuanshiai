@@ -1,6 +1,6 @@
 """Common request dependencies and authenticated-user guards."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -77,7 +77,7 @@ async def get_realname_verified_user(
     if current.realname_status != 2:
         raise HTTPException(status_code=403, detail="请先完成实名认证")
     if current.face_verified is not None and current.face_verified != 1:
-        raise HTTPException(status_code=403, detail="璇峰厛瀹屾垚浜鸿劯璁よ瘉")
+        raise HTTPException(status_code=403, detail="请先完成人脸认证")
     return current
 
 
@@ -115,6 +115,11 @@ async def get_current_admin(
 class CurrentMatchmakerAdmin:
     account: MatchmakerAdminAccount
     session_id: int
+    permissions: frozenset[str] = field(default_factory=frozenset)
+
+    def require(self, permission: str) -> None:
+        if "*" not in self.permissions and permission not in self.permissions:
+            raise HTTPException(status_code=403, detail="红娘后台权限不足")
 
 
 async def get_current_matchmaker_admin(
@@ -131,4 +136,13 @@ async def get_current_matchmaker_admin(
     except (ValueError, KeyError) as exc:
         raise HTTPException(status_code=401, detail="无效或已过期的红娘后台访问令牌") from exc
     account = await get_session_account(db, account_id, session_id)
-    return CurrentMatchmakerAdmin(account=account, session_id=session_id)
+    result = await db.execute(
+        text("SELECT permission FROM matchmaker_admin_permission WHERE account_id = :id"),
+        {"id": account_id},
+    )
+    permissions = frozenset(str(row[0]) for row in result.all())
+    return CurrentMatchmakerAdmin(
+        account=account,
+        session_id=session_id,
+        permissions=permissions,
+    )

@@ -812,8 +812,26 @@ async def respond_application(db: AsyncSession, viewer_id: int, application_id: 
             await db.execute(text("INSERT INTO user_match (user_id, target_user_id, status) VALUES (:left, :right, 1) ON DUPLICATE KEY UPDATE status = 1, updated_at = UTC_TIMESTAMP()"), {"left": left, "right": right})
         first, second = sorted((row["from_user_id"], row["to_user_id"]))
         session = await db.execute(text("SELECT id FROM chat_session WHERE user1_id = :first AND user2_id = :second LIMIT 1"), {"first": first, "second": second})
-        if not session.scalar():
-            await db.execute(text("INSERT INTO chat_session (user1_id, user2_id) VALUES (:first, :second)"), {"first": first, "second": second})
+        session_id = session.scalar()
+        if not session_id:
+            created_session = await db.execute(text("INSERT INTO chat_session (user1_id, user2_id) VALUES (:first, :second)"), {"first": first, "second": second})
+            session_id = int(created_session.lastrowid)
+        greeting = "你们已经互相同意认识，可以开始聊天了。"
+        existing_greeting = await db.execute(text("""SELECT id FROM chat_message
+            WHERE session_id = :session_id AND type = 6 AND content = :greeting LIMIT 1"""),
+            {"session_id": session_id, "greeting": greeting})
+        if not existing_greeting.scalar():
+            await db.execute(text("""INSERT INTO chat_message
+                (session_id, from_user_id, to_user_id, type, content, is_read)
+                VALUES (:session_id, :from_user_id, :to_user_id, 6, :greeting, 0)"""), {
+                "session_id": session_id, "from_user_id": viewer_id,
+                "to_user_id": row["from_user_id"], "greeting": greeting,
+            })
+            unread_field = "unread_count_user1" if first == row["from_user_id"] else "unread_count_user2"
+            await db.execute(text(f"""UPDATE chat_session SET last_message = :greeting,
+                last_message_time = UTC_TIMESTAMP(), {unread_field} = {unread_field} + 1,
+                updated_at = UTC_TIMESTAMP() WHERE id = :session_id"""),
+                {"greeting": greeting, "session_id": session_id})
         await _notify(db, row["from_user_id"], "match_application_accepted", "认识申请已通过", "对方接受了你的认识申请", viewer_id, application_id)
     else:
         await _notify(db, row["from_user_id"], "match_application_rejected", "认识申请未通过", (request.reason if request else None) or "对方暂时婉拒了你的申请", viewer_id, application_id)

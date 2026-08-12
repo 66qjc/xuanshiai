@@ -58,6 +58,8 @@ BUSINESS_TABLES = {
             `password_hash` varchar(255) NOT NULL,
             `matchmaker_user_id` bigint unsigned DEFAULT NULL,
             `display_name` varchar(128) NOT NULL,
+            `data_scope` varchar(16) NOT NULL DEFAULT 'SELF' COMMENT 'SELF/STORE/ORGANIZATION/ALL',
+            `organization_id` bigint unsigned DEFAULT NULL,
             `status` tinyint NOT NULL DEFAULT '1' COMMENT '1正常 2停用',
             `failed_count` int unsigned NOT NULL DEFAULT '0',
             `locked_until` datetime DEFAULT NULL,
@@ -483,5 +485,23 @@ BUSINESS_TABLES = {
             UNIQUE KEY `uk_withdrawal_provider_event` (`provider_event_id`),
             KEY `idx_withdrawal_event_withdrawal` (`withdrawal_id`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='提现支付事件'
+    """,
+    "chat_session_request": """
+        CREATE TABLE IF NOT EXISTS `chat_session_request` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `session_id` bigint unsigned NOT NULL,
+            `requester_id` bigint unsigned NOT NULL,
+            `responder_id` bigint unsigned NOT NULL,
+            `request_type` varchar(32) NOT NULL,
+            `payload` json DEFAULT NULL,
+            `status` varchar(16) NOT NULL DEFAULT 'PENDING',
+            `expire_at` datetime DEFAULT NULL,
+            `responded_at` datetime DEFAULT NULL,
+            `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`),
+            KEY `idx_chat_request_session` (`session_id`,`status`,`created_at`),
+            KEY `idx_chat_request_responder` (`responder_id`,`status`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='会话结构化请求'
     """,
 }

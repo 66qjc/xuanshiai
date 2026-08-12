@@ -22,6 +22,8 @@ def _account(row: Any) -> MatchmakerAdminAccount:
     return MatchmakerAdminAccount(
         id=int(row["id"]), username=row["username"], display_name=row["display_name"],
         matchmaker_user_id=int(row["matchmaker_user_id"]) if row["matchmaker_user_id"] else None,
+        data_scope=str(row.get("data_scope") or "SELF"),
+        organization_id=int(row["organization_id"]) if row.get("organization_id") else None,
         status=int(row["status"]), last_login_at=row["last_login_at"],
     )
 

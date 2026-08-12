@@ -5,6 +5,12 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+def _adult_cutoff(today: date) -> date:
+    try:
+        return today.replace(year=today.year - 18)
+    except ValueError:
+        return today.replace(year=today.year - 18, day=28)
+
 
 class MatchmakerMemberCreate(BaseModel):
     phone: str = Field(pattern=r"^1[3-9]\d{9}$")
@@ -17,7 +23,7 @@ class MatchmakerMemberCreate(BaseModel):
 
     @model_validator(mode="after")
     def validate_adult(self) -> "MatchmakerMemberCreate":
-        if self.birthday and (date.today().year - self.birthday.year) < 18:
+        if self.birthday and self.birthday > _adult_cutoff(date.today()):
             raise ValueError("会员必须年满18周岁")
         return self
 

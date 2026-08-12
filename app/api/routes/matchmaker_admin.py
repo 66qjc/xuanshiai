@@ -43,7 +43,7 @@ async def admin_refresh(request: Request, body: MatchmakerAdminRefreshRequest, d
 
 @router.get("/auth/me", response_model=MatchmakerAdminMeResponse, summary="查询当前红娘后台账号")
 async def admin_me(current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin)) -> MatchmakerAdminMeResponse:
-    return MatchmakerAdminMeResponse(account=current.account, permissions=["matchmaker:read", "matchmaker:service:write"])
+    return MatchmakerAdminMeResponse(account=current.account, permissions=sorted(current.permissions))
 
 
 @router.post("/auth/logout", status_code=204, summary="退出红娘后台")
@@ -150,9 +150,11 @@ async def assignments(page: int = Query(1, ge=1, le=1000), page_size: int = Quer
     conditions = ["1=1"]
     params: dict[str, int] = {"limit": page_size, "offset": (page - 1) * page_size}
     if user_id is not None:
-        conditions.append("user_id = :user_id"); params["user_id"] = user_id
+        conditions.append("user_id = :user_id")
+        params["user_id"] = user_id
     if matchmaker_id is not None:
-        conditions.append("matchmaker_id = :matchmaker_id"); params["matchmaker_id"] = matchmaker_id
+        conditions.append("matchmaker_id = :matchmaker_id")
+        params["matchmaker_id"] = matchmaker_id
     where = " AND ".join(conditions)
     rows = await db.execute(text(f"SELECT id, user_id, organization_id, matchmaker_id, source, status, effective_at, ended_at FROM resource_assignment WHERE {where} ORDER BY id DESC LIMIT :limit OFFSET :offset"), params)
     count = await db.execute(text(f"SELECT COUNT(*) FROM resource_assignment WHERE {where}"), {k: v for k, v in params.items() if k not in ("limit", "offset")})
