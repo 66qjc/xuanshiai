@@ -7,6 +7,7 @@
 ### 变更记录
 
 - 2026-08-08：新增 2 个 `/api/v1/ai/compatibility/*` 路径（GET 读取 + POST recompute）。旧推荐流的 `match_score/match_reason` 保持 `legacy-rule-v1` 语义并在卡片上标注 `algorithm_version`/`match_score_source=legacy-rule-v1`；新兼容度只写 shadow，不影响首页推荐排序、不触发喜欢/申请/聊天。
+- 2026-08-11（二期 M06）：兼容度快照保存双方完整五维修订向量与 `compatibility_shadow` 双方同意快照；GET 读取时重新校验双方同意、投影授权、完整版本和过期时间，发现变化返回 `stale/blocked`，不在 GET 中回写数据库。
 
 通用请求头（所有接口）：
 
@@ -26,7 +27,7 @@ X-Request-ID: req_01J...                # 可选，1-128 位 [A-Za-z0-9._:-]，�
 - **维度权重冻结**（§9.2，非科学概率）：年龄 20、城市/异地 15、婚姻 10、学历 10、身高 10、收入 10、兴趣标签 15、关系期待 10。MBTI、认证、活跃、会员、置顶不进入兼容度。
 - **证据与解释**（§9.3）：结果使用稳定原因码（`AGE_MUTUAL_WITHIN_RANGE`、`CITY_MUTUAL_ACCEPTED`、`MARRIAGE_MUTUAL_ACCEPTED`、`EDUCATION_MUTUAL_WITHIN_RANGE`、`HEIGHT_MUTUAL_WITHIN_RANGE`、`INCOME_MUTUAL_WITHIN_RANGE`、`INTEREST_OVERLAP`、`RELATIONSHIP_GOAL_SHARED`、`DIMENSION_UNKNOWN`、`COVERAGE_INSUFFICIENT`、`CANDIDATE_NOT_VISIBLE`）。每条原因码绑定 `evidence`（字段 key、source revisions、可展示标记、限制说明），不存对方敏感原文；模板解释优先。
 - **Shadow 纪律**（§9.5/§10.4）：新快照只写 `ai_compatibility_snapshot`，`display_eligible` 固定为 `false`、`experiment_bucket=shadow`，不影响排序和用户动作；旧 `match_score/match_reason` 语义恒为 `legacy-rule-v1`，新客户端才读取可选的 `compatibility` 对象。C-06 质量反馈只做离线评估（Task 12），学习排序仍受 Phase 5 门禁。
-- 结果读取以 MySQL 为事实源；Redis 断开不影响本接口。
+- 结果读取以 MySQL 为事实源；Redis 断开不影响本接口。GET 是纯读取路径，不负责把发现的版本变化写回 `status`；撤权、删除和失效状态由同步门禁及 cleanup/outbox 负责传播。
 - 错误响应统一为：
 
 ```json

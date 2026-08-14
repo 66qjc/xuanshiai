@@ -55,10 +55,10 @@ from app.services.ai.search import (
     confirm_search_draft,
     create_search_draft,
     delete_search_snapshot,
-    execute_search_snapshot,
     get_search_suggestions,
     load_search_draft,
     patch_search_draft,
+    read_materialized_search_results,
 )
 from app.services.ai.tasks import TaskError
 from app.services.candidate_query import InvalidCandidateCursor
@@ -208,6 +208,7 @@ async def patch_search_draft_route(
             current.id,
             body,
             expected_condition_revision,
+            idempotency_key,
         )
     except SearchInputInvalid as exc:
         raise _error_response(exc.code, exc.message, exc.status_code) from exc
@@ -217,6 +218,10 @@ async def patch_search_draft_route(
         raise _error_response(exc.code, exc.message, exc.status_code) from exc
     except DraftVersionConflict as exc:
         raise _error_response(exc.code, exc.message, exc.status_code) from exc
+    except TaskError as exc:
+        raise _error_response(
+            exc.code, exc.message, exc.status_code, retryable=exc.retryable
+        ) from exc
     await db.commit()
 
 
@@ -310,7 +315,7 @@ async def get_search_results_route(
     """每次读取重新过可见性门禁；结果过期标 stale。"""
     _require_search_feature()
     try:
-        return await execute_search_snapshot(
+        return await read_materialized_search_results(
             db, snapshot_id, current.id, cursor, page_size
         )
     except SearchSnapshotNotFound as exc:

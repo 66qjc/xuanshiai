@@ -39,8 +39,9 @@ import base64
 import hashlib
 import json
 import logging
+import math
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -49,7 +50,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.schemas.ai_common import AiTaskStatus, AI_FIELD_ALLOWLIST, ProjectionKind
+from app.schemas.ai_common import AI_FIELD_ALLOWLIST, AiTaskStatus, ProjectionKind
 from app.schemas.ai_profile import (
     ProfileFieldConfirmationStatus,
     ProfileFieldPatchAction,
@@ -58,6 +59,7 @@ from app.schemas.ai_profile import (
     ProfileRevisionRead,
     ProfileSessionStatus,
     ProfileSubject,
+    normalize_profile_extracted_value,
 )
 from app.services.ai.base import AITaskContext, StructuredExtractRequest
 from app.services.ai.features import (
@@ -66,7 +68,7 @@ from app.services.ai.features import (
 )
 from app.services.ai.gateway import AIGateway
 from app.services.ai.tasks import AiTaskRecord, TaskError, enqueue_task, fail_task
-from app.services.derivation_outbox import run_cleanup_for_user
+from app.services.derivation_outbox import purge_ai_resources, run_cleanup_for_user
 from app.services.revisions import (
     RevisionKind,
     RevisionVector,
@@ -193,6 +195,8 @@ _TURN_COLUMNS = (
 # review C-2/C-3）。
 _PROJECTION_TASK_TYPE = "profile_projection"
 _CLEANUP_TASK_TYPE = "cleanup"
+# restore 是同步操作但需要幂等记录，复用 ai_task 表做去重锚（缺陷 15）。
+_RESTORE_TASK_TYPE = "profile_restore"
 
 # 供 app.workers.ai_worker.register_business_handlers 引用的公共常量。
 PROJECTION_TASK_TYPE = _PROJECTION_TASK_TYPE
@@ -201,11 +205,13 @@ CLEANUP_TASK_TYPE = _CLEANUP_TASK_TYPE
 _DRAFT_COLUMNS = (
     "draft_id, user_id, subject, session_id, status, expected_revision, "
     "consent_snapshot_json, policy_revision, prompt_version, schema_version, "
-    "published_revision_id, expires_at, created_at, updated_at"
+    "published_revision_id, last_operation_idempotency_key, "
+    "last_operation_request_digest, last_operation_response_json, "
+    "expires_at, created_at, updated_at"
 )
 _DRAFT_FIELD_COLUMNS = (
     "draft_id, field_key, subject, value_json, display_value, source_type, "
-    "source_turn_ids, confidence, visibility, consent_scope, schema_version, "
+    "source_turn_ids, source_span, confidence, visibility, consent_scope, schema_version, "
     "prompt_version, content_hash, confirmation_status, created_at, updated_at"
 )
 _TASK_COLUMNS = (
@@ -454,6 +460,7 @@ class ProfileDraftField:
     display_value: str | None = None
     source_type: str | None = None
     source_turn_ids: tuple[str, ...] = ()
+    source_span: str | None = None
     confidence: float = 0.0
     visibility: str | None = None
     consent_scope: str | None = None
@@ -474,6 +481,10 @@ class ProfileDraft:
     revision: int = 0
     policy_revision: str = PROFILE_POLICY_REVISION
     schema_version: str = PROFILE_SCHEMA_VERSION
+    consent_snapshot: dict[str, Any] = field(default_factory=dict)
+    last_operation_idempotency_key: str | None = None
+    last_operation_request_digest: str | None = None
+    operation_history: dict[str, Any] = field(default_factory=dict)
     session_id: str | None = None
     fields: tuple[ProfileDraftField, ...] = ()
     expires_at: datetime | None = None
@@ -1016,19 +1027,31 @@ async def find_turn_by_client_id(
     return _turn_from_row(row) if row else None
 
 
-async def _count_turns(db: AsyncSession, session_id: str) -> int:
-    result = await db.execute(
-        text("SELECT COUNT(*) FROM ai_profile_turn WHERE session_id = :session_id"),
-        {"session_id": session_id},
-    )
-    return int(await _scalar(result) or 0)
-
-
 async def _insert_turn(
     db: AsyncSession, session_id: str, user_id: int, client_turn_id: str, answer_text: str
 ) -> ProfileTurn:
     turn_id = uuid.uuid4().hex
-    turn_no = (await _count_turns(db, session_id)) + 1
+    # turn_no 经 ``COUNT(*)+1`` 计算，同一会话两个并发 turn（不同 client_turn_id）
+    # 可得到相同 turn_no。``client_turn_id`` 唯一键无法保护 turn_no 维度。此处对
+    # ``ai_profile_session`` 行加 ``SELECT ... FOR UPDATE`` 锁，序列化同一会话的
+    # turn 插入：第二个并发请求在锁释放后才能读取 COUNT，此时前一个 turn 已可见，
+    # turn_no 一定递增。同时把 COUNT 换成 ``COALESCE(MAX(turn_no), 0)+1``，避免
+    # 已删除/软删除 turn 对计数的影响。
+    await db.execute(
+        text(
+            "SELECT session_id FROM ai_profile_session "
+            "WHERE session_id = :session_id FOR UPDATE"
+        ),
+        {"session_id": session_id},
+    )
+    result = await db.execute(
+        text(
+            "SELECT COALESCE(MAX(turn_no), 0) + 1 AS next_no "
+            "FROM ai_profile_turn WHERE session_id = :session_id"
+        ),
+        {"session_id": session_id},
+    )
+    turn_no = int(await _scalar(result) or 1)
     await db.execute(
         text(
             "INSERT INTO ai_profile_turn "
@@ -1104,6 +1127,8 @@ async def submit_profile_turn(
     await db.execute(
         text(
             "UPDATE ai_task SET payload_summary = :payload_summary, "
+            "source_revision_json = :source_revision_json, "
+            "consent_snapshot_json = :consent_snapshot_json, "
             "updated_at = UTC_TIMESTAMP() WHERE task_id = :task_id"
         ),
         {
@@ -1115,6 +1140,12 @@ async def submit_profile_turn(
                     "subject": session.subject.value,
                 },
                 ensure_ascii=False,
+            ),
+            "source_revision_json": json.dumps(
+                session.revision_vector.as_dict(), ensure_ascii=False
+            ),
+            "consent_snapshot_json": json.dumps(
+                session.consent_snapshot, ensure_ascii=False
             ),
             "task_id": task.task_id,
         },
@@ -1204,10 +1235,10 @@ async def _write_draft(
             text(
                 "INSERT INTO ai_profile_draft_field "
                 "(draft_id, field_key, subject, value_json, display_value, source_type, "
-                " source_turn_ids, confidence, visibility, consent_scope, schema_version, "
+                " source_turn_ids, source_span, confidence, visibility, consent_scope, schema_version, "
                 " prompt_version, content_hash, confirmation_status, created_at, updated_at) "
                 "VALUES (:draft_id, :field_key, :subject, :value_json, :display_value, "
-                " 'user_answer', :source_turn_ids, :confidence, :visibility, "
+                " 'user_answer', :source_turn_ids, :source_span, :confidence, :visibility, "
                 " :consent_scope, :schema_version, :prompt_version, :content_hash, "
                 " 'suggested', UTC_TIMESTAMP(), UTC_TIMESTAMP())"
             ),
@@ -1218,6 +1249,8 @@ async def _write_draft(
                 "value_json": json.dumps(value, ensure_ascii=False),
                 "display_value": _display_value(value),
                 "source_turn_ids": json.dumps(list(source_turn_ids), ensure_ascii=False),
+                "source_span": getattr(field, "source_span", None)
+                or getattr(field, "source_quote", None),
                 "confidence": float(field.confidence),
                 "visibility": "self",
                 "consent_scope": consent_scope,
@@ -1291,6 +1324,56 @@ async def extract_profile_turn(
             db, task.task_id, worker_id,
             error_code=outcome.error_code or "AI_TEMPORARILY_UNAVAILABLE",
             retryable=outcome.retryable,
+        )
+        return None
+
+    expected_subject = session.subject
+    expected_policy_revision = session.policy_revision or PROFILE_POLICY_REVISION
+    try:
+        fields = tuple(outcome.result.fields)
+        if outcome.result.schema_version != PROFILE_SCHEMA_VERSION:
+            raise ValueError("provider result schema version does not match")
+        for field in fields:
+            # Revalidate at the worker boundary as well as in Pydantic.  A
+            # provider adapter can return a model created with ``model_construct``
+            # or another bypass, so the draft writer must never silently filter
+            # an unknown/authentication field.
+            if not isinstance(field.subject, ProfileSubject):
+                raise ValueError("provider subject is not typed")
+            if field.subject is not expected_subject:
+                raise ValueError("provider subject does not match session")
+            if field.schema_version != PROFILE_SCHEMA_VERSION:
+                raise ValueError("provider schema version does not match")
+            if field.prompt_version != PROFILE_PROMPT_VERSION:
+                raise ValueError("provider prompt version does not match")
+            if field.policy_revision != expected_policy_revision:
+                raise ValueError("provider policy revision does not match")
+            field.value = normalize_profile_extracted_value(
+                field.subject, field.field_key, field.value
+            )
+            if isinstance(field.confidence, bool):
+                raise ValueError("provider confidence must be numeric")
+            confidence = float(field.confidence)
+            if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
+                raise ValueError("provider confidence is outside the allowed range")
+            source_span = getattr(field, "source_span", None)
+            source_quote = getattr(field, "source_quote", None)
+            if source_span is not None and not isinstance(source_span, str):
+                raise ValueError("provider source span must be text")
+            if source_quote is not None and not isinstance(source_quote, str):
+                raise ValueError("provider source quote must be text")
+            if source_span is not None and source_quote is not None and source_span != source_quote:
+                raise ValueError("provider source evidence does not agree")
+            if field.confirmation_status != ProfileFieldConfirmationStatus.SUGGESTED.value:
+                raise ValueError("provider confirmation status is not suggested")
+            if not field.needs_confirmation:
+                raise ValueError("provider field does not require confirmation")
+    except (AttributeError, TypeError, ValueError):
+        # Provider provenance must describe this exact session.  Do not rewrite
+        # a foreign subject or accept fabricated version evidence into a draft.
+        await fail_task(
+            db, task.task_id, worker_id,
+            error_code="AI_INPUT_INVALID", retryable=False,
         )
         return None
 
@@ -1461,6 +1544,72 @@ def hash_profile_delete(subject: str, field_key: str | None = None) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
+def hash_restore_request(revision_id: int, owner_user_id: int) -> str:
+    """Stable digest of a restore request for idempotent replay (缺陷 15)."""
+    payload = json.dumps(
+        {"revision_id": int(revision_id), "owner_user_id": int(owner_user_id)},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def hash_profile_patch_request(
+    draft_id: str, expected_revision: int, actions: list[ProfileFieldPatchAction]
+) -> str:
+    payload = json.dumps(
+        {
+            "draft_id": draft_id,
+            "expected_revision": int(expected_revision),
+            "actions": [action.model_dump(mode="json") for action in actions],
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _cleanup_purge_deadline() -> str:
+    return (_now_utc() + timedelta(minutes=15)).isoformat()
+
+
+def _cleanup_payload(
+    *,
+    scope: str,
+    resource_id: str,
+    version: RevisionVector,
+) -> dict[str, Any]:
+    return {
+        "scope": scope,
+        "resource_id": resource_id,
+        "version": version.as_dict(),
+        "purge_deadline": _cleanup_purge_deadline(),
+    }
+
+
+def _parse_cleanup_resource_id(resource_id: str) -> dict[str, str]:
+    parts = str(resource_id).split(":")
+    if not parts:
+        return {}
+    kind = parts[0]
+    if kind == "profile" and len(parts) >= 3:
+        return {"kind": kind, "user_id": parts[1], "subject": parts[2]}
+    if kind == "field" and len(parts) >= 4:
+        return {
+            "kind": kind,
+            "user_id": parts[1],
+            "subject": parts[2],
+            "field_key": parts[3],
+        }
+    if kind == "snapshot" and len(parts) >= 3:
+        return {"kind": kind, "user_id": parts[1], "snapshot_id": parts[2]}
+    if kind == "consent" and len(parts) >= 3:
+        return {"kind": kind, "user_id": parts[1], "consent_scope": parts[2]}
+    return {"kind": kind}
+
+
 async def _find_write_task(
     db: AsyncSession, owner_user_id: int, task_type: str, idempotency_key: str
 ) -> AiTaskRecord | None:
@@ -1551,6 +1700,7 @@ def _draft_field_from_row(row: dict[str, Any]) -> ProfileDraftField:
         source_turn_ids=(
             tuple(json.loads(source_turn_ids)) if source_turn_ids else ()
         ),
+        source_span=row.get("source_span"),
         confidence=float(row.get("confidence") or 0.0),
         visibility=row.get("visibility"),
         consent_scope=row.get("consent_scope"),
@@ -1558,6 +1708,93 @@ def _draft_field_from_row(row: dict[str, Any]) -> ProfileDraftField:
         prompt_version=row.get("prompt_version"),
         content_hash=row.get("content_hash"),
         confirmation_status=str(row.get("confirmation_status") or "suggested"),
+    )
+
+
+def _operation_history(row: dict[str, Any]) -> dict[str, Any]:
+    raw = _maybe_json(row.get("last_operation_response_json"))
+    if isinstance(raw, dict) and isinstance(raw.get("operations"), dict):
+        return raw
+    return {"operations": {}}
+
+
+def _draft_response_payload(draft: ProfileDraft) -> dict[str, Any]:
+    return {
+        "draft_id": draft.draft_id,
+        "owner_user_id": draft.owner_user_id,
+        "subject": draft.subject,
+        "status": draft.status,
+        "revision": draft.revision,
+        "policy_revision": draft.policy_revision,
+        "schema_version": draft.schema_version,
+        "consent_snapshot": draft.consent_snapshot,
+        "session_id": draft.session_id,
+        "fields": [
+            {
+                "field_key": item.field_key,
+                "subject": item.subject,
+                "value": item.value,
+                "display_value": item.display_value,
+                "source_type": item.source_type,
+                "source_turn_ids": list(item.source_turn_ids),
+                "source_span": item.source_span,
+                "confidence": item.confidence,
+                "visibility": item.visibility,
+                "consent_scope": item.consent_scope,
+                "schema_version": item.schema_version,
+                "prompt_version": item.prompt_version,
+                "content_hash": item.content_hash,
+                "confirmation_status": item.confirmation_status,
+            }
+            for item in draft.fields
+        ],
+    }
+
+
+def _draft_from_response_payload(
+    payload: dict[str, Any], fallback: ProfileDraft
+) -> ProfileDraft:
+    fields = tuple(
+        ProfileDraftField(
+            field_key=str(item["field_key"]),
+            subject=str(item.get("subject") or fallback.subject),
+            value=item.get("value"),
+            display_value=item.get("display_value"),
+            source_type=item.get("source_type"),
+            source_turn_ids=tuple(item.get("source_turn_ids") or ()),
+            source_span=item.get("source_span"),
+            confidence=float(item.get("confidence") or 0.0),
+            visibility=item.get("visibility"),
+            consent_scope=item.get("consent_scope"),
+            schema_version=str(item.get("schema_version") or PROFILE_SCHEMA_VERSION),
+            prompt_version=item.get("prompt_version"),
+            content_hash=item.get("content_hash"),
+            confirmation_status=str(item.get("confirmation_status") or "suggested"),
+        )
+        for item in payload.get("fields") or ()
+        if isinstance(item, dict) and item.get("field_key")
+    )
+    if not fields:
+        return fallback
+    return ProfileDraft(
+        draft_id=str(payload.get("draft_id") or fallback.draft_id),
+        owner_user_id=int(payload.get("owner_user_id") or fallback.owner_user_id),
+        subject=str(payload.get("subject") or fallback.subject),
+        status=str(payload.get("status") or fallback.status),
+        revision=int(payload.get("revision") or 0),
+        policy_revision=str(payload.get("policy_revision") or fallback.policy_revision),
+        schema_version=str(payload.get("schema_version") or fallback.schema_version),
+        consent_snapshot=(
+            payload.get("consent_snapshot")
+            if isinstance(payload.get("consent_snapshot"), dict)
+            else fallback.consent_snapshot
+        ),
+        operation_history=fallback.operation_history,
+        session_id=payload.get("session_id") or fallback.session_id,
+        fields=fields,
+        expires_at=fallback.expires_at,
+        created_at=fallback.created_at,
+        updated_at=fallback.updated_at,
     )
 
 
@@ -1572,6 +1809,14 @@ def _draft_from_row(
         revision=int(row.get("expected_revision") or 0),
         policy_revision=str(row.get("policy_revision") or PROFILE_POLICY_REVISION),
         schema_version=str(row.get("schema_version") or PROFILE_SCHEMA_VERSION),
+        consent_snapshot=(
+            _maybe_json(row.get("consent_snapshot_json"))
+            if isinstance(_maybe_json(row.get("consent_snapshot_json")), dict)
+            else {}
+        ),
+        last_operation_idempotency_key=row.get("last_operation_idempotency_key"),
+        last_operation_request_digest=row.get("last_operation_request_digest"),
+        operation_history=_operation_history(row),
         session_id=str(row["session_id"]) if row.get("session_id") else None,
         fields=tuple(_draft_field_from_row(f) for f in fields),
         expires_at=row.get("expires_at"),
@@ -1608,6 +1853,7 @@ async def confirm_profile_draft(
     owner_user_id: int,
     actions: list[ProfileFieldPatchAction],
     expected_revision: int,
+    idempotency_key: str = "",
 ) -> ProfileDraft:
     """Apply per-field confirm/replace/reject/delete actions under optimistic lock.
 
@@ -1617,6 +1863,30 @@ async def confirm_profile_draft(
     ``expected_revision + 1``，返回新草稿。不 commit。
     """
     draft = await load_owned_draft_for_update(db, draft_id, owner_user_id)
+    request_hash = hash_profile_patch_request(draft_id, expected_revision, actions)
+    history_entry = (
+        draft.operation_history.get("operations", {}).get(idempotency_key)
+        if idempotency_key
+        else None
+    )
+    if isinstance(history_entry, dict):
+        if str(history_entry.get("request_digest") or "") != request_hash:
+            raise TaskError(
+                code="TASK_IDEMPOTENCY_CONFLICT",
+                message="Idempotency-Key conflict",
+                status_code=409,
+            )
+        response_payload = history_entry.get("response")
+        if isinstance(response_payload, dict):
+            return _draft_from_response_payload(response_payload, draft)
+    if idempotency_key and draft.last_operation_idempotency_key == idempotency_key:
+        if draft.last_operation_request_digest != request_hash:
+            raise TaskError(
+                code="TASK_IDEMPOTENCY_CONFLICT",
+                message="Idempotency-Key conflict",
+                status_code=409,
+            )
+        return draft
     ensure_draft_editable(draft, "确认/修改")
     ensure_revision(draft.revision, expected_revision)
     known = {field.field_key for field in draft.fields}
@@ -1676,7 +1946,32 @@ async def confirm_profile_draft(
             ),
             {"revision": draft.revision + 1, "draft_id": draft_id},
         )
-    return await load_owned_draft(db, draft_id, owner_user_id)
+    updated = await load_owned_draft(db, draft_id, owner_user_id)
+    if idempotency_key:
+        history = dict(updated.operation_history or {"operations": {}})
+        operations = dict(history.get("operations") or {})
+        operations[idempotency_key] = {
+            "request_digest": request_hash,
+            "response": _draft_response_payload(updated),
+        }
+        if len(operations) > 64:
+            operations = dict(list(operations.items())[-64:])
+        history["operations"] = operations
+        await db.execute(
+            text(
+                "UPDATE ai_profile_draft SET last_operation_idempotency_key = :key, "
+                "last_operation_request_digest = :request_digest, "
+                "last_operation_response_json = :response_json, "
+                "updated_at = UTC_TIMESTAMP() WHERE draft_id = :draft_id"
+            ),
+            {
+                "draft_id": draft_id,
+                "key": idempotency_key,
+                "request_digest": request_hash,
+                "response_json": json.dumps(history, ensure_ascii=False),
+            },
+        )
+    return updated
 
 
 async def _update_draft_field_status(
@@ -1709,58 +2004,105 @@ async def insert_immutable_profile_revision(
     （发布后历史只读）。不 commit。
     """
     subject = draft.subject
-    result = await db.execute(
-        text(
-            "SELECT COALESCE(MAX(revision_no), 0) + 1 AS next_no "
-            "FROM ai_profile_revision WHERE user_id = :user_id AND subject = :subject"
-        ),
-        {"user_id": owner_user_id, "subject": subject},
-    )
-    row = await _first_row(result)
-    revision_no = int(row["next_no"]) if row else 1
     source_revision = await _load_revision_vector(db, owner_user_id)
     now = _now_utc()
-    await db.execute(
-        text(
-            "INSERT INTO ai_profile_revision "
-            "(user_id, subject, revision_no, draft_id, source_revision_json, "
-            " policy_revision, published_by, published_at, created_at) "
-            "VALUES (:user_id, :subject, :revision_no, :draft_id, :source_revision_json, "
-            " :policy_revision, :published_by, :published_at, :created_at)"
-        ),
-        {
-            "user_id": owner_user_id,
-            "subject": subject,
-            "revision_no": revision_no,
-            "draft_id": draft.draft_id,
-            "source_revision_json": json.dumps(source_revision.as_dict(), ensure_ascii=False),
-            "policy_revision": draft.policy_revision or PROFILE_POLICY_REVISION,
-            "published_by": owner_user_id,
-            "published_at": now,
-            "created_at": now,
-        },
-    )
-    result = await db.execute(
-        text(
-            "SELECT id FROM ai_profile_revision "
-            "WHERE user_id = :user_id AND subject = :subject AND revision_no = :revision_no "
-            "ORDER BY id DESC LIMIT 1"
-        ),
-        {"user_id": owner_user_id, "subject": subject, "revision_no": revision_no},
-    )
-    row = await _first_row(result)
-    revision_id = int(row["id"]) if row else 0
+    # revision_no 经 ``SELECT MAX(revision_no)+1`` 计算，两个并发发布事务可读到
+    # 同一值。唯一键 ``uk_ai_profile_revision (user_id, subject, revision_no)``
+    # 会拒绝第二个 INSERT；此处捕获 ``IntegrityError``，用 SAVEPOINT 只回滚本次
+    # INSERT 后重读并重试（最多 3 次），与 ``enqueue_task`` 的嵌套事务并发处理
+    # 模式一致。SAVEPOINT 保证调用方事务（草稿锁、reserved_task 等）不被误回滚。
+    revision_id = 0
+    revision_no = 1
+    for attempt in range(3):
+        result = await db.execute(
+            text(
+                "SELECT COALESCE(MAX(revision_no), 0) + 1 AS next_no "
+                "FROM ai_profile_revision WHERE user_id = :user_id AND subject = :subject"
+            ),
+            {"user_id": owner_user_id, "subject": subject},
+        )
+        row = await _first_row(result)
+        revision_no = int(row["next_no"]) if row else 1
+        try:
+            if hasattr(db, "begin_nested"):
+                async with db.begin_nested():
+                    await db.execute(
+                        text(
+                            "INSERT INTO ai_profile_revision "
+                            "(user_id, subject, revision_no, draft_id, source_revision_json, "
+                            " policy_revision, published_by, published_at, created_at) "
+                            "VALUES (:user_id, :subject, :revision_no, :draft_id, "
+                            " :source_revision_json, :policy_revision, :published_by, "
+                            " :published_at, :created_at)"
+                        ),
+                        {
+                            "user_id": owner_user_id,
+                            "subject": subject,
+                            "revision_no": revision_no,
+                            "draft_id": draft.draft_id,
+                            "source_revision_json": json.dumps(
+                                source_revision.as_dict(), ensure_ascii=False
+                            ),
+                            "policy_revision": draft.policy_revision or PROFILE_POLICY_REVISION,
+                            "published_by": owner_user_id,
+                            "published_at": now,
+                            "created_at": now,
+                        },
+                    )
+            else:
+                await db.execute(
+                    text(
+                        "INSERT INTO ai_profile_revision "
+                        "(user_id, subject, revision_no, draft_id, source_revision_json, "
+                        " policy_revision, published_by, published_at, created_at) "
+                        "VALUES (:user_id, :subject, :revision_no, :draft_id, "
+                        " :source_revision_json, :policy_revision, :published_by, "
+                        " :published_at, :created_at)"
+                    ),
+                    {
+                        "user_id": owner_user_id,
+                        "subject": subject,
+                        "revision_no": revision_no,
+                        "draft_id": draft.draft_id,
+                        "source_revision_json": json.dumps(
+                            source_revision.as_dict(), ensure_ascii=False
+                        ),
+                        "policy_revision": draft.policy_revision or PROFILE_POLICY_REVISION,
+                        "published_by": owner_user_id,
+                        "published_at": now,
+                        "created_at": now,
+                    },
+                )
+        except IntegrityError:
+            if attempt == 2:
+                raise
+            continue
+        result = await db.execute(
+            text(
+                "SELECT id FROM ai_profile_revision "
+                "WHERE user_id = :user_id AND subject = :subject AND revision_no = :revision_no "
+                "ORDER BY id DESC LIMIT 1"
+            ),
+            {"user_id": owner_user_id, "subject": subject, "revision_no": revision_no},
+        )
+        row = await _first_row(result)
+        revision_id = int(row["id"]) if row else 0
+        break
     changed_keys: list[str] = []
     for field in fields:
+        if field.confirmation_status != ProfileFieldConfirmationStatus.CONFIRMED.value:
+            raise AIInputError("only confirmed fields can be published")
+        if field.subject != subject or field.field_key not in AI_FIELD_ALLOWLIST:
+            raise AIInputError("published field is outside the draft subject allowlist")
         changed_keys.append(field.field_key)
         await db.execute(
             text(
                 "INSERT INTO ai_profile_revision_field "
                 "(revision_id, field_key, subject, value_json, display_value, confidence, "
-                " source_type, source_turn_ids, content_hash, schema_version, prompt_version, "
+                " source_type, source_turn_ids, source_span, content_hash, schema_version, prompt_version, "
                 " created_at) "
                 "VALUES (:revision_id, :field_key, :subject, :value_json, :display_value, "
-                " :confidence, :source_type, :source_turn_ids, :content_hash, "
+                " :confidence, :source_type, :source_turn_ids, :source_span, :content_hash, "
                 " :schema_version, :prompt_version, :created_at)"
             ),
             {
@@ -1772,6 +2114,7 @@ async def insert_immutable_profile_revision(
                 "confidence": field.confidence,
                 "source_type": field.source_type or "user_answer",
                 "source_turn_ids": json.dumps(list(field.source_turn_ids), ensure_ascii=False),
+                "source_span": field.source_span,
                 "content_hash": field.content_hash
                 or _content_hash(field.field_key, subject, field.value, field.source_turn_ids),
                 "schema_version": field.schema_version or PROFILE_SCHEMA_VERSION,
@@ -1814,6 +2157,9 @@ async def enqueue_cleanup_or_projection_task(
     revision: PublishedRevision,
     idempotency_key: str,
     request_hash: str,
+    source_revision: RevisionVector,
+    consent_snapshot: dict[str, Any],
+    reserved_task: AiTaskRecord | None = None,
 ) -> AiTaskRecord:
     """Enqueue the projection-build task that follows a confirmed publish.
 
@@ -1821,30 +2167,41 @@ async def enqueue_cleanup_or_projection_task(
     记录受控摘要（revision/draft/subject/target），不含字段原文。不 commit。
     """
     target = "user_profile" if revision.subject == "personal" else "user_partner_preference"
-    task = await enqueue_task(
+    task = reserved_task or await enqueue_task(
         db=db,
         owner_user_id=owner_user_id,
         task_type=_PROJECTION_TASK_TYPE,
         idempotency_key=idempotency_key,
         request_hash=request_hash,
-        revisions=RevisionVector(),
-        consent=None,
+        revisions=source_revision,
+        consent=consent_snapshot or None,
     )
     await db.execute(
         text(
             "UPDATE ai_task SET payload_summary = :payload_summary, "
+            "source_revision_json = :source_revision_json, "
+            "consent_snapshot_json = :consent_snapshot_json, "
             "updated_at = UTC_TIMESTAMP() WHERE task_id = :task_id"
         ),
         {
             "payload_summary": json.dumps(
                 {
+                    "published_revision_id": revision.revision_id,
                     "revision_id": revision.revision_id,
                     "draft_id": revision.draft_id,
                     "subject": revision.subject,
                     "user_id": owner_user_id,
                     "projection_target": target,
+                    "source_revision": source_revision.as_dict(),
+                    "consent_snapshot": consent_snapshot,
                 },
                 ensure_ascii=False,
+            ),
+            "source_revision_json": json.dumps(
+                source_revision.as_dict(), ensure_ascii=False
+            ),
+            "consent_snapshot_json": json.dumps(
+                consent_snapshot, ensure_ascii=False
             ),
             "task_id": task.task_id,
         },
@@ -1877,38 +2234,102 @@ async def publish_profile_draft(
             _replay_or_conflict(existing, request_hash, "publish")
         )
     draft = await load_owned_draft_for_update(db, draft_id, owner_user_id)
+    request_hash = hash_publish_request(draft_id, expected_revision)
+    # The draft row lock serializes concurrent publishes of the same draft.
+    # Re-check the idempotency row after acquiring it: a retry that entered
+    # before the winning transaction committed must replay, not fail on the
+    # now-published draft or create a second immutable revision.
+    existing = await _find_write_task(
+        db, owner_user_id, _PROJECTION_TASK_TYPE, idempotency_key
+    )
+    if existing is not None:
+        return TaskSubmission.replay(
+            _replay_or_conflict(existing, request_hash, "publish")
+        )
     ensure_draft_editable(draft, "发布")
     ensure_revision(draft.revision, expected_revision)
     fields = confirmed_fields(draft)
     if not fields:
         raise AIInputError("at least one confirmed field is required")
+    current_revision = await _load_revision_vector(db, owner_user_id)
+    # Reserve the unique task key before mutating the immutable revision. The
+    # unique owner/type/key constraint plus the draft lock makes the whole
+    # publish idempotent even when two requests race before either response.
+    reserved_task = await enqueue_task(
+        db=db,
+        owner_user_id=owner_user_id,
+        task_type=_PROJECTION_TASK_TYPE,
+        idempotency_key=idempotency_key,
+        request_hash=request_hash,
+        revisions=current_revision,
+        consent=draft.consent_snapshot or None,
+    )
+    if reserved_task.request_digest != request_hash:
+        raise TaskError(
+            code="TASK_IDEMPOTENCY_CONFLICT",
+            message="Idempotency-Key 已用于不同请求内容",
+            status_code=409,
+        )
     target = "user_profile" if draft.subject == "personal" else "user_partner_preference"
     revision = await insert_immutable_profile_revision(
         db, owner_user_id, draft, fields, target
     )
     revision_component = "profile" if draft.subject == "personal" else "preference"
-    await increment_revision_and_enqueue(
+    published_vector = await increment_revision_and_enqueue(
         db,
         owner_user_id,
         RevisionKind(revision_component),
         revision.changed_field_keys,
         "ai_profile_published",
         priority=40,
+        payload_extra={
+            "published_revision_id": revision.revision_id,
+            "subject": draft.subject,
+            "consent_snapshot": draft.consent_snapshot,
+        },
+    )
+    # The immutable revision is not externally visible until this transaction
+    # commits; record the post-publish five-dimensional snapshot before then.
+    await db.execute(
+        text(
+            "UPDATE ai_profile_revision SET source_revision_json = :source_revision_json "
+            "WHERE id = :revision_id"
+        ),
+        {
+            "source_revision_json": json.dumps(
+                published_vector.as_dict(), ensure_ascii=False
+            ),
+            "revision_id": revision.revision_id,
+        },
     )
     task = await enqueue_cleanup_or_projection_task(
-        db, owner_user_id, revision, idempotency_key, request_hash
+        db,
+        owner_user_id,
+        revision,
+        idempotency_key,
+        request_hash,
+        source_revision=published_vector,
+        consent_snapshot=draft.consent_snapshot,
+        reserved_task=reserved_task,
     )
     await db.flush()
     return TaskSubmission.accepted(task, revision)
 
 
 async def restore_profile_revision(
-    db: AsyncSession, revision_id: int, owner_user_id: int
+    db: AsyncSession,
+    revision_id: int,
+    owner_user_id: int,
+    idempotency_key: str = "",
 ) -> ProfileDraft:
     """Create a new editable draft from an immutable revision snapshot.
 
     旧 revision 只读、不更新旧行；新草稿字段回填 ``suggested``（再由用户确认后
     发布）。新草稿 ``expected_revision=0``，可正常走 confirm → publish 流程。
+
+    consent 校验与 ``create_profile_session`` 一致：恢复前必须有有效
+    ``profile_text_extract`` 授权（revoked_at IS NULL），否则抛
+    ``AIConsentRequired``，不允许用已撤销授权的快照静默创建草稿。
     """
     result = await db.execute(
         text(
@@ -1925,24 +2346,58 @@ async def restore_profile_revision(
     field_rows_result = await db.execute(
         text(
             "SELECT field_key, subject, value_json, display_value, confidence, "
-            "source_type, source_turn_ids, content_hash, schema_version, prompt_version "
+            "source_type, source_turn_ids, source_span, content_hash, schema_version, prompt_version "
             "FROM ai_profile_revision_field WHERE revision_id = :revision_id"
         ),
         {"revision_id": revision_id},
     )
     field_rows = field_rows_result.mappings().all()
-    draft_id = uuid.uuid4().hex
     now = _now_utc()
     consent = await _load_latest_consent(db, owner_user_id, PROFILE_CONSENT_SCOPE)
-    consent_snapshot = _consent_snapshot(consent) if consent else {}
+    if consent is None:
+        # consent 已撤销或不存在时禁止恢复（与 ``create_profile_session`` 一致），
+        # 不允许用已撤销授权的快照静默创建草稿（缺陷 14）。
+        raise AIConsentRequired()
+    consent_snapshot = _consent_snapshot(consent)
+    # 幂等回放（缺陷 15）：同 ``Idempotency-Key`` 重复 restore 返回已创建的草稿，
+    # 不创建第二个草稿。参考 ``confirm_profile_draft`` 的幂等处理模式：在
+    # ``ai_task`` 表按 ``task_type='profile_restore'`` + key 查找既有终态任务，
+    # 命中且 request_digest 一致时回放其关联草稿；digest 不一致则 409 冲突。
+    request_digest = hash_restore_request(revision_id, owner_user_id)
+    if idempotency_key:
+        existing_task = await _find_write_task(
+            db, owner_user_id, _RESTORE_TASK_TYPE, idempotency_key
+        )
+        if existing_task is not None:
+            if existing_task.request_digest != request_digest:
+                raise TaskError(
+                    code="TASK_IDEMPOTENCY_CONFLICT",
+                    message="Idempotency-Key 已用于不同请求内容",
+                    status_code=409,
+                )
+            # 回放：从任务 payload_summary 取回已创建的 draft_id 并回读草稿。
+            payload = existing_task.payload_summary or {}
+            replayed_draft_id = payload.get("draft_id") if isinstance(payload, dict) else None
+            if replayed_draft_id:
+                try:
+                    replayed = await load_owned_draft(
+                        db, str(replayed_draft_id), owner_user_id
+                    )
+                    return replayed
+                except ProfileDraftNotFound:
+                    # 草稿已被删除等：回放失败，走重建路径。
+                    pass
+    draft_id = uuid.uuid4().hex
     await db.execute(
         text(
             "INSERT INTO ai_profile_draft "
             "(draft_id, user_id, subject, session_id, status, expected_revision, "
             " consent_snapshot_json, policy_revision, prompt_version, schema_version, "
+            " last_operation_idempotency_key, last_operation_request_digest, "
             " expires_at, created_at, updated_at) "
             "VALUES (:draft_id, :user_id, :subject, NULL, 'draft', 0, "
             " :consent_snapshot_json, :policy_revision, :prompt_version, :schema_version, "
+            " :idempotency_key, :request_digest, "
             " NULL, :created_at, :created_at)"
         ),
         {
@@ -1953,6 +2408,8 @@ async def restore_profile_revision(
             "policy_revision": str(row["policy_revision"] or PROFILE_POLICY_REVISION),
             "prompt_version": PROFILE_PROMPT_VERSION,
             "schema_version": PROFILE_SCHEMA_VERSION,
+            "idempotency_key": idempotency_key or None,
+            "request_digest": request_digest if idempotency_key else None,
             "created_at": now,
         },
     )
@@ -1962,10 +2419,10 @@ async def restore_profile_revision(
             text(
                 "INSERT INTO ai_profile_draft_field "
                 "(draft_id, field_key, subject, value_json, display_value, source_type, "
-                " source_turn_ids, confidence, visibility, consent_scope, schema_version, "
+                " source_turn_ids, source_span, confidence, visibility, consent_scope, schema_version, "
                 " prompt_version, content_hash, confirmation_status, created_at, updated_at) "
                 "VALUES (:draft_id, :field_key, :subject, :value_json, :display_value, "
-                " :source_type, :source_turn_ids, :confidence, 'self', :consent_scope, "
+                " :source_type, :source_turn_ids, :source_span, :confidence, 'self', :consent_scope, "
                 " :schema_version, :prompt_version, :content_hash, 'suggested', "
                 " :created_at, :created_at)"
             ),
@@ -1982,6 +2439,7 @@ async def restore_profile_revision(
                     list(json.loads(source_turn_ids)) if source_turn_ids else [],
                     ensure_ascii=False,
                 ),
+                "source_span": field.get("source_span"),
                 "confidence": float(field.get("confidence") or 0.0),
                 "consent_scope": consent_snapshot.get("scope"),
                 "schema_version": str(
@@ -2005,7 +2463,85 @@ async def restore_profile_revision(
         "created_at": now,
         "updated_at": now,
     }
-    return _draft_from_row(draft_row, list(field_rows))
+    draft = _draft_from_row(draft_row, list(field_rows))
+    # 记录幂等锚（缺陷 15）：restore 是同步操作，但需要一个 ``profile_restore``
+    # 任务行承载 idempotency_key + request_digest + draft_id，供重复请求回放。
+    # 不入队执行（无 handler）；enqueue 后立即标记 succeeded 终态，worker 不会
+    # 拾取（profile_restore 无注册 handler）。
+    if idempotency_key:
+        current_revision = await _load_revision_vector(db, owner_user_id)
+        try:
+            restore_task = await enqueue_task(
+                db=db,
+                owner_user_id=owner_user_id,
+                task_type=_RESTORE_TASK_TYPE,
+                idempotency_key=idempotency_key,
+                request_hash=request_digest,
+                revisions=current_revision,
+                consent=consent_snapshot or None,
+            )
+            # 同步操作直接置终态（绕过 queued->leased->running->succeeded 状态机：
+            # 此任务无 handler、worker 不会拾取，终态仅为幂等去重锚）。
+            if restore_task.status != AiTaskStatus.SUCCEEDED:
+                await db.execute(
+                    text(
+                        "UPDATE ai_task SET status = 'succeeded', "
+                        "result_ref = :result_ref, finished_at = UTC_TIMESTAMP(), "
+                        "payload_summary = :payload_summary, "
+                        "updated_at = UTC_TIMESTAMP() WHERE task_id = :task_id"
+                    ),
+                    {
+                        "result_ref": f"profile-draft:{draft_id}",
+                        "payload_summary": json.dumps(
+                            {
+                                "revision_id": revision_id,
+                                "draft_id": draft_id,
+                                "subject": subject,
+                            },
+                            ensure_ascii=False,
+                        ),
+                        "task_id": restore_task.task_id,
+                    },
+                )
+            else:
+                # 并发同 key 回放：enqueue_task 已返回既有终态任务，补记 payload。
+                await db.execute(
+                    text(
+                        "UPDATE ai_task SET payload_summary = :payload_summary, "
+                        "updated_at = UTC_TIMESTAMP() WHERE task_id = :task_id"
+                    ),
+                    {
+                        "payload_summary": json.dumps(
+                            {
+                                "revision_id": revision_id,
+                                "draft_id": draft_id,
+                                "subject": subject,
+                            },
+                            ensure_ascii=False,
+                        ),
+                        "task_id": restore_task.task_id,
+                    },
+                )
+        except IntegrityError:
+            # 并发同 key：另一请求已抢先创建 restore 草稿。回读回放。
+            await db.rollback()
+            existing_task = await _find_write_task(
+                db, owner_user_id, _RESTORE_TASK_TYPE, idempotency_key
+            )
+            if existing_task is not None:
+                payload = existing_task.payload_summary or {}
+                replayed_draft_id = (
+                    payload.get("draft_id") if isinstance(payload, dict) else None
+                )
+                if replayed_draft_id:
+                    try:
+                        return await load_owned_draft(
+                            db, str(replayed_draft_id), owner_user_id
+                        )
+                    except ProfileDraftNotFound:
+                        pass
+            raise
+    return draft
 
 
 async def _load_latest_consent(
@@ -2088,7 +2624,13 @@ async def delete_ai_profile(
     )
     await db.execute(
         text(
-            "UPDATE ai_search_result SET stale = 1 WHERE target_user_id = :user_id"
+            # M-4 carry-over：不仅失效 target 方向结果，还要失效该用户作为
+            # viewer（snapshot 发起人）的结果行，通过 JOIN ai_search_snapshot
+            # 匹配 viewer 方向。参考 consents.py 的同款 JOIN 模式。
+            "UPDATE ai_search_result r "
+            "JOIN ai_search_snapshot s ON s.snapshot_id = r.snapshot_id "
+            "SET r.stale = 1, r.updated_at = UTC_TIMESTAMP() "
+            "WHERE r.target_user_id = :user_id OR s.user_id = :user_id"
         ),
         {"user_id": owner_user_id},
     )
@@ -2102,10 +2644,26 @@ async def delete_ai_profile(
         ),
         {"user_id": owner_user_id},
     )
+    # 撤销 ``profile_text_extract`` 授权前先 ``SELECT ... FOR UPDATE`` 锁行，
+    # 序列化并发撤销路径（与 ``revoke_consent`` 的墓碑计算逻辑一致）：两个并发
+    # ``delete_ai_profile`` 只能有一个把 grant 标记 revoked，另一个在锁释放后
+    # 看到 revoked_at 已非空，UPDATE 影响 0 行，幂等。墓碑计算依赖 granted_at，
+    # 锁行保证墓碑值稳定。
+    await db.execute(
+        text(
+            "SELECT user_id FROM ai_consent_grant "
+            "WHERE user_id = :user_id AND scope = :scope AND revoked_at IS NULL "
+            "FOR UPDATE"
+        ),
+        {"user_id": owner_user_id, "scope": PROFILE_CONSENT_SCOPE},
+    )
     await db.execute(
         text(
             "UPDATE ai_consent_grant SET revoked_at = UTC_TIMESTAMP(), "
-            "revoke_reason = 'ai_profile_deleted', updated_at = UTC_TIMESTAMP() "
+            "revoke_reason = 'ai_profile_deleted', "
+            "user_id = NULL, "
+            "user_tombstone = SHA2(CONCAT('consent:', :user_id, ':', :scope, ':', granted_at), 256), "
+            "updated_at = UTC_TIMESTAMP() "
             "WHERE user_id = :user_id AND scope = :scope AND revoked_at IS NULL"
         ),
         {"user_id": owner_user_id, "scope": PROFILE_CONSENT_SCOPE},
@@ -2122,6 +2680,7 @@ async def delete_ai_profile(
         (event_type,),
         event_type,
         priority=10,
+        payload_extra={"subject": subject_value},
     )
     current_revision = await _load_revision_vector(db, owner_user_id)
     task = await enqueue_task(
@@ -2140,12 +2699,11 @@ async def delete_ai_profile(
         ),
         {
             "payload_summary": json.dumps(
-                {
-                    "subject": subject_value,
-                    "scope": "profile",
-                    "user_id": owner_user_id,
-                    "event_type": event_type,
-                },
+                _cleanup_payload(
+                    scope="profile",
+                    resource_id=f"profile:{owner_user_id}:{subject_value}",
+                    version=current_revision,
+                ),
                 ensure_ascii=False,
             ),
             "task_id": task.task_id,
@@ -2169,6 +2727,11 @@ async def delete_ai_profile_field(
     同一事务内：把该字段在本主体所有草稿中标记 ``deleted``（不可见），递增对应
     主体 revision（personal → profile、ideal_partner → preference）并写 outbox
     事件，最后 enqueue cleanup task。重复删除（同 key）回放同一 task。不 commit。
+
+    注意（缺陷 16）：字段级删除是派生投影的失效信号，而非版本回写。已发布的
+    ``ai_profile_revision`` 本身不可变——本函数不修改任何 revision 行。字段被标
+    ``deleted`` 后，投影重建（``profile_projection`` handler）会读取最新已发布
+    版本的 confirmed 字段重新生成投影，被删除的字段在下次重建时自然缺席。
     """
     subject_value = _subject_value(subject)
     if field_key not in AI_FIELD_ALLOWLIST:
@@ -2199,9 +2762,60 @@ async def delete_ai_profile_field(
         else RevisionKind.PREFERENCE
     )
     await increment_revision_and_enqueue(
-        db, owner_user_id, kind, (field_key,), "ai_profile_field_deleted", priority=40
+        db,
+        owner_user_id,
+        kind,
+        (field_key,),
+        "ai_profile_field_deleted",
+        priority=40,
+        payload_extra={
+            "subject": subject_value,
+            "field_key": field_key,
+        },
     )
     current_revision = await _load_revision_vector(db, owner_user_id)
+    projection_kinds = (
+        _PERSONAL_PROJECTION_KINDS
+        if subject_value == ProfileSubject.PERSONAL.value
+        else _IDEAL_PARTNER_PROJECTION_KINDS
+    )
+    placeholders = ", ".join(f":field_kind{i}" for i in range(len(projection_kinds)))
+    await db.execute(
+        text(
+            "UPDATE ai_feature_projection SET status = 'invalidated', "
+            "invalidated_at = UTC_TIMESTAMP(), "
+            "invalidated_reason = 'ai_profile_field_deleted', "
+            "purge_after = DATE_ADD(UTC_TIMESTAMP(), INTERVAL 30 DAY), "
+            "updated_at = UTC_TIMESTAMP() "
+            "WHERE subject_user_id = :user_id "
+            f"AND projection_kind IN ({placeholders}) AND status = 'active'"
+        ),
+        {
+            "user_id": owner_user_id,
+            **{f"field_kind{i}": kind for i, kind in enumerate(projection_kinds)},
+        },
+    )
+    await db.execute(
+        text(
+            # M-4 carry-over：不仅失效 target 方向结果，还要失效该用户作为
+            # viewer（snapshot 发起人）的结果行，通过 JOIN ai_search_snapshot
+            # 匹配 viewer 方向。参考 consents.py 的同款 JOIN 模式。
+            "UPDATE ai_search_result r "
+            "JOIN ai_search_snapshot s ON s.snapshot_id = r.snapshot_id "
+            "SET r.stale = 1, r.updated_at = UTC_TIMESTAMP() "
+            "WHERE r.target_user_id = :user_id OR s.user_id = :user_id"
+        ),
+        {"user_id": owner_user_id},
+    )
+    await db.execute(
+        text(
+            "UPDATE ai_compatibility_snapshot SET status = 'stale', "
+            "invalidated_at = UTC_TIMESTAMP() "
+            "WHERE (viewer_user_id = :user_id OR target_user_id = :user_id) "
+            "AND status NOT IN ('stale', 'blocked')"
+        ),
+        {"user_id": owner_user_id},
+    )
     task = await enqueue_task(
         db=db,
         owner_user_id=owner_user_id,
@@ -2218,12 +2832,11 @@ async def delete_ai_profile_field(
         ),
         {
             "payload_summary": json.dumps(
-                {
-                    "subject": subject_value,
-                    "field_key": field_key,
-                    "scope": "field",
-                    "user_id": owner_user_id,
-                },
+                _cleanup_payload(
+                    scope="field",
+                    resource_id=f"field:{owner_user_id}:{subject_value}:{field_key}",
+                    version=current_revision,
+                ),
                 ensure_ascii=False,
             ),
             "task_id": task.task_id,
@@ -2263,7 +2876,20 @@ async def profile_projection_handler(
     payload = task.payload_summary or {}
     user_id = payload.get("user_id")
     subject = payload.get("subject")
-    if not user_id or not subject:
+    published_revision_id = payload.get("published_revision_id")
+    source_revision = task.source_revision_json or payload.get("source_revision") or {}
+    consent_snapshot = task.consent_snapshot_json or payload.get("consent_snapshot") or {}
+    required_revision_keys = {
+        "profile", "preference", "privacy", "relationship", "policy"
+    }
+    if (
+        not user_id
+        or not subject
+        or not published_revision_id
+        or not source_revision
+        or set(source_revision) != required_revision_keys
+        or not consent_snapshot
+    ):
         await fail_task(
             db, task.task_id, worker_id,
             error_code="AI_INPUT_INVALID", retryable=False,
@@ -2287,7 +2913,12 @@ async def profile_projection_handler(
         built: list[str] = []
         for kind in kinds:
             projection = await build_feature_projection(
-                db, int(user_id), kind, revision_vector=None
+                db,
+                int(user_id),
+                kind,
+                revision_vector=RevisionVector(**source_revision),
+                published_revision_id=int(published_revision_id),
+                consent_snapshot=consent_snapshot,
             )
             built.append(f"{kind.value}:{projection.id if projection.id is not None else 'ok'}")
     except ProjectionBuildError:
@@ -2320,9 +2951,20 @@ async def cleanup_handler(
     """
     payload = task.payload_summary or {}
     scope = str(payload.get("scope") or "")
-    user_id = payload.get("user_id")
+    resource = _parse_cleanup_resource_id(str(payload.get("resource_id") or ""))
+    user_id = resource.get("user_id")
     if scope in {"profile", "field"}:
-        if not user_id:
+        subject_value = str(resource.get("subject") or "").strip()
+        if not user_id or subject_value not in {"personal", "ideal_partner"}:
+            await fail_task(
+                db, task.task_id, worker_id,
+                error_code="AI_INPUT_INVALID", retryable=False,
+            )
+            return None
+        # 缺陷 44：user_id 来自 resource_id 解析，可能非整数；转换失败时不可重试。
+        try:
+            user_id_int = int(user_id)
+        except (TypeError, ValueError):
             await fail_task(
                 db, task.task_id, worker_id,
                 error_code="AI_INPUT_INVALID", retryable=False,
@@ -2337,17 +2979,49 @@ async def cleanup_handler(
             if task.source_revision_json
             else RevisionVector()
         )
-        await run_cleanup_for_user(db, int(user_id), reason, source_revision)
+        await run_cleanup_for_user(
+            db,
+            user_id_int,
+            reason,
+            source_revision,
+            subject=subject_value,
+        )
+        if scope == "profile":
+            await purge_ai_resources(
+                db,
+                user_id_int,
+                scope="profile",
+                subject=subject_value,
+            )
         return f"cleanup:user:{user_id}", source_revision
-    snapshot_id = payload.get("snapshot_id")
+    snapshot_id = resource.get("snapshot_id")
     if snapshot_id:
-        await db.execute(
-            text(
-                "UPDATE ai_search_result SET stale = 1 WHERE snapshot_id = :snapshot_id"
-            ),
-            {"snapshot_id": str(snapshot_id)},
+        await purge_ai_resources(
+            db,
+            int(user_id) if user_id else 0,
+            scope="search",
+            resource_id=str(snapshot_id),
         )
         return f"cleanup:snapshot:{snapshot_id}", RevisionVector()
+    if scope == "consent":
+        consent_scope = str(resource.get("consent_scope") or "unknown")
+        if user_id:
+            consent_cleanup_scope = {
+                "profile_text_extract": "consent_profile",
+                "search_parse": "consent_search",
+                "compatibility_shadow": "consent_compatibility",
+            }.get(consent_scope)
+            if consent_cleanup_scope is not None:
+                await purge_ai_resources(
+                    db,
+                    int(user_id),
+                    scope=consent_cleanup_scope,
+                )
+        return f"cleanup:consent:{user_id or 'unknown'}:{consent_scope}", (
+            RevisionVector(**task.source_revision_json)
+            if task.source_revision_json
+            else RevisionVector()
+        )
     await fail_task(
         db, task.task_id, worker_id,
         error_code="AI_INPUT_INVALID", retryable=False,

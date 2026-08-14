@@ -24,7 +24,7 @@ from __future__ import annotations
 import re
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
+from fastapi import APIRouter, Body, Depends, Header, HTTPException, Path, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies import CurrentUser, get_current_user
@@ -159,6 +159,7 @@ def _to_draft_read(draft: ProfileDraft) -> ProfileDraftRead:
                 subject=ProfileSubject(field.subject),
                 value=field.value,
                 display_value=field.display_value,
+                source_quote=field.source_span,
                 confidence=field.confidence,
                 needs_confirmation=(
                     field.confirmation_status
@@ -219,7 +220,7 @@ async def create_profile_session_route(
     summary="查询本人的 AI 画像会话",
 )
 async def get_profile_session_route(
-    session_id: str,
+    session_id: str = Path(..., min_length=1, max_length=64, pattern=r"^[a-z0-9_]+$"),
     current: CurrentUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> ProfileSessionRead:
@@ -239,8 +240,8 @@ async def get_profile_session_route(
     summary="提交一条文字回答并创建 profile_extract 任务",
 )
 async def submit_profile_turn_route(
-    session_id: str,
-    body: ProfileTurnCreateRequest,
+    session_id: str = Path(..., min_length=1, max_length=64, pattern=r"^[a-z0-9_]+$"),
+    body: ProfileTurnCreateRequest = Body(...),
     current: CurrentUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
@@ -293,7 +294,7 @@ async def submit_profile_turn_route(
     summary="暂停 AI 画像会话",
 )
 async def pause_profile_session_route(
-    session_id: str,
+    session_id: str = Path(..., min_length=1, max_length=64, pattern=r"^[a-z0-9_]+$"),
     current: CurrentUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
@@ -318,7 +319,7 @@ async def pause_profile_session_route(
     summary="恢复 AI 画像会话",
 )
 async def resume_profile_session_route(
-    session_id: str,
+    session_id: str = Path(..., min_length=1, max_length=64, pattern=r"^[a-z0-9_]+$"),
     current: CurrentUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
@@ -343,7 +344,7 @@ async def resume_profile_session_route(
     summary="软删除 AI 画像会话并创建清理任务",
 )
 async def delete_profile_session_route(
-    session_id: str,
+    session_id: str = Path(..., min_length=1, max_length=64, pattern=r"^[a-z0-9_]+$"),
     current: CurrentUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
@@ -379,7 +380,7 @@ async def delete_profile_session_route(
     summary="查询本人的 AI 画像字段草稿",
 )
 async def get_profile_draft_route(
-    draft_id: str,
+    draft_id: str = Path(..., min_length=1, max_length=64, pattern=r"^[a-z0-9_]+$"),
     current: CurrentUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> ProfileDraftRead:
@@ -399,8 +400,8 @@ async def get_profile_draft_route(
     summary="逐项确认/修改/拒绝/删除草稿字段",
 )
 async def patch_profile_draft_route(
-    draft_id: str,
-    body: ProfileDraftPatchRequest,
+    draft_id: str = Path(..., min_length=1, max_length=64, pattern=r"^[a-z0-9_]+$"),
+    body: ProfileDraftPatchRequest = Body(...),
     current: CurrentUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
@@ -415,6 +416,7 @@ async def patch_profile_draft_route(
             current.id,
             body.actions,
             body.expected_revision,
+            idempotency_key,
         )
     except DraftVersionConflict as exc:
         raise _error_response(exc.code, exc.message, exc.status_code) from exc
@@ -424,6 +426,10 @@ async def patch_profile_draft_route(
         raise _error_response(exc.code, exc.message, exc.status_code) from exc
     except ProfileDraftNotFound as exc:
         raise _error_response(exc.code, exc.message, exc.status_code) from exc
+    except TaskError as exc:
+        raise _error_response(
+            exc.code, exc.message, exc.status_code, retryable=exc.retryable
+        ) from exc
     await db.commit()
     return _to_draft_read(draft)
 
@@ -435,7 +441,7 @@ async def patch_profile_draft_route(
     summary="发布已确认字段并创建投影任务",
 )
 async def publish_profile_draft_route(
-    draft_id: str,
+    draft_id: str = Path(..., min_length=1, max_length=64, pattern=r"^[a-z0-9_]+$"),
     current: CurrentUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
@@ -516,7 +522,9 @@ async def restore_profile_revision_route(
     _require_profile_feature()
     _check_idempotency_key(idempotency_key)
     try:
-        draft = await restore_profile_revision(db, revision_id, current.id)
+        draft = await restore_profile_revision(
+            db, revision_id, current.id, idempotency_key or ""
+        )
     except ProfileRevisionNotFound as exc:
         raise _error_response(exc.code, exc.message, exc.status_code) from exc
     except AIInputError as exc:
@@ -560,7 +568,7 @@ async def delete_ai_profile_route(
 )
 async def delete_ai_profile_field_route(
     subject: ProfileSubject,
-    field_key: str,
+    field_key: str = Path(..., min_length=1, max_length=64),
     current: CurrentUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),

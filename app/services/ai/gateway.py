@@ -20,6 +20,7 @@ from typing import Any, Generic, TypeVar
 
 from pydantic import BaseModel, ValidationError
 
+from app.core.config import settings
 from app.services.ai.base import (
     AIProvider,
     AITaskContext,
@@ -30,6 +31,7 @@ from app.services.ai.base import (
     StructuredExtractResult,
     ModerationResult,
 )
+from app.services.ai.audit import GenerationAuditEvent, record_generation_audit
 from app.services.ai.providers import get_provider
 
 logger = logging.getLogger(__name__)
@@ -122,7 +124,18 @@ class AIGateway:
         provider: AIProvider | None = None,
         timeout_seconds: float = 30.0,
     ) -> None:
-        self._provider = provider or get_provider("mock")
+        # Resolve the provider from settings when none is explicitly supplied,
+        # instead of hard-coding "mock".  In production a mock provider is a
+        # deployment misconfiguration: ``settings.ai_provider`` is constrained
+        # to "mock" in phase 1, so warn loudly rather than silently falling back
+        # to a stub that returns deterministic fixtures.
+        provider_name = settings.ai_provider
+        self._provider = provider or get_provider(provider_name)
+        if settings.environment == "production" and provider_name == "mock":
+            logger.warning(
+                "ai_gateway_mock_provider_in_production "
+                "AIGateway 在生产环境使用 mock provider，请配置真实 AI provider"
+            )
         self._timeout_seconds = timeout_seconds
         # Token usage / cost hooks; phase 1 mock reports none.
         self._cost_hook: Any | None = None
@@ -160,7 +173,7 @@ class AIGateway:
                         kind=ProviderErrorKind.NON_RETRYABLE,
                     )
                 raw_result = response_type.model_validate(raw_result.model_dump())
-            self._log_audit(record)
+            await self._log_audit(record)
             return InvokeOutcome(result=raw_result)
         except ProviderError as exc:
             # The provider's raw message only ever reaches the debug log, and
@@ -179,7 +192,7 @@ class AIGateway:
             record = self._record(
                 context, method, started, error_code=exc.code, succeeded=False
             )
-            self._log_audit(record)
+            await self._log_audit(record)
             return InvokeOutcome(
                 error_code=exc.code,
                 error_message=_safe_error_message(exc.code),
@@ -192,13 +205,34 @@ class AIGateway:
                 context, method, started, error_code=_SCHEMA_VIOLATION_CODE,
                 succeeded=False,
             )
-            self._log_audit(record)
+            await self._log_audit(record)
             return InvokeOutcome(
                 error_code=_SCHEMA_VIOLATION_CODE,
                 error_message=_safe_error_message(_SCHEMA_VIOLATION_CODE),
                 retryable=False,
             )
+        except (ConnectionError, TimeoutError, OSError) as exc:
+            # Network / IO failures are genuinely transient: retryable.
+            logger.warning(
+                "ai_gateway_retryable_failure method=%s request_id=%s err=%s",
+                method,
+                context.request_id,
+                type(exc).__name__,
+            )
+            record = self._record(
+                context, method, started,
+                error_code="AI_TEMPORARILY_UNAVAILABLE", succeeded=False,
+            )
+            await self._log_audit(record)
+            return InvokeOutcome(
+                error_code="AI_TEMPORARILY_UNAVAILABLE",
+                error_message=_safe_error_message("AI_TEMPORARILY_UNAVAILABLE"),
+                retryable=True,
+            )
         except Exception as exc:  # noqa: BLE001 - boundary conversion
+            # Programming errors (TypeError/AttributeError/KeyError/etc.) are
+            # not transient: retrying would just reproduce the same fault.  Mark
+            # them non-retryable so callers fail fast instead of looping.
             logger.warning(
                 "ai_gateway_unhandled method=%s request_id=%s err=%s",
                 method,
@@ -209,11 +243,11 @@ class AIGateway:
                 context, method, started,
                 error_code="AI_TEMPORARILY_UNAVAILABLE", succeeded=False,
             )
-            self._log_audit(record)
+            await self._log_audit(record)
             return InvokeOutcome(
                 error_code="AI_TEMPORARILY_UNAVAILABLE",
                 error_message=_safe_error_message("AI_TEMPORARILY_UNAVAILABLE"),
-                retryable=True,
+                retryable=False,
             )
 
     def _record(
@@ -237,10 +271,17 @@ class AIGateway:
             token_usage=None,
             error_code=error_code,
             succeeded=succeeded,
+            input_revision=dict(context.input_revision),
+            policy_revision=context.policy_revision,
         )
 
-    def _log_audit(self, record: GatewayCallRecord) -> None:
-        """Log the minimal auditable metadata; never payloads or secrets."""
+    async def _log_audit(self, record: GatewayCallRecord) -> None:
+        """Log and persist minimal metadata; never payloads or secrets.
+
+        ``record_generation_audit`` is async because the underlying DB write is
+        offloaded to a worker thread; awaiting here keeps the event loop free
+        while the audit row is persisted.
+        """
         logger.info(
             "ai_generation request_id=%s task_id=%s scene=%s provider=%s "
             "model=%s prompt_version=%s schema_version=%s duration_ms=%d "
@@ -254,6 +295,24 @@ class AIGateway:
             record.schema_version,
             record.duration_ms,
             record.error_code,
+        )
+        await record_generation_audit(
+            GenerationAuditEvent(
+                request_id=record.request_id,
+                task_id=record.task_id,
+                scene=record.scene,
+                provider=record.provider,
+                model=record.model,
+                prompt_version=record.prompt_version,
+                schema_version=record.schema_version,
+                input_revision=record.input_revision,
+                policy_revision=record.policy_revision,
+                status="succeeded" if record.succeeded else "failed",
+                error_code=record.error_code,
+                usage_cost=record.token_usage,
+                display_eligible=False,
+                duration_ms=record.duration_ms,
+            )
         )
 
     # ------------------------------------------------------------------

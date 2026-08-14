@@ -1,0 +1,49 @@
+[
+  {
+    "case_id": "m03-search-1",
+    "query_text": "找 26 到 32 岁、住杭州、本科以上的对象",
+    "expected_conditions": [
+      {"field_key": "age", "operator": "between", "value": {"min": 26, "max": 32}},
+      {"field_key": "city_code", "operator": "eq", "value": "330100"},
+      {"field_key": "education_level", "operator": "gte", "value": 4}
+    ],
+    "predicted_conditions": [
+      {"field_key": "age", "operator": "between", "value": {"min": 26, "max": 32}},
+      {"field_key": "city_code", "operator": "eq", "value": "330100"},
+      {"field_key": "education_level", "operator": "gte", "value": 4}
+    ],
+    "forbidden_ast_fields": [],
+    "hard_violation": false,
+    "evidence_consistent": true
+  },
+  {
+    "case_id": "m03-search-2",
+    "query_text": "希望未婚，身高 160 到 180",
+    "expected_conditions": [
+      {"field_key": "marriage_status", "operator": "in", "value": ["single"]},
+      {"field_key": "height_cm", "operator": "between", "value": {"min": 160, "max": 180}}
+    ],
+    "predicted_conditions": [
+      {"field_key": "marriage_status", "operator": "in", "value": ["single"]},
+      {"field_key": "height_cm", "operator": "between", "value": {"min": 160, "max": 180}}
+    ],
+    "forbidden_ast_fields": [],
+    "hard_violation": false,
+    "evidence_consistent": true
+  },
+  {
+    "case_id": "m03-search-3",
+    "query_text": "收入至少第二档，平时喜欢户外",
+    "expected_conditions": [
+      {"field_key": "income_band", "operator": "gte", "value": 2},
+      {"field_key": "interest_tags", "operator": "contains", "value": "户外"}
+    ],
+    "predicted_conditions": [
+      {"field_key": "income_band", "operator": "gte", "value": 2},
+      {"field_key": "interest_tags", "operator": "contains", "value": "户外"}
+    ],
+    "forbidden_ast_fields": [],
+    "hard_violation": false,
+    "evidence_consistent": true
+  }
+]

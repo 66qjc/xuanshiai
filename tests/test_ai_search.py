@@ -19,17 +19,18 @@ import uuid
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
-import app.services.ai.search as search_mod
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.exc import IntegrityError
 
+import app.services.ai.search as search_mod
 from app.api.dependencies import CurrentUser, get_current_user
 from app.core.config import settings
 from app.db.session import get_db
 from app.main import app
 from app.schemas.ai_search import (
     SearchCondition,
+    SearchConditionPatchRequest,
     SearchDraftRead,
     SearchResultPageRead,
 )
@@ -42,16 +43,18 @@ from app.services.ai.search import (
     compile_search_conditions,
     confirm_search_draft,
     create_search_draft,
-    execute_search_snapshot,
+    delete_search_snapshot,
     get_search_suggestions,
+    materialize_search_snapshot,
     parse_search_draft,
     patch_search_draft,
+    read_materialized_search_results,
 )
 from app.services.ai.tasks import AiTaskRecord
 from app.services.candidate_query import (
+    SORT_VERSION,
     CandidateCursor,
     InvalidCandidateCursor,
-    SORT_VERSION,
 )
 from app.workers import ai_worker as worker_mod
 
@@ -209,6 +212,11 @@ class TaskStore:
             row["payload_summary"] = params.get("payload_summary")
         else:
             raise AssertionError(f"unhandled task update: {sql}")
+        if "payload_summary = NULL" in sql:
+            row["payload_summary"] = None
+            row["consent_snapshot_json"] = None
+            row["source_revision_json"] = None
+            row["result_ref"] = None
         row["updated_at"] = _now()
         return True
 
@@ -267,6 +275,7 @@ class SearchStore:
         self.task_store = TaskStore()
         self._next_draft_id = 1
         self._next_snapshot_id = 1
+        self._profile_grant_at = _now().replace(microsecond=0)
         self.session = FakeSearchSession(self)
 
     # ---- seeding helpers ------------------------------------------------
@@ -352,12 +361,55 @@ class SearchStore:
         fields: dict[str, Any],
         *,
         status: str = "active",
+        projection_id: int | None = None,
+        source_hash: str | None = None,
+        source_revision: dict[str, int] | None = None,
+        consent_snapshot: dict[str, Any] | None = None,
     ) -> None:
+        if not any(
+            row["user_id"] == subject_user_id
+            and row["scope"] == "profile_text_extract"
+            and row.get("revoked_at") is None
+            for row in self.consents
+        ):
+            self.consents.append(
+                {
+                    "user_id": subject_user_id,
+                    "scope": "profile_text_extract",
+                    "version": "profile-text-v1",
+                    "policy_revision": "ai-policy-2026-08-07-v1",
+                    "granted_at": self._profile_grant_at,
+                }
+            )
+        effective_consent = consent_snapshot or {
+            "scope": "profile_text_extract",
+            "version": "profile-text-v1",
+            "policy_revision": "ai-policy-2026-08-07-v1",
+            "granted_at": self._profile_grant_at.isoformat(),
+        }
         self.projections.append(
             {
+                "id": projection_id or len(self.projections) + 1,
                 "subject_user_id": subject_user_id,
+                "source_hash": source_hash or f"search-projection-{subject_user_id}",
                 "fields_json": json.dumps(fields, ensure_ascii=False),
-                "profile_revision": 1,
+                "source_revision_json": json.dumps(
+                    source_revision
+                    or {
+                        "profile": 0,
+                        "preference": 0,
+                        "privacy": 0,
+                        "relationship": 0,
+                        "policy": 0,
+                    },
+                    ensure_ascii=False,
+                ),
+                "profile_revision": int((source_revision or {}).get("profile", 0)),
+                "preference_revision": int((source_revision or {}).get("preference", 0)),
+                "privacy_revision": int((source_revision or {}).get("privacy", 0)),
+                "relationship_revision": int((source_revision or {}).get("relationship", 0)),
+                "policy_revision": int((source_revision or {}).get("policy", 0)),
+                "consent_snapshot_json": effective_consent,
                 "status": status,
                 "expires_at": _now() + timedelta(days=30),
             }
@@ -609,6 +661,9 @@ class FakeSearchSession:
                 "expires_at": values.get("expires_at"),
                 "created_at": _now(),
                 "updated_at": _now(),
+                "last_patch_idempotency_key": None,
+                "last_patch_request_digest": None,
+                "last_patch_response_json": None,
             }
             return _WriteResult(rowcount=1)
         if sql.startswith("UPDATE ai_search_draft SET status"):
@@ -621,6 +676,14 @@ class FakeSearchSession:
             draft = store.drafts.get(values["draft_id"])
             if draft:
                 draft["condition_revision"] += 1
+                draft["updated_at"] = _now()
+            return _WriteResult(rowcount=1 if draft else 0)
+        if sql.startswith("UPDATE ai_search_draft SET last_patch_idempotency_key"):
+            draft = store.drafts.get(values["draft_id"])
+            if draft:
+                draft["last_patch_idempotency_key"] = values.get("key")
+                draft["last_patch_request_digest"] = values.get("request_digest")
+                draft["last_patch_response_json"] = values.get("response_json")
                 draft["updated_at"] = _now()
             return _WriteResult(rowcount=1 if draft else 0)
         if "FROM ai_search_draft" in sql:
@@ -681,9 +744,18 @@ class FakeSearchSession:
                 "source_revision_json": values.get("source_revision_json"),
                 "expires_at": values.get("expires_at"),
                 "invalidated_at": None,
+                "result_total": int(values.get("result_total") or 0),
+                "degraded": int(values.get("degraded") or 0),
                 "created_at": _now(),
             }
             return _WriteResult(rowcount=1)
+        if sql.startswith("UPDATE ai_search_snapshot SET status"):
+            snapshot = store.snapshots.get(values["snapshot_id"])
+            if snapshot:
+                snapshot["status"] = values["status"]
+                snapshot["result_total"] = int(values.get("result_total") or 0)
+                snapshot["degraded"] = int(values.get("degraded") or 0)
+            return _WriteResult(rowcount=1 if snapshot else 0)
         if sql.startswith("UPDATE ai_search_snapshot SET invalidated_at"):
             snapshot = store.snapshots.get(values["snapshot_id"])
             if snapshot:
@@ -703,6 +775,12 @@ class FakeSearchSession:
             return _MappingResult([snapshot] if snapshot else [])
 
         # ---- ai_search_result ----
+        if sql.startswith("DELETE FROM ai_search_result"):
+            rows = store.results.get(str(values["snapshot_id"]), [])
+            store.results[str(values["snapshot_id"])] = [
+                row for row in rows if int(row.get("rank_position") or 0) <= int(values["limit"])
+            ]
+            return _WriteResult(rowcount=1)
         if "INSERT INTO ai_search_result" in sql:
             snapshot_id = str(values["snapshot_id"])
             store.results.setdefault(snapshot_id, [])
@@ -720,6 +798,10 @@ class FakeSearchSession:
                             "profile_revision": int(values["profile_revision"]),
                             "result_expires_at": values["result_expires_at"],
                             "stale": 0,
+                            "projection_id": values.get("projection_id"),
+                            "source_hash": values.get("source_hash"),
+                            "consent_snapshot_json": values.get("consent_snapshot_json"),
+                            "source_revision_json": values.get("source_revision_json"),
                         }
                     )
                     return _WriteResult(rowcount=1)
@@ -735,9 +817,20 @@ class FakeSearchSession:
                     "profile_revision": int(values["profile_revision"]),
                     "result_expires_at": values["result_expires_at"],
                     "stale": 0,
+                    "projection_id": values.get("projection_id"),
+                    "source_hash": values.get("source_hash"),
+                    "consent_snapshot_json": values.get("consent_snapshot_json"),
+                    "source_revision_json": values.get("source_revision_json"),
                 }
             )
             return _WriteResult(rowcount=1)
+        if sql.startswith("SELECT target_user_id, projection_id"):
+            rows = [
+                row for row in store.results.get(str(values["snapshot_id"]), [])
+                if not row.get("stale") and int(row.get("rank_position") or 0) > int(values.get("after_rank") or 0)
+            ]
+            rows.sort(key=lambda row: int(row["rank_position"]))
+            return _MappingResult(rows[: int(values.get("limit") or 0)])
 
         # ---- 投影 / 建议 ----
         if "FROM ai_feature_projection" in sql:
@@ -775,7 +868,12 @@ class FakeSearchSession:
             return _MappingResult([{"count": len(matching)}])
         if "AS user_id" in sql and "FROM users u" in sql:
             candidate_rows = []
+            requested_card_ids = {
+                int(value) for key, value in values.items() if key.startswith("card_uid")
+            }
             for candidate in store.candidates.values():
+                if requested_card_ids and int(candidate["user_id"]) not in requested_card_ids:
+                    continue
                 if not _candidate_matches_sql_filters(candidate, values, sql):
                     continue
                 candidate_rows.append(
@@ -893,8 +991,16 @@ async def _run_parse(store: SearchStore, draft_id: str) -> None:
 
 
 @pytest.fixture(autouse=True)
-def _reset_parse_quota() -> None:
-    """重置本地（无 Redis）分钟解析额度，避免跨测试累计限流。"""
+def _reset_parse_quota(monkeypatch: pytest.MonkeyPatch) -> None:
+    """让 fake-store 测试不依赖开发机上 Redis 的跨测试计数。"""
+    from redis.exceptions import RedisError
+
+    class _RedisDown:
+        async def eval(self, *args: Any, **kwargs: Any) -> Any:
+            raise RedisError("redis disabled for fake-store test")
+
+    monkeypatch.setattr(search_mod, "redis_client", _RedisDown())
+    monkeypatch.setattr(search_mod, "_parse_quota_window", lambda: 1_000_000_000)
     search_mod.reset_local_quota_for_testing()
     yield
 
@@ -1052,6 +1158,55 @@ def test_hard_field_mappings_cover_the_allowlist() -> None:
     assert ("relationship_goal", "marriage") in compiled.soft_terms
 
 
+def test_multi_value_in_is_preserved_as_typed_hard_membership() -> None:
+    compiled = compile_search_conditions(
+        [
+            SearchCondition(
+                field_key="city_code",
+                operator="in",
+                value=["330100", "440100"],
+                kind="hard",
+                user_action="confirmed",
+            ),
+            SearchCondition(
+                field_key="marriage_status",
+                operator="in",
+                value=["single", "married"],
+                kind="hard",
+                user_action="confirmed",
+            ),
+        ]
+    )
+    assert compiled.hard_memberships == (
+        ("city_code", ("330100", "440100")),
+        ("marriage_status", (1, 2)),
+    )
+    assert compiled.filters.city_code is None
+    assert compiled.filters.marriage_status is None
+
+
+def test_soft_conditions_never_enter_candidate_where() -> None:
+    compiled = compile_search_conditions(
+        [
+            SearchCondition(
+                field_key="interest_tags",
+                operator="contains",
+                value="户外",
+                kind="soft",
+                user_action="confirmed",
+            )
+        ]
+    )
+    snapshot = build_search_query_snapshot(
+        viewer_id=10,
+        viewer={"realname_status": 2},
+        viewer_is_vip=True,
+        compiled=compiled,
+    )
+    assert "户外" not in snapshot.where_sql
+    assert not any(key.startswith("search_tag_") for key in snapshot.params)
+
+
 # ----------------------------------------------------------------------
 # 草稿创建 / 解析 / 确认 / 编辑 / 执行链路
 # ----------------------------------------------------------------------
@@ -1077,6 +1232,20 @@ async def test_create_draft_requires_consent_and_writes_parsing_draft(search_sto
     assert result.task_id
     assert search_store.drafts[result.draft_id]["status"] == "parsing"
     assert db.commits == 0
+
+
+@pytest.mark.asyncio
+async def test_create_draft_same_key_replays_without_random_hash_conflict(search_store) -> None:
+    await search_store.seed_consent()
+    await search_store.seed_revision()
+    first = await create_search_draft(
+        search_store.session, 10, "想找26到32岁的人", "manual", "zh-CN", "search-create-replay"
+    )
+    second = await create_search_draft(
+        search_store.session, 10, "想找26到32岁的人", "manual", "zh-CN", "search-create-replay"
+    )
+    assert second.draft_id == first.draft_id
+    assert len(search_store.drafts) == 1
 
 
 @pytest.mark.asyncio
@@ -1177,8 +1346,27 @@ async def test_confirm_creates_snapshot_and_execute_task(search_store) -> None:
     )
     stored = search_store.snapshots[snapshot.snapshot_id]
     assert stored["snapshot_hash"]
-    assert stored["source_revision_json"]
-    assert stored["policy_revision"] == "ai-policy-2026-08-07-v1"
+
+
+@pytest.mark.asyncio
+async def test_delete_search_snapshot_enqueues_minimal_cleanup_payload(search_store) -> None:
+    search_store.snapshots["ss-delete-1"] = {
+        "snapshot_id": "ss-delete-1",
+        "draft_id": "draft-delete-1",
+        "user_id": 10,
+        "invalidated_at": None,
+    }
+    task = await delete_search_snapshot(
+        search_store.session, "ss-delete-1", 10, "search-delete-1"
+    )
+
+    assert task.task_id
+    assert search_store.snapshots["ss-delete-1"]["invalidated_at"] is not None
+    stored_task = search_store.task_store.tasks[task.task_id]
+    payload = json.loads(stored_task["payload_summary"])
+    assert set(payload) == {"scope", "resource_id", "version", "purge_deadline"}
+    assert payload["scope"] == "search"
+    assert payload["resource_id"] == "snapshot:10:ss-delete-1"
 
 
 @pytest.mark.asyncio
@@ -1215,6 +1403,84 @@ async def test_patch_confirms_condition_and_bumps_revision(search_store) -> None
         for condition in updated.conditions
     }
     assert confirmed["age"] == "confirmed"
+
+
+@pytest.mark.asyncio
+async def test_patch_idempotency_key_replays_durable_response(search_store) -> None:
+    await search_store.seed_consent()
+    await search_store.seed_revision()
+    draft = await search_store.seed_draft(
+        conditions=[
+            SearchCondition(
+                field_key="age",
+                operator="gte",
+                value=26,
+                kind="hard",
+                user_action="pending",
+            )
+        ]
+    )
+    first = await patch_search_draft(
+        search_store.session,
+        draft["draft_id"],
+        10,
+        [SearchConditionPatchRequest(condition_no=0, action="confirm")],
+        expected_condition_revision=0,
+        idempotency_key="search-patch-1",
+    )
+    second = await patch_search_draft(
+        search_store.session,
+        draft["draft_id"],
+        10,
+        [SearchConditionPatchRequest(condition_no=0, action="confirm")],
+        expected_condition_revision=0,
+        idempotency_key="search-patch-1",
+    )
+    assert first.condition_revision == second.condition_revision == 1
+    assert search_store.drafts[draft["draft_id"]]["last_patch_idempotency_key"] == "search-patch-1"
+
+
+@pytest.mark.asyncio
+async def test_patch_replays_original_response_after_later_patch(search_store) -> None:
+    await search_store.seed_consent()
+    await search_store.seed_revision()
+    draft = await search_store.seed_draft(
+        conditions=[
+            SearchCondition(
+                field_key="age",
+                operator="gte",
+                value=26,
+                kind="hard",
+                user_action="pending",
+            )
+        ]
+    )
+    first = await patch_search_draft(
+        search_store.session,
+        draft["draft_id"],
+        10,
+        [SearchConditionPatchRequest(condition_no=0, action="confirm")],
+        expected_condition_revision=0,
+        idempotency_key="search-history-01",
+    )
+    await patch_search_draft(
+        search_store.session,
+        draft["draft_id"],
+        10,
+        [SearchConditionPatchRequest(condition_no=0, action="remove")],
+        expected_condition_revision=1,
+        idempotency_key="search-history-02",
+    )
+    replay = await patch_search_draft(
+        search_store.session,
+        draft["draft_id"],
+        10,
+        [SearchConditionPatchRequest(condition_no=0, action="confirm")],
+        expected_condition_revision=0,
+        idempotency_key="search-history-01",
+    )
+    assert first.condition_revision == replay.condition_revision == 1
+    assert replay.conditions[0].value == 26
 
 
 @pytest.mark.asyncio
@@ -1277,6 +1543,7 @@ async def test_execute_snapshot_filters_soft_evidence_and_persists_results(
         interest_tags=["摄影"],
     )
     await search_store.seed_projection(42, {"interest_tags": ["户外"]})
+    await search_store.seed_projection(43, {})
     db = search_store.session
     draft = await create_search_draft(
         db, 10, "想找26到32岁住杭州本科以上喜欢户外的人", "manual", "zh-CN", "idem-exe-1"
@@ -1291,7 +1558,7 @@ async def test_execute_snapshot_filters_soft_evidence_and_persists_results(
         db, draft.draft_id, 10, 0, "idem-exe-2"
     )
 
-    page = await execute_search_snapshot(db, snapshot.snapshot_id, 10, None, 20)
+    page = await materialize_search_snapshot(db, snapshot.snapshot_id, 10)
 
     assert isinstance(page, SearchResultPageRead)
     assert page.status == "completed"
@@ -1311,11 +1578,82 @@ async def test_execute_snapshot_filters_soft_evidence_and_persists_results(
 
 
 @pytest.mark.asyncio
+async def test_worker_materializes_soft_rank_and_get_only_reads_materialized_rows(
+    search_store,
+) -> None:
+    await search_store.seed_consent()
+    await search_store.seed_revision()
+    await search_store.seed_candidate(42, birthday="1996-05-20", interest_tags=["户外"])
+    await search_store.seed_candidate(43, birthday="1996-05-20", interest_tags=["摄影"])
+    await search_store.seed_projection(42, {"interest_tags": ["户外"]})
+    draft = await search_store.seed_draft(
+        conditions=[
+            SearchCondition(
+                field_key="interest_tags",
+                operator="contains",
+                value="户外",
+                kind="soft",
+                user_action="confirmed",
+            )
+        ]
+    )
+    snapshot = await confirm_search_draft(
+        search_store.session, draft["draft_id"], 10, 0, "idem-materialize-1"
+    )
+
+    materialized = await materialize_search_snapshot(
+        search_store.session, snapshot.snapshot_id, 10
+    )
+    assert materialized.status == "completed"
+    assert [item.user_id for item in materialized.items] == [42]
+    assert materialized.items[0].matched_conditions == ["interest_tags"]
+
+    search_store.session.calls.clear()
+    read_page = await read_materialized_search_results(
+        search_store.session, snapshot.snapshot_id, 10, None, 20
+    )
+    assert [item.user_id for item in read_page.items] == [42]
+    assert not any("COUNT(DISTINCT u.id)" in sql for sql, _ in search_store.session.calls)
+    assert not any("INSERT INTO ai_search_result" in sql for sql, _ in search_store.session.calls)
+
+
+@pytest.mark.asyncio
+async def test_worker_materializes_at_most_200_and_marks_partial(search_store) -> None:
+    await search_store.seed_consent()
+    await search_store.seed_revision()
+    for user_id in range(600, 805):
+        await search_store.seed_candidate(user_id, birthday="1996-05-20")
+        await search_store.seed_projection(user_id, {"interest_tags": ["户外"]})
+    draft = await search_store.seed_draft(
+        conditions=[
+            SearchCondition(
+                field_key="age",
+                operator="gte",
+                value=26,
+                kind="hard",
+                user_action="confirmed",
+            )
+        ]
+    )
+    snapshot = await confirm_search_draft(
+        search_store.session, draft["draft_id"], 10, 0, "idem-materialize-200"
+    )
+    page = await materialize_search_snapshot(
+        search_store.session, snapshot.snapshot_id, 10
+    )
+    assert page.status == "partial"
+    assert page.degraded is True
+    assert page.total == 205
+    assert len(search_store.results[snapshot.snapshot_id]) == 200
+
+
+@pytest.mark.asyncio
 async def test_execute_snapshot_excludes_blocked_candidates(search_store) -> None:
     await search_store.seed_consent()
     await search_store.seed_revision()
     await search_store.seed_candidate(50, birthday="1996-05-20")
     await search_store.seed_candidate(51, birthday="1996-05-21", blocked=True)
+    await search_store.seed_projection(50, {})
     db = search_store.session
     draft = await create_search_draft(
         db, 10, "想找26到32岁的人", "manual", "zh-CN", "idem-exe-3"
@@ -1330,7 +1668,7 @@ async def test_execute_snapshot_excludes_blocked_candidates(search_store) -> Non
     snapshot = await confirm_search_draft(
         db, draft.draft_id, 10, 0, "idem-exe-4"
     )
-    page = await execute_search_snapshot(db, snapshot.snapshot_id, 10, None, 20)
+    page = await materialize_search_snapshot(db, snapshot.snapshot_id, 10)
 
     assert {item.user_id for item in page.items} == {50}
 
@@ -1357,7 +1695,7 @@ async def test_expired_snapshot_returns_stale_page(search_store) -> None:
         _now() - timedelta(hours=1)
     )
 
-    page = await execute_search_snapshot(db, snapshot.snapshot_id, 10, None, 20)
+    page = await materialize_search_snapshot(db, snapshot.snapshot_id, 10)
 
     assert page.status == "stale"
     assert page.items == []
@@ -1636,6 +1974,7 @@ async def test_snapshot_results_have_zero_hard_condition_violations(
         income=15000.0,
         is_married=1,
     )
+    await search_store.seed_projection(100, {})
     # 违反单个 hard 条件的候选：超龄/错误城市/学历不足/身高过低/收入过低/非单身
     await search_store.seed_candidate(101, birthday="1982-01-01")
     await search_store.seed_candidate(102, birthday="1996-05-20", residence_city_code="440100")
@@ -1647,8 +1986,8 @@ async def test_snapshot_results_have_zero_hard_condition_violations(
     snapshot_id = await _confirm_seeded_draft(
         search_store, conditions, "idem-hard-1"
     )
-    page = await execute_search_snapshot(
-        search_store.session, snapshot_id, 10, None, 20
+    page = await materialize_search_snapshot(
+        search_store.session, snapshot_id, 10
     )
 
     assert page.status == "completed"
@@ -1676,6 +2015,7 @@ async def test_cursor_paging_has_no_duplicates_or_omissions(search_store) -> Non
         await search_store.seed_candidate(
             uid, birthday="1996-05-20", last_active_at=_now() - timedelta(hours=uid)
         )
+        await search_store.seed_projection(uid, {})
     conditions = [
         SearchCondition(
             field_key="age",
@@ -1687,13 +2027,15 @@ async def test_cursor_paging_has_no_duplicates_or_omissions(search_store) -> Non
     ]
     snapshot_id = await _confirm_seeded_draft(search_store, conditions, "idem-page-1")
     db = search_store.session
+    # Worker 路径物化全部候选结果，读取路径再分页。
+    await materialize_search_snapshot(db, snapshot_id, 10)
 
     seen: list[int] = []
     cursor: str | None = None
     first_order: list[int] = []
     pages = 0
     while True:
-        page = await execute_search_snapshot(db, snapshot_id, 10, cursor, 4)
+        page = await read_materialized_search_results(db, snapshot_id, 10, cursor, 4)
         assert page.status == "completed"
         ids = [item.user_id for item in page.items]
         assert len(ids) == len(set(ids)), "单页内出现重复 user_id"
@@ -1720,6 +2062,7 @@ async def test_result_total_matches_manual_candidate_query_count(
     """同一筛选下 ai_search 结果 total 与手工 CandidateQueryService 精确 count 一致。"""
     for uid in range(300, 308):  # 8 个满足条件的候选
         await search_store.seed_candidate(uid, birthday="1996-05-20")
+        await search_store.seed_projection(uid, {})
     await search_store.seed_candidate(
         308, birthday="1996-05-20", residence_city_code="440100"
     )
@@ -1741,7 +2084,7 @@ async def test_result_total_matches_manual_candidate_query_count(
     ]
     snapshot_id = await _confirm_seeded_draft(search_store, conditions, "idem-total-1")
     db = search_store.session
-    page = await execute_search_snapshot(db, snapshot_id, 10, None, 20)
+    page = await materialize_search_snapshot(db, snapshot_id, 10)
 
     # 手工 discovery：同一编译筛选直接 count（与 execute 相同查询身份）。
     compiled = compile_search_conditions(conditions)
@@ -1784,6 +2127,7 @@ async def test_result_read_excludes_blocked_withdrawn_and_pending_candidates(
     await search_store.seed_candidate(
         405, birthday="1996-05-20", profile_visible=0  # 撤回展示
     )
+    await search_store.seed_projection(400, {})
     conditions = [
         SearchCondition(
             field_key="age",
@@ -1794,8 +2138,8 @@ async def test_result_read_excludes_blocked_withdrawn_and_pending_candidates(
         )
     ]
     snapshot_id = await _confirm_seeded_draft(search_store, conditions, "idem-vis-1")
-    page = await execute_search_snapshot(
-        search_store.session, snapshot_id, 10, None, 20
+    page = await materialize_search_snapshot(
+        search_store.session, snapshot_id, 10
     )
 
     assert page.status == "completed"
@@ -1819,6 +2163,8 @@ async def test_cross_query_cursor_raises_invalid_candidate_cursor(
         )
     ]
     snapshot_id = await _confirm_seeded_draft(search_store, conditions, "idem-cur-1")
+    # Worker 物化结果后再用读取路径校验 cursor 合法性。
+    await materialize_search_snapshot(search_store.session, snapshot_id, 10)
     foreign_cursor = candidate_query_service.encode_cursor(
         CandidateCursor(
             sort_version=SORT_VERSION,
@@ -1829,7 +2175,7 @@ async def test_cross_query_cursor_raises_invalid_candidate_cursor(
         )
     )
     with pytest.raises(InvalidCandidateCursor):
-        await execute_search_snapshot(
+        await read_materialized_search_results(
             search_store.session, snapshot_id, 10, foreign_cursor, 20
         )
 

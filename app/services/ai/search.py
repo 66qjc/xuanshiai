@@ -15,10 +15,11 @@
   冲突，才在同一事务创建带 ``snapshot_hash``/``policy_revision``/
   ``consent_snapshot``/五维 revision vector 的 ``ai_search_snapshot`` 并入队
   ``search_execute`` 任务；编译失败不创建候选任务。
-- ``execute_search_snapshot`` 复用 ``CandidateQueryService`` 的
-  predicate/count/cursor，每次读取重新过 ``CandidateVisibilityService`` 门禁
-  （被拉黑/撤回对象排除），只把当前可见卡片引用与证据写入
-  ``ai_search_result``；软字段缺失记为 ``unknown``，不作为硬失败。
+- ``materialize_search_snapshot``（Worker handler）复用
+  ``CandidateQueryService`` 的 predicate/count/cursor，每次读取重新过
+  ``CandidateVisibilityService`` 门禁（被拉黑/撤回对象排除），只把当前可见卡片
+  引用与证据写入 ``ai_search_result``；软字段缺失记为 ``unknown``，不作为硬
+  失败。
 - 结果读取路径完全以 MySQL 为事实源（不依赖 Redis），因此 Redis 断开时天然
   从 MySQL 恢复。
 
@@ -29,7 +30,9 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import hmac
 import json
 import logging
 import time
@@ -66,9 +69,10 @@ from app.services.ai.tasks import (
     fail_task,
 )
 from app.services.candidate_query import (
+    SORT_VERSION,
     CandidateQueryService,
     CandidateQuerySnapshot,
-    SORT_VERSION,
+    InvalidCandidateCursor,
     build_query_fingerprint,
 )
 from app.services.candidate_visibility import (
@@ -94,6 +98,8 @@ SEARCH_CLEANUP_TASK_TYPE = "cleanup"
 # 结果证据 TTL：与统一方案 §8.3 示例的 result_expires_at（10 分钟）一致。
 SEARCH_RESULT_TTL_MINUTES = 10
 SEARCH_PAGE_SIZE_DEFAULT = 20
+SEARCH_MATERIALIZATION_LIMIT = 200
+_MATERIALIZED_CURSOR_VERSION = "ai-search-result-v1"
 
 # Task 1 冻结的 10 个 allowlist 字段 → operator/kind 静态映射（逐字，统一方案 §8.1）。
 FIELD_RULES: dict[str, dict[str, Any]] = {
@@ -221,6 +227,11 @@ class CompiledSearch:
     """
 
     filters: DiscoveryFilters
+    # Multi-value hard predicates (currently city_code/marriage_status ``in``).
+    # Singleton ``in`` values remain in ``filters`` for backwards-compatible
+    # discovery predicates; true multi-value values are emitted as typed data,
+    # never as SQL text.
+    hard_memberships: tuple[tuple[str, tuple[Any, ...]], ...] = ()
     soft_terms: tuple[tuple[str, Any], ...] = ()
     unknown: tuple[SearchCondition, ...] = ()
     conflicts: tuple[str, ...] = ()
@@ -260,6 +271,12 @@ class SearchEvidence:
     unknown_conditions: list[str]
     reason_codes: list[str]
     profile_revision: int
+    projection_id: int | None = None
+    source_hash: str | None = None
+    consent_snapshot: dict[str, Any] | None = None
+    source_revision: dict[str, int] | None = None
+    card: dict[str, Any] | None = None
+    soft_match_count: int = 0
 
 
 # ----------------------------------------------------------------------
@@ -302,6 +319,18 @@ def _single_city(value: Any) -> str:
     raise SearchInputInvalid("city_code 筛选一次仅支持一座城市")
 
 
+def _city_values(value: Any) -> tuple[str, ...]:
+    values = value if isinstance(value, list) else [value]
+    normalized = tuple(
+        item.strip()
+        for item in values
+        if isinstance(item, str) and item.strip()
+    )
+    if not normalized or len(normalized) != len(values):
+        raise SearchInputInvalid("city_code in 必须是非空城市编码数组")
+    return tuple(dict.fromkeys(normalized))
+
+
 def _marriage_value(value: Any) -> int:
     if isinstance(value, list):
         if len(value) == 1:
@@ -315,6 +344,14 @@ def _marriage_value(value: Any) -> int:
         if mapped is not None:
             return mapped
     raise SearchInputInvalid("marriage_status 必须是 1/2/3 或 single/married/divorced")
+
+
+def _marriage_values(value: Any) -> tuple[int, ...]:
+    values = value if isinstance(value, list) else [value]
+    normalized = tuple(_marriage_value(item) for item in values)
+    if not normalized:
+        raise SearchInputInvalid("marriage_status in 必须是非空数组")
+    return tuple(dict.fromkeys(normalized))
 
 
 def _enum_value(value: Any) -> str:
@@ -412,6 +449,7 @@ def compile_search_conditions(conditions: list[SearchCondition]) -> CompiledSear
     - 永不生成 SQL；参数化 SQL 由 ``CandidateQueryService`` 负责。
     """
     filters = CompiledFilters()
+    hard_memberships: list[tuple[str, tuple[Any, ...]]] = []
     soft_terms: list[tuple[str, Any]] = []
     unknown: list[SearchCondition] = []
     for condition in conditions:
@@ -426,11 +464,30 @@ def compile_search_conditions(conditions: list[SearchCondition]) -> CompiledSear
         if condition.user_action != SearchConditionUserAction.CONFIRMED:
             continue
         if rule["kind"] == "hard":
-            filters = filters.with_condition(condition)
+            operator = _enum_value(condition.operator)
+            if operator == "in" and condition.field_key == "city_code":
+                values = _city_values(condition.value)
+                if len(values) == 1:
+                    filters = filters.with_condition(
+                        condition.model_copy(update={"operator": "eq", "value": values[0]})
+                    )
+                else:
+                    hard_memberships.append((condition.field_key, values))
+            elif operator == "in" and condition.field_key == "marriage_status":
+                values = _marriage_values(condition.value)
+                if len(values) == 1:
+                    filters = filters.with_condition(
+                        condition.model_copy(update={"operator": "eq", "value": values[0]})
+                    )
+                else:
+                    hard_memberships.append((condition.field_key, values))
+            else:
+                filters = filters.with_condition(condition)
         else:
             soft_terms.append((condition.field_key, condition.value))
     return CompiledSearch(
         filters=filters,
+        hard_memberships=tuple(hard_memberships),
         soft_terms=tuple(soft_terms),
         unknown=tuple(unknown),
         conflicts=detect_range_conflicts(filters),
@@ -521,6 +578,7 @@ async def _load_revision_vector(db: AsyncSession, user_id: int) -> RevisionVecto
 _DRAFT_COLUMNS = (
     "draft_id, user_id, query_text, source, locale, status, condition_revision, "
     "condition_schema_version, policy_revision, consent_snapshot_json, expires_at, "
+    "last_patch_idempotency_key, last_patch_request_digest, last_patch_response_json, "
     "created_at, updated_at"
 )
 _CONDITION_COLUMNS = (
@@ -531,7 +589,7 @@ _CONDITION_COLUMNS = (
 _SNAPSHOT_COLUMNS = (
     "id, snapshot_id, user_id, draft_id, snapshot_hash, status, "
     "condition_schema_version, policy_revision, consent_snapshot_json, "
-    "source_revision_json, expires_at, invalidated_at, created_at"
+    "source_revision_json, result_total, degraded, expires_at, invalidated_at, created_at"
 )
 
 
@@ -753,9 +811,15 @@ def _replay_or_conflict(existing: AiTaskRecord, request_hash: str) -> AiTaskReco
     return existing
 
 
-def _hash_draft_request(draft_id: str, query_text: str) -> str:
+def _hash_draft_request(
+    query_text: str, source: str | None, locale: str | None
+) -> str:
     payload = json.dumps(
-        {"draft_id": draft_id, "query_text": query_text},
+        {
+            "query_text": query_text,
+            "source": (source or "")[:24] or None,
+            "locale": (locale or "")[:16] or None,
+        },
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
@@ -773,6 +837,26 @@ def _hash_confirm_request(draft_id: str, condition_revision: int) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
+def _hash_patch_request(
+    draft_id: str, expected_condition_revision: int, patches: list[Any]
+) -> str:
+    canonical_patches = [
+        patch.model_dump(mode="json") if hasattr(patch, "model_dump") else dict(patch)
+        for patch in patches
+    ]
+    payload = json.dumps(
+        {
+            "draft_id": draft_id,
+            "expected_condition_revision": int(expected_condition_revision),
+            "patches": canonical_patches,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
 def _hash_delete_request(snapshot_id: str) -> str:
     return hashlib.sha256(
         json.dumps(
@@ -782,6 +866,17 @@ def _hash_delete_request(snapshot_id: str) -> str:
             separators=(",", ":"),
         ).encode()
     ).hexdigest()
+
+
+def _cleanup_payload_for_snapshot(
+    owner_user_id: int, snapshot_id: str
+) -> dict[str, Any]:
+    return {
+        "scope": "search",
+        "resource_id": f"snapshot:{owner_user_id}:{snapshot_id}",
+        "version": RevisionVector().as_dict(),
+        "purge_deadline": (_now_utc() + timedelta(minutes=15)).isoformat(),
+    }
 
 
 def _snapshot_hash(conditions: list[SearchCondition], policy_revision: str) -> str:
@@ -880,6 +975,26 @@ async def create_search_draft(
     consent = await _load_active_consent(db, owner_user_id, SEARCH_CONSENT_SCOPE)
     if consent is None:
         raise SearchConsentRequired()
+    request_hash = _hash_draft_request(normalized, source, locale)
+    existing = await _find_write_task(
+        db, owner_user_id, SEARCH_PARSE_TASK_TYPE, idempotency_key
+    )
+    if existing is not None:
+        _replay_or_conflict(existing, request_hash)
+        payload = existing.payload_summary or {}
+        existing_draft_id = payload.get("draft_id")
+        if not existing_draft_id:
+            raise TaskError(
+                code="AI_INPUT_INVALID",
+                message="幂等任务缺少草稿引用",
+                status_code=400,
+            )
+        return SearchDraftParse(
+            draft_id=str(existing_draft_id),
+            status=SearchDraftStatus.PARSING.value,
+            task_id=existing.task_id,
+            condition_schema_version=SEARCH_SCHEMA_VERSION,
+        )
     await _consume_parse_quota(db, owner_user_id)
     consent_snapshot = _consent_snapshot(consent)
     revision = await _load_revision_vector(db, owner_user_id)
@@ -913,7 +1028,7 @@ async def create_search_draft(
         owner_user_id=owner_user_id,
         task_type=SEARCH_PARSE_TASK_TYPE,
         idempotency_key=idempotency_key,
-        request_hash=_hash_draft_request(draft_id, normalized),
+        request_hash=request_hash,
         revisions=revision,
         consent=consent_snapshot,
     )
@@ -997,6 +1112,9 @@ async def parse_search_draft(
         gateway = AIGateway(timeout_seconds=settings.ai_gateway_timeout_seconds)
         outcome = await gateway.parse_search_query(context, request)
         if outcome.result is None:
+            await _update_draft_status(
+                db, str(draft_id), SearchDraftStatus.FAILED.value
+            )
             await fail_task(
                 db, task.task_id, worker_id,
                 error_code=outcome.error_code or "AI_TEMPORARILY_UNAVAILABLE",
@@ -1083,6 +1201,7 @@ async def patch_search_draft(
     owner_user_id: int,
     patches: list[Any],
     expected_condition_revision: int,
+    idempotency_key: str = "",
 ) -> SearchDraftRead:
     """显式 confirm/edit/remove 条件（condition_revision 乐观锁）。
 
@@ -1092,6 +1211,36 @@ async def patch_search_draft(
     draft = await _load_draft_row(db, draft_id, for_update=True)
     if draft is None or int(draft["user_id"]) != owner_user_id:
         raise SearchDraftNotFound()
+    request_hash = _hash_patch_request(
+        draft_id, expected_condition_revision, patches
+    )
+    response_history = _maybe_json(draft.get("last_patch_response_json")) or {}
+    history_entry = (
+        response_history.get("operations", {}).get(idempotency_key)
+        if isinstance(response_history, dict)
+        and isinstance(response_history.get("operations"), dict)
+        and idempotency_key
+        else None
+    )
+    if isinstance(history_entry, dict):
+        if str(history_entry.get("request_digest") or "") != request_hash:
+            raise TaskError(
+                code="TASK_IDEMPOTENCY_CONFLICT",
+                message="Idempotency-Key conflict",
+                status_code=409,
+            )
+        response_payload = history_entry.get("response")
+        if isinstance(response_payload, dict):
+            return SearchDraftRead.model_validate(response_payload)
+    if idempotency_key and draft.get("last_patch_idempotency_key"):
+        if str(draft["last_patch_idempotency_key"]) == idempotency_key:
+            if str(draft.get("last_patch_request_digest") or "") != request_hash:
+                raise TaskError(
+                    code="TASK_IDEMPOTENCY_CONFLICT",
+                    message="Idempotency-Key 已用于不同请求内容",
+                    status_code=409,
+                )
+            return await load_search_draft(db, draft_id, owner_user_id)
     if int(draft.get("condition_revision") or 0) != int(expected_condition_revision):
         raise DraftVersionConflict()
     if str(draft["status"]) != SearchDraftStatus.AWAITING_CONFIRMATION.value:
@@ -1119,7 +1268,36 @@ async def patch_search_draft(
             raise SearchInputInvalid(f"action {action} 非法")
     if applied:
         await _bump_condition_revision(db, draft_id)
-    return await load_search_draft(db, draft_id, owner_user_id)
+    updated = await load_search_draft(db, draft_id, owner_user_id)
+    if idempotency_key:
+        operations = dict(
+            (response_history.get("operations") or {})
+            if isinstance(response_history, dict)
+            else {}
+        )
+        operations[idempotency_key] = {
+            "request_digest": request_hash,
+            "response": updated.model_dump(mode="json"),
+        }
+        if len(operations) > 64:
+            operations = dict(list(operations.items())[-64:])
+        await db.execute(
+            text(
+                "UPDATE ai_search_draft SET last_patch_idempotency_key = :key, "
+                "last_patch_request_digest = :request_digest, "
+                "last_patch_response_json = :response_json, "
+                "updated_at = UTC_TIMESTAMP() WHERE draft_id = :draft_id"
+            ),
+            {
+                "draft_id": draft_id,
+                "key": idempotency_key,
+                "request_digest": request_hash,
+                "response_json": json.dumps(
+                    {"operations": operations}, ensure_ascii=False
+                ),
+            },
+        )
+    return updated
 
 
 # ----------------------------------------------------------------------
@@ -1164,6 +1342,8 @@ async def confirm_search_draft(
         raise SearchDraftNotFound()
     if _is_expired(draft.get("expires_at")):
         await _update_draft_status(db, draft_id, SearchDraftStatus.EXPIRED.value)
+        # 固化 expired 状态为独立短事务，避免后续 raise 导致回滚。
+        await db.commit()
         raise SearchDraftNotConfirmed("草稿已过期")
     if str(draft["status"]) == SearchDraftStatus.CONFIRMED.value:
         snapshot = await _find_snapshot_row_by_draft(db, draft_id)
@@ -1226,10 +1406,11 @@ async def confirm_search_draft(
             "INSERT INTO ai_search_snapshot "
             "(snapshot_id, user_id, draft_id, snapshot_hash, status, "
             " condition_schema_version, policy_revision, consent_snapshot_json, "
-            " source_revision_json, expires_at, invalidated_at, created_at) "
+            " source_revision_json, result_total, degraded, expires_at, "
+            " invalidated_at, created_at) "
             "VALUES (:snapshot_id, :user_id, :draft_id, :snapshot_hash, 'completed', "
             " :condition_schema_version, :policy_revision, :consent_snapshot_json, "
-            " :source_revision_json, :expires_at, NULL, UTC_TIMESTAMP())"
+            " :source_revision_json, 0, 0, :expires_at, NULL, UTC_TIMESTAMP())"
         ),
         {
             "snapshot_id": snapshot_id,
@@ -1285,7 +1466,9 @@ candidate_visibility_service = CandidateVisibilityService()
 
 
 def _hard_filter_clauses(
-    filters: DiscoveryFilters, params: dict[str, Any]
+    filters: DiscoveryFilters,
+    params: dict[str, Any],
+    hard_memberships: tuple[tuple[str, tuple[Any, ...]], ...] = (),
 ) -> list[str]:
     """把编译后的 hard 筛选映射为参数化 SQL（与 discovery._filter_sql 同源口径）。
 
@@ -1321,6 +1504,23 @@ def _hard_filter_clauses(
     if filters.income_max is not None:
         clauses.append("p.income <= :filter_income_max")
         params["filter_income_max"] = float(filters.income_max)
+    for index, (field_key, values) in enumerate(hard_memberships):
+        if field_key == "city_code":
+            names = []
+            for value_index, value in enumerate(values):
+                name = f"filter_city_code_{index}_{value_index}"
+                names.append(f":{name}")
+                params[name] = value
+            clauses.append(f"p.residence_city_code IN ({', '.join(names)})")
+        elif field_key == "marriage_status":
+            names = []
+            for value_index, value in enumerate(values):
+                name = f"filter_marriage_{index}_{value_index}"
+                names.append(f":{name}")
+                params[name] = int(value)
+            clauses.append(f"u.is_married IN ({', '.join(names)})")
+        else:
+            raise SearchInputInvalid(f"hard 字段 {field_key} 缺少静态映射")
     return clauses
 
 
@@ -1349,20 +1549,11 @@ def build_search_query_snapshot(
     )
     params: dict[str, Any] = {"viewer_id": viewer_id, **visibility.params}
     clauses = [visibility.clause]
-    clauses.extend(_hard_filter_clauses(compiled.filters, params))
-    tag_terms = [
-        value
-        for field_key, value in compiled.soft_terms
-        if field_key in _TAG_SOFT_FIELDS and isinstance(value, str) and value.strip()
-    ]
-    for index, tag in enumerate(tag_terms):
-        param = f"search_tag_{index}"
-        clauses.append(
-            "(JSON_CONTAINS(p.interest_tags, JSON_QUOTE(:%s)) "
-            "OR JSON_CONTAINS(p.personality_tags, JSON_QUOTE(:%s)) "
-            "OR JSON_SEARCH(p.tags, 'one', :%s) IS NOT NULL)" % (param, param, param)
+    clauses.extend(
+        _hard_filter_clauses(
+            compiled.filters, params, compiled.hard_memberships
         )
-        params[param] = tag
+    )
     filter_facts = compiled.filters.model_dump(mode="json")
     for key in ("cursor", "page", "page_size"):
         filter_facts.pop(key, None)
@@ -1374,6 +1565,7 @@ def build_search_query_snapshot(
             "scene": VisibilityScene.SEARCH.value,
             "filters": filter_facts,
             "soft_terms": compiled.soft_terms,
+            "hard_memberships": compiled.hard_memberships,
             "policy_revision": visibility.policy_revision,
             "sort_version": SORT_VERSION,
         }
@@ -1430,18 +1622,40 @@ async def _load_projections(
     placeholders = ", ".join(f":uid{i}" for i in range(len(user_ids)))
     result = await db.execute(
         text(
-            "SELECT subject_user_id, fields_json, profile_revision, status, expires_at "
+            "SELECT id, subject_user_id, source_hash, fields_json, "
+            "profile_revision, preference_revision, privacy_revision, "
+            "relationship_revision, policy_revision, source_revision_json, "
+            "consent_snapshot_json, status, expires_at "
             "FROM ai_feature_projection "
             f"WHERE subject_user_id IN ({placeholders}) "
-            "AND projection_kind = 'personal_searchable' AND status = 'active'"
+            "AND projection_kind = 'personal_searchable' AND status = 'active' "
+            "AND (expires_at IS NULL OR expires_at > UTC_TIMESTAMP()) "
+            "ORDER BY id DESC"
         ),
         {f"uid{i}": uid for i, uid in enumerate(user_ids)},
     )
     projections: dict[int, dict[str, Any]] = {}
     for row in result.mappings().all():
-        projections[int(row["subject_user_id"])] = {
+        subject_user_id = int(row["subject_user_id"])
+        if subject_user_id in projections:
+            continue
+        source_revision = _maybe_json(row.get("source_revision_json"))
+        if not isinstance(source_revision, dict) and row.get("profile_revision") is not None:
+            source_revision = {
+                "profile": int(row.get("profile_revision") or 0),
+                "preference": int(row.get("preference_revision") or 0),
+                "privacy": int(row.get("privacy_revision") or 0),
+                "relationship": int(row.get("relationship_revision") or 0),
+                "policy": int(row.get("policy_revision") or 0),
+            }
+        projections[subject_user_id] = {
+            "id": int(row.get("id") or 0) or None,
+            "source_hash": str(row.get("source_hash") or "") or None,
             "fields": _maybe_json(row.get("fields_json")) or {},
             "profile_revision": int(row.get("profile_revision") or 0),
+            "source_revision": source_revision,
+            "consent_snapshot": _maybe_json(row.get("consent_snapshot_json")),
+            "expires_at": row.get("expires_at"),
         }
     return projections
 
@@ -1476,6 +1690,7 @@ def _evidence_for_row(
     unknown: list[str] = []
     fields = (projection or {}).get("fields") or {}
     profile_revision = int((projection or {}).get("profile_revision") or 0)
+    soft_match_count = 0
     for field_key, value in compiled.soft_terms:
         field_value = fields.get(field_key)
         if field_value is None:
@@ -1484,6 +1699,7 @@ def _evidence_for_row(
             continue
         if _soft_matches(field_key, value, field_value):
             matched.append(field_key)
+            soft_match_count += 1
             reason_codes.append("SOFT_FIELD_MATCH")
         else:
             reason_codes.append("SOFT_FIELD_NO_MATCH")
@@ -1493,10 +1709,15 @@ def _evidence_for_row(
         unknown_conditions=unknown,
         reason_codes=reason_codes,
         profile_revision=profile_revision,
+        projection_id=(projection or {}).get("id"),
+        source_hash=(projection or {}).get("source_hash"),
+        consent_snapshot=(projection or {}).get("consent_snapshot"),
+        source_revision=(projection or {}).get("source_revision"),
+        soft_match_count=soft_match_count,
     )
 
 
-def _result_card(row: dict[str, Any]) -> dict[str, Any]:
+def _result_card(row: dict[str, Any], *, viewer_is_vip: bool = False) -> dict[str, Any]:
     """只返回当前可见卡片字段；detail_locked 隐私字段不进入结果卡片。"""
     from datetime import date
 
@@ -1508,18 +1729,36 @@ def _result_card(row: dict[str, Any]) -> dict[str, Any]:
             birthday = date.fromisoformat(birthday)
         except ValueError:
             birthday = None
+    detail_locked = bool(row.get("only_vip_can_see_detail")) and not viewer_is_vip
     return {
         "user_id": int(row["user_id"]),
         "nickname": row.get("nickname"),
         "avatar": row.get("avatar"),
         "age": _calculate_age(birthday) if birthday else None,
-        "city_code": row.get("residence_city_code"),
-        "education_level": row.get("education_level"),
-        "height": row.get("height"),
-        "occupation": row.get("occupation"),
-        "income": float(row["income"]) if row.get("income") is not None else None,
-        "is_married": row.get("is_married"),
-        "interest_tags": _maybe_json(row.get("interest_tags")) or [],
+        "city_code": row.get("residence_city_code") if not detail_locked else None,
+        "education_level": (
+            row.get("education_level")
+            if not detail_locked and not row.get("hide_school")
+            else None
+        ),
+        "height": row.get("height") if not detail_locked else None,
+        "occupation": (
+            row.get("occupation")
+            if not detail_locked and not row.get("hide_company")
+            else None
+        ),
+        "income": (
+            float(row["income"])
+            if row.get("income") is not None and not detail_locked
+            else None
+        ),
+        "is_married": row.get("is_married") if not detail_locked else None,
+        "interest_tags": (
+            (_maybe_json(row.get("interest_tags")) or [])[:5]
+            if not detail_locked
+            else []
+        ),
+        "detail_locked": detail_locked,
     }
 
 
@@ -1536,10 +1775,13 @@ async def _upsert_result_row(
             "INSERT INTO ai_search_result "
             "(snapshot_id, target_user_id, rank_position, matched_condition_count, "
             " matched_conditions, unknown_conditions, reason_codes, profile_revision, "
+            " projection_id, source_hash, consent_snapshot_json, source_revision_json, "
             " result_expires_at, stale, created_at) "
             "VALUES (:snapshot_id, :target_user_id, :rank_position, "
             " :matched_condition_count, :matched_conditions, :unknown_conditions, "
-            " :reason_codes, :profile_revision, :result_expires_at, 0, UTC_TIMESTAMP()) "
+            " :reason_codes, :profile_revision, :projection_id, :source_hash, "
+            " :consent_snapshot_json, :source_revision_json, :result_expires_at, "
+            " 0, UTC_TIMESTAMP()) "
             "ON DUPLICATE KEY UPDATE "
             " rank_position = VALUES(rank_position), "
             " matched_condition_count = VALUES(matched_condition_count), "
@@ -1547,6 +1789,10 @@ async def _upsert_result_row(
             " unknown_conditions = VALUES(unknown_conditions), "
             " reason_codes = VALUES(reason_codes), "
             " profile_revision = VALUES(profile_revision), "
+            " projection_id = VALUES(projection_id), "
+            " source_hash = VALUES(source_hash), "
+            " consent_snapshot_json = VALUES(consent_snapshot_json), "
+            " source_revision_json = VALUES(source_revision_json), "
             " result_expires_at = VALUES(result_expires_at), "
             " stale = 0"
         ),
@@ -1563,46 +1809,228 @@ async def _upsert_result_row(
             ),
             "reason_codes": json.dumps(evidence.reason_codes, ensure_ascii=False),
             "profile_revision": evidence.profile_revision,
+            "projection_id": evidence.projection_id,
+            "source_hash": evidence.source_hash,
+            "consent_snapshot_json": json.dumps(
+                evidence.consent_snapshot, ensure_ascii=False
+            ) if evidence.consent_snapshot is not None else None,
+            "source_revision_json": json.dumps(
+                evidence.source_revision, ensure_ascii=False
+            ) if evidence.source_revision is not None else None,
             "result_expires_at": result_expires_at,
         },
     )
 
 
-async def execute_search_snapshot(
+def _encode_materialized_cursor(snapshot_id: str, rank_position: int) -> str:
+    payload = json.dumps(
+        {
+            "version": _MATERIALIZED_CURSOR_VERSION,
+            "snapshot_id": snapshot_id,
+            "rank_position": int(rank_position),
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+    encoded = base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+    signature = hmac.new(
+        settings.secret_key.encode("utf-8"), encoded.encode("ascii"), hashlib.sha256
+    ).digest()
+    return f"{encoded}.{base64.urlsafe_b64encode(signature).decode('ascii').rstrip('=')}"
+
+
+def _decode_materialized_cursor(snapshot_id: str, token: str) -> int:
+    if not token or len(token) > 512 or "." not in token:
+        raise InvalidCandidateCursor("invalid materialized search cursor")
+    encoded, signature = token.split(".", 1)
+    try:
+        expected = hmac.new(
+            settings.secret_key.encode("utf-8"), encoded.encode("ascii"), hashlib.sha256
+        ).digest()
+        padding = "=" * (-len(signature) % 4)
+        actual = base64.urlsafe_b64decode((signature + padding).encode("ascii"))
+        if not hmac.compare_digest(expected, actual):
+            raise InvalidCandidateCursor("invalid materialized search cursor")
+        padding = "=" * (-len(encoded) % 4)
+        payload = json.loads(
+            base64.urlsafe_b64decode((encoded + padding).encode("ascii"))
+        )
+    except (ValueError, TypeError, UnicodeError, json.JSONDecodeError) as exc:
+        raise InvalidCandidateCursor("invalid materialized search cursor") from exc
+    if (
+        payload.get("version") != _MATERIALIZED_CURSOR_VERSION
+        or payload.get("snapshot_id") != snapshot_id
+        or not isinstance(payload.get("rank_position"), int)
+        or payload["rank_position"] < 0
+    ):
+        raise InvalidCandidateCursor("invalid materialized search cursor")
+    return int(payload["rank_position"])
+
+
+async def _load_materialized_result_rows(
+    db: AsyncSession, snapshot_id: str, after_rank: int, limit: int
+) -> list[dict[str, Any]]:
+    result = await db.execute(
+        text(
+            "SELECT target_user_id, projection_id, source_hash, rank_position, "
+            "matched_condition_count, matched_conditions, unknown_conditions, "
+            "reason_codes, profile_revision, consent_snapshot_json, "
+            "source_revision_json, result_expires_at, stale "
+            "FROM ai_search_result WHERE snapshot_id = :snapshot_id "
+            "AND stale = 0 AND rank_position > :after_rank "
+            "ORDER BY rank_position ASC LIMIT :limit"
+        ),
+        {
+            "snapshot_id": snapshot_id,
+            "after_rank": int(after_rank),
+            "limit": int(limit),
+        },
+    )
+    return [dict(row) for row in result.mappings().all()]
+
+
+async def _load_materialized_candidate_cards(
+    db: AsyncSession, viewer_id: int, user_ids: list[int]
+) -> dict[int, dict[str, Any]]:
+    if not user_ids:
+        return {}
+    placeholders = ", ".join(f":card_uid{i}" for i in range(len(user_ids)))
+    result = await db.execute(
+        text(CARD_SELECT + CARD_FROM + f" WHERE u.id IN ({placeholders})"),
+        {
+            "viewer_id": viewer_id,
+            "candidate_query_limit": len(user_ids),
+            **{f"card_uid{i}": uid for i, uid in enumerate(user_ids)},
+        },
+    )
+    return {int(row["user_id"]): dict(row) for row in result.mappings().all()}
+
+
+async def _candidate_projection_is_current(
+    db: AsyncSession, candidate_id: int, stored: dict[str, Any]
+) -> bool:
+    projection = (await _load_projections(db, [candidate_id])).get(candidate_id)
+    if projection is None:
+        return False
+    stored_projection_id = stored.get("projection_id")
+    projection_id = projection.get("id")
+    stored_source_hash = str(stored.get("source_hash") or "")
+    projection_source_hash = str(projection.get("source_hash") or "")
+    if (
+        stored_projection_id is None
+        or projection_id is None
+        or int(stored_projection_id or 0) != int(projection_id or 0)
+        or not stored_source_hash
+        or not projection_source_hash
+        or stored_source_hash != projection_source_hash
+    ):
+        return False
+    stored_revision = _maybe_json(
+        stored.get("source_revision_json") or stored.get("source_revision")
+    )
+    projection_revision = projection.get("source_revision")
+    required_revision_keys = {
+        "profile", "preference", "privacy", "relationship", "policy"
+    }
+    if (
+        not isinstance(stored_revision, dict)
+        or not isinstance(projection_revision, dict)
+        or set(stored_revision) != required_revision_keys
+        or set(projection_revision) != required_revision_keys
+        or stored_revision != projection_revision
+    ):
+        return False
+    current = await _load_revision_vector(db, candidate_id)
+    if current.as_dict() != projection_revision:
+        return False
+    stored_consent = _maybe_json(
+        stored.get("consent_snapshot_json") or stored.get("consent_snapshot")
+    )
+    projection_consent = projection.get("consent_snapshot")
+    if (
+        not isinstance(stored_consent, dict)
+        or not isinstance(projection_consent, dict)
+        or stored_consent != projection_consent
+        or str(stored_consent.get("scope") or "") != "profile_text_extract"
+        or not stored_consent.get("version")
+        or not stored_consent.get("policy_revision")
+        or not stored_consent.get("granted_at")
+    ):
+        return False
+    return await _active_consent_matches(
+        db, candidate_id, stored_consent, expected_scope="profile_text_extract"
+    )
+
+
+async def _active_consent_matches(
+    db: AsyncSession,
+    user_id: int,
+    snapshot: dict[str, Any],
+    *,
+    expected_scope: str | None = None,
+) -> bool:
+    scope = str(snapshot.get("scope") or "")
+    version = str(snapshot.get("version") or "")
+    if not scope or not version or (expected_scope and scope != expected_scope):
+        return False
+    row = await _first_row(
+        await db.execute(
+            text(
+                "SELECT version, policy_revision, granted_at FROM ai_consent_grant "
+                "WHERE user_id = :user_id AND scope = :scope AND version = :version "
+                "AND revoked_at IS NULL ORDER BY granted_at DESC LIMIT 1"
+            ),
+            {"user_id": user_id, "scope": scope, "version": version},
+        )
+    )
+    if row is None:
+        return False
+    if str(row.get("policy_revision") or "") != str(snapshot.get("policy_revision") or ""):
+        return False
+    granted_at = row.get("granted_at")
+    current_granted_at = (
+        granted_at.isoformat() if hasattr(granted_at, "isoformat") else str(granted_at or "")
+    )
+    return current_granted_at == str(snapshot.get("granted_at") or "")
+
+
+async def _set_search_task_stage(
+    db: AsyncSession, task_id: str, stage: str
+) -> None:
+    await db.execute(
+        text(
+            "UPDATE ai_task SET stage = :stage, updated_at = UTC_TIMESTAMP() "
+            "WHERE task_id = :task_id"
+        ),
+        {"task_id": task_id, "stage": stage},
+    )
+
+
+async def materialize_search_snapshot(
     db: AsyncSession,
     snapshot_id: str,
     owner_user_id: int,
-    cursor: str | None,
-    page_size: int,
+    *,
+    task_id: str | None = None,
 ) -> SearchResultPageRead:
-    """执行确认后的快照并返回 cursor 结果页（GET 读取路径）。
-
-    每次读取重新过 ``CandidateVisibilityService.decide`` 门禁（被拉黑/撤回对象
-    排除），软字段缺失记为 ``unknown`` 不当硬失败；当前可见卡片引用与证据写入
-    ``ai_search_result``；快照过期返回 stale 页。结果读取以 MySQL 为事实源，
-    Redis 断开时天然恢复。
-    """
+    """Worker-only path: scan the full hard-filtered baseline and materialize top 200."""
     snapshot = await _load_snapshot_row(db, snapshot_id)
     if snapshot is None or int(snapshot["user_id"]) != owner_user_id:
         raise SearchSnapshotNotFound()
     if snapshot.get("invalidated_at") is not None:
         raise SearchSnapshotNotFound()
     if _is_expired(snapshot.get("expires_at")):
-        return SearchResultPageRead(
-            snapshot_id=snapshot_id,
-            status="stale",
-            items=[],
-            next_cursor=None,
-            total=0,
-            total_is_estimate=False,
-            degraded=False,
-        )
-
+        return SearchResultPageRead(snapshot_id=snapshot_id, status="stale")
+    if task_id:
+        await _set_search_task_stage(db, task_id, "validating")
     draft_id = str(snapshot.get("draft_id") or "")
-    condition_rows = await _load_condition_rows(db, draft_id) if draft_id else []
-    condition_objects = [_condition_from_row(row) for row in condition_rows]
+    condition_objects = [
+        _condition_from_row(row) for row in await _load_condition_rows(db, draft_id)
+    ]
     compiled = compile_search_conditions(condition_objects)
-
+    if compiled.conflicts:
+        raise SearchInputInvalid("AI_INPUT_INVALID")
+    if task_id:
+        await _set_search_task_stage(db, task_id, "filtering")
     viewer = await _load_viewer_context(db, owner_user_id)
     viewer_is_vip = await _is_vip(db, owner_user_id)
     query_snapshot = build_search_query_snapshot(
@@ -1612,50 +2040,194 @@ async def execute_search_snapshot(
         compiled=compiled,
         page=1,
     )
-    page = await candidate_query_service.fetch_page(
-        db, query_snapshot, cursor=cursor, page_size=page_size
+    baseline_rows: list[dict[str, Any]] = []
+    candidate_cursor: str | None = None
+    while True:
+        page = await candidate_query_service.fetch_page(
+            db,
+            query_snapshot,
+            cursor=candidate_cursor,
+            page_size=SEARCH_MATERIALIZATION_LIMIT,
+        )
+        baseline_rows.extend(page.items)
+        if not page.next_cursor:
+            break
+        candidate_cursor = page.next_cursor
+    projections = await _load_projections(
+        db, [int(row["user_id"]) for row in baseline_rows]
     )
-    user_ids = [int(row["user_id"]) for row in page.items]
-    projections = await _load_projections(db, user_ids)
-    now = _now_utc()
-    result_expires_at = now + timedelta(minutes=SEARCH_RESULT_TTL_MINUTES)
-
-    items: list[SearchResultItemRead] = []
-    rank = 0
-    for row in page.items:
+    visible: list[tuple[int, dict[str, Any], SearchEvidence]] = []
+    for baseline_index, row in enumerate(baseline_rows):
         candidate_id = int(row["user_id"])
         decision = await candidate_visibility_service.decide(
             db, owner_user_id, candidate_id, VisibilityScene.SEARCH
         )
         if not decision.allowed:
             continue
+        if candidate_id not in projections:
+            # Search consumes only the versioned personal_searchable boundary;
+            # an unprojected candidate cannot safely enter a materialized set.
+            continue
+        projection = projections[candidate_id]
+        projection_evidence = {
+            "projection_id": projection.get("id"),
+            "source_hash": projection.get("source_hash"),
+            "source_revision_json": projection.get("source_revision"),
+            "consent_snapshot_json": projection.get("consent_snapshot"),
+        }
+        if not await _candidate_projection_is_current(
+            db, candidate_id, projection_evidence
+        ):
+            continue
         evidence = _evidence_for_row(
             row, condition_objects, compiled, projections.get(candidate_id)
         )
-        rank += 1
+        visible.append((baseline_index, row, evidence))
+    if task_id:
+        await _set_search_task_stage(db, task_id, "ranking")
+    visible.sort(
+        key=lambda item: (
+            -item[2].soft_match_count,
+            item[0],
+            -int(item[1]["user_id"]),
+        )
+    )
+    materialized = visible[:SEARCH_MATERIALIZATION_LIMIT]
+    result_expires_at = _now_utc() + timedelta(minutes=SEARCH_RESULT_TTL_MINUTES)
+    await db.execute(
+        text("DELETE FROM ai_search_result WHERE snapshot_id = :snapshot_id AND rank_position > :limit"),
+        {"snapshot_id": snapshot_id, "limit": SEARCH_MATERIALIZATION_LIMIT},
+    )
+    for rank_position, (_, row, evidence) in enumerate(materialized, start=1):
         await _upsert_result_row(
-            db, snapshot_id, candidate_id, rank, evidence, result_expires_at
+            db,
+            snapshot_id,
+            int(row["user_id"]),
+            rank_position,
+            evidence,
+            result_expires_at,
         )
-        items.append(
-            SearchResultItemRead(
-                user_id=candidate_id,
-                card=_result_card(row),
-                matched_condition_count=evidence.matched_condition_count,
-                matched_conditions=evidence.matched_conditions,
-                unknown_conditions=evidence.unknown_conditions,
-                reason_codes=evidence.reason_codes,
-                profile_revision=evidence.profile_revision,
-                result_expires_at=result_expires_at,
-            )
+    total = len(visible)
+    degraded = total > SEARCH_MATERIALIZATION_LIMIT
+    status_value = "partial" if degraded else ("empty" if total == 0 else "completed")
+    await db.execute(
+        text(
+            "UPDATE ai_search_snapshot SET status = :status, result_total = :result_total, "
+            "degraded = :degraded WHERE snapshot_id = :snapshot_id"
+        ),
+        {
+            "snapshot_id": snapshot_id,
+            "status": status_value,
+            "result_total": total,
+            "degraded": int(degraded),
+        },
+    )
+    if task_id:
+        await _set_search_task_stage(db, task_id, status_value)
+    items = [
+        SearchResultItemRead(
+            user_id=int(row["user_id"]),
+            card=_result_card(row, viewer_is_vip=viewer_is_vip),
+            matched_condition_count=evidence.matched_condition_count,
+            matched_conditions=evidence.matched_conditions,
+            unknown_conditions=evidence.unknown_conditions,
+            reason_codes=evidence.reason_codes,
+            profile_revision=evidence.profile_revision,
+            result_expires_at=result_expires_at,
         )
+        for _, row, evidence in materialized[:SEARCH_PAGE_SIZE_DEFAULT]
+    ]
     return SearchResultPageRead(
         snapshot_id=snapshot_id,
-        status="completed",
+        status=status_value,
         items=items,
-        next_cursor=page.next_cursor,
-        total=page.total,
-        total_is_estimate=page.total_is_estimate,
-        degraded=False,
+        next_cursor=(
+            _encode_materialized_cursor(snapshot_id, SEARCH_PAGE_SIZE_DEFAULT)
+            if total > SEARCH_PAGE_SIZE_DEFAULT
+            else None
+        ),
+        total=total,
+        total_is_estimate=False,
+        degraded=degraded,
+    )
+
+
+async def read_materialized_search_results(
+    db: AsyncSession,
+    snapshot_id: str,
+    owner_user_id: int,
+    cursor: str | None,
+    page_size: int,
+) -> SearchResultPageRead:
+    """Pure read path: never runs CandidateQuery or writes result rows."""
+    snapshot = await _load_snapshot_row(db, snapshot_id)
+    if snapshot is None or int(snapshot["user_id"]) != owner_user_id:
+        raise SearchSnapshotNotFound()
+    if snapshot.get("invalidated_at") is not None:
+        raise SearchSnapshotNotFound()
+    # Validate a supplied cursor before returning a stale page.  A malformed or
+    # cross-snapshot token is still a client error even when the snapshot is no
+    # longer readable.
+    after_rank = _decode_materialized_cursor(snapshot_id, cursor) if cursor else 0
+    if _is_expired(snapshot.get("expires_at")):
+        return SearchResultPageRead(snapshot_id=snapshot_id, status="stale")
+    owner_source = _maybe_json(snapshot.get("source_revision_json")) or {}
+    if owner_source:
+        if (await _load_revision_vector(db, owner_user_id)).as_dict() != owner_source:
+            return SearchResultPageRead(snapshot_id=snapshot_id, status="stale")
+    owner_consent = _maybe_json(snapshot.get("consent_snapshot_json")) or {}
+    if owner_consent and not await _active_consent_matches(db, owner_user_id, owner_consent):
+        return SearchResultPageRead(snapshot_id=snapshot_id, status="stale")
+    stored_rows = await _load_materialized_result_rows(
+        db, snapshot_id, after_rank, page_size + 1
+    )
+    has_more = len(stored_rows) > page_size
+    stored_rows = stored_rows[:page_size]
+    accepted: list[dict[str, Any]] = []
+    for stored in stored_rows:
+        candidate_id = int(stored["target_user_id"])
+        decision = await candidate_visibility_service.decide(
+            db, owner_user_id, candidate_id, VisibilityScene.SEARCH
+        )
+        if not decision.allowed:
+            continue
+        if not await _candidate_projection_is_current(db, candidate_id, stored):
+            continue
+        accepted.append(stored)
+    cards = await _load_materialized_candidate_cards(
+        db, owner_user_id, [int(row["target_user_id"]) for row in accepted]
+    )
+    viewer_is_vip = await _is_vip(db, owner_user_id)
+    items: list[SearchResultItemRead] = []
+    for row in accepted:
+        card_row = cards.get(int(row["target_user_id"]))
+        if card_row is None:
+            continue
+        items.append(
+            SearchResultItemRead(
+                user_id=int(row["target_user_id"]),
+                card=_result_card(card_row, viewer_is_vip=viewer_is_vip),
+                matched_condition_count=int(row.get("matched_condition_count") or 0),
+                matched_conditions=_maybe_json(row.get("matched_conditions")) or [],
+                unknown_conditions=_maybe_json(row.get("unknown_conditions")) or [],
+                reason_codes=_maybe_json(row.get("reason_codes")) or [],
+                profile_revision=int(row.get("profile_revision") or 0),
+                result_expires_at=row.get("result_expires_at"),
+            )
+        )
+    status_value = str(snapshot.get("status") or "completed")
+    return SearchResultPageRead(
+        snapshot_id=snapshot_id,
+        status=status_value,
+        items=items,
+        next_cursor=(
+            _encode_materialized_cursor(snapshot_id, int(stored_rows[-1]["rank_position"]))
+            if has_more and stored_rows
+            else None
+        ),
+        total=int(snapshot.get("result_total") or 0),
+        total_is_estimate=False,
+        degraded=bool(snapshot.get("degraded")),
     )
 
 
@@ -1679,14 +2251,13 @@ async def search_execute_handler(
         )
         return None
     try:
-        await execute_search_snapshot(
+        await materialize_search_snapshot(
             db,
             str(snapshot_id),
             task.owner_user_id,
-            cursor=None,
-            page_size=SEARCH_PAGE_SIZE_DEFAULT,
+            task_id=task.task_id,
         )
-    except (SearchSnapshotNotFound, SearchDraftNotConfirmed):
+    except (SearchSnapshotNotFound, SearchDraftNotConfirmed, SearchInputInvalid):
         await fail_task(
             db, task.task_id, worker_id,
             error_code="RESULT_STALE", retryable=False,
@@ -1719,6 +2290,7 @@ async def get_search_suggestions(
             "FROM ai_feature_projection "
             "WHERE subject_user_id = :user_id "
             "AND projection_kind = 'personal_searchable' AND status = 'active' "
+            "AND (expires_at IS NULL OR expires_at > UTC_TIMESTAMP()) "
             "ORDER BY id DESC LIMIT 1"
         ),
         {"user_id": owner_user_id},
@@ -1764,6 +2336,19 @@ async def delete_search_snapshot(
         request_hash=request_hash,
         revisions=RevisionVector(),
         consent=None,
+    )
+    await db.execute(
+        text(
+            "UPDATE ai_task SET payload_summary = :payload_summary, "
+            "updated_at = UTC_TIMESTAMP() WHERE task_id = :task_id"
+        ),
+        {
+            "payload_summary": json.dumps(
+                _cleanup_payload_for_snapshot(owner_user_id, snapshot_id),
+                ensure_ascii=False,
+            ),
+            "task_id": task.task_id,
+        },
     )
     return CleanupTask(
         task_id=task.task_id,

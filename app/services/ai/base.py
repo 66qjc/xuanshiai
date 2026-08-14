@@ -11,10 +11,14 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Protocol
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.schemas.ai_common import AI_FIELD_ALLOWLIST
-from app.schemas.ai_profile import ProfileFieldConfirmationStatus
+from app.schemas.ai_profile import (
+    ProfileFieldConfirmationStatus,
+    ProfileSubject,
+    normalize_profile_extracted_value,
+)
 
 
 @dataclass(frozen=True)
@@ -36,13 +40,34 @@ class StructuredExtractRequest:
 class ExtractedField(BaseModel):
     """One structured field candidate with its source evidence."""
 
+    model_config = ConfigDict(extra="forbid")
+
     field_key: str = Field(..., min_length=1, max_length=64)
-    subject: str = Field(default="personal", min_length=1, max_length=24)
+    subject: ProfileSubject
     value: Any = None
     source_quote: str | None = None
+    source_span: str | None = Field(default=None, max_length=500)
+    source_turn_ids: tuple[str, ...] = ()
     confidence: float = Field(default=1.0, ge=0.0, le=1.0)
     needs_confirmation: bool = True
-    confirmation_status: str = ProfileFieldConfirmationStatus.SUGGESTED.value
+    confirmation_status: str = Field(
+        default=ProfileFieldConfirmationStatus.SUGGESTED.value,
+        pattern="^suggested$",
+    )
+    schema_version: str = Field(default="profile-extract-v1", min_length=1, max_length=32)
+    prompt_version: str = Field(default="profile-extract-prompt-v1", min_length=1, max_length=32)
+    policy_revision: str = Field(default="ai-policy-2026-08-07-v1", min_length=1, max_length=64)
+
+    @model_validator(mode="after")
+    def validate_subject_aware_value_and_provenance(self) -> "ExtractedField":
+        self.value = normalize_profile_extracted_value(self.subject, self.field_key, self.value)
+        if self.source_span is None:
+            self.source_span = self.source_quote
+        elif self.source_quote is not None and self.source_quote != self.source_span:
+            raise ValueError("source_quote and source_span must agree")
+        if not self.needs_confirmation:
+            raise ValueError("provider fields must require confirmation")
+        return self
 
 
 class StructuredExtractResult(BaseModel):
@@ -160,6 +185,7 @@ class AITaskContext:
     prompt_version: str | None = None
     schema_version: str | None = None
     input_revision: dict[str, int] = field(default_factory=dict)
+    policy_revision: str | None = None
 
 
 @dataclass(frozen=True)
@@ -181,3 +207,5 @@ class GatewayCallRecord:
     token_usage: dict[str, int] | None
     error_code: str | None
     succeeded: bool
+    input_revision: dict[str, int] = field(default_factory=dict)
+    policy_revision: str | None = None

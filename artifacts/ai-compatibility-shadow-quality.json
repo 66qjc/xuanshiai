@@ -1,0 +1,45 @@
+{
+  "artifact": "ai-compatibility-shadow-quality",
+  "generated_at": "2026-08-11T00:00:00Z",
+  "module": "M06",
+  "evaluation_only": true,
+  "synthetic": true,
+  "dataset": {
+    "path": "tests/fixtures/ai/compatibility_quality_pairs.json",
+    "sample_size": 4,
+    "extensible": false
+  },
+  "metrics": {
+    "replay_consistency_pct": 100.0,
+    "evidence_consistency_pct": 100.0,
+    "display_eligible_false_pct": 100.0,
+    "sensitive_marker_hits": 0,
+    "coverage_slices": {
+      "group_a": 0.94,
+      "group_b": 0.795
+    },
+    "false_block_slices": {
+      "group_a": 0.0,
+      "group_b": 1.0
+    },
+    "controlled_completeness_max_coverage_gap_pct_points": 14.5,
+    "controlled_completeness_max_false_block_gap_pct_points": 100.0
+  },
+  "thresholds": {
+    "replay_consistency_pct_min": 100.0,
+    "evidence_consistency_pct_min": 100.0,
+    "display_eligible_false_pct_min": 100.0,
+    "sensitive_marker_hits_max": 0,
+    "max_allowed_gap_pct_points": 10.0
+  },
+  "verdict": {
+    "thresholds_met": true,
+    "allow_expansion": false,
+    "expansion_blocked": true,
+    "auto_weight_adjustment_applied": false
+  },
+  "notes": [
+    "Synthetic offline evaluation only; not real runtime acceptance evidence.",
+    "Controlled-completeness slice gaps above 10 percentage points block expansion."
+  ]
+}

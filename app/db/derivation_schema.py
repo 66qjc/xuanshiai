@@ -32,10 +32,15 @@ DERIVATION_TABLES = {
             `occurred_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
             `priority` int NOT NULL DEFAULT '50',
             `published_at` datetime DEFAULT NULL,
+            `status` varchar(16) NOT NULL DEFAULT 'pending' COMMENT 'pending/processing/succeeded/dead_letter',
+            `attempt_count` int unsigned NOT NULL DEFAULT '0',
+            `last_error_code` varchar(64) DEFAULT NULL,
+            `dead_letter_at` datetime DEFAULT NULL,
             `lease_owner` varchar(64) DEFAULT NULL,
             `lease_until` datetime DEFAULT NULL,
             PRIMARY KEY (`event_id`),
-            KEY `idx_derivation_outbox_publish` (`published_at`, `priority`, `occurred_at`),
+            KEY `idx_derivation_outbox_publish` (`status`, `published_at`, `priority`, `occurred_at`),
+            KEY `idx_derivation_outbox_dead_letter` (`dead_letter_at`, `status`),
             KEY `idx_derivation_outbox_aggregate` (`aggregate_type`, `aggregate_id`, `occurred_at`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='派生事件外发盒'
     """,
@@ -43,6 +48,9 @@ DERIVATION_TABLES = {
         CREATE TABLE IF NOT EXISTS `derivation_consumer_receipt` (
             `event_id` varchar(64) NOT NULL,
             `consumer_name` varchar(64) NOT NULL,
+            `event_type` varchar(64) NOT NULL DEFAULT '',
+            `outcome` varchar(16) NOT NULL DEFAULT 'processed' COMMENT 'processed/noop/dead_letter',
+            `duration_ms` int unsigned NOT NULL DEFAULT '0',
             `processed_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
             `lease_until` datetime DEFAULT NULL,
             PRIMARY KEY (`event_id`, `consumer_name`),
@@ -50,3 +58,33 @@ DERIVATION_TABLES = {
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='派生事件消费收据'
     """,
 }
+
+
+DERIVATION_TASK10_REQUIRED_COLUMNS: dict[str, dict[str, str]] = {
+    "derivation_outbox": {
+        "status": "`status` varchar(16) NOT NULL DEFAULT 'pending'",
+        "attempt_count": "`attempt_count` int unsigned NOT NULL DEFAULT '0'",
+        "last_error_code": "`last_error_code` varchar(64) DEFAULT NULL",
+        "dead_letter_at": "`dead_letter_at` datetime DEFAULT NULL",
+    },
+    "derivation_consumer_receipt": {
+        "event_type": "`event_type` varchar(64) NOT NULL DEFAULT ''",
+        "outcome": "`outcome` varchar(16) NOT NULL DEFAULT 'processed'",
+        "duration_ms": "`duration_ms` int unsigned NOT NULL DEFAULT '0'",
+    },
+}
+
+
+def ensure_derivation_task10_columns(cursor: object) -> None:
+    """Add Task 10 columns to a database created before the second migration."""
+    for table_name, required_columns in DERIVATION_TASK10_REQUIRED_COLUMNS.items():
+        try:
+            cursor.execute(f"SHOW COLUMNS FROM `{table_name}`")
+            existing = {row["Field"] for row in cursor.fetchall()}
+        except Exception:  # noqa: BLE001, S112 - legacy bootstrap is best effort
+            continue
+        for column_name, column_def in required_columns.items():
+            if column_name not in existing:
+                cursor.execute(
+                    f"ALTER TABLE `{table_name}` ADD COLUMN {column_def}"
+                )

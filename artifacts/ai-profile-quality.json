@@ -1,0 +1,34 @@
+{
+  "artifact": "ai-profile-quality",
+  "generated_at": "2026-08-11T00:00:00Z",
+  "module": "M04",
+  "evaluation_only": true,
+  "synthetic": true,
+  "dataset": {
+    "path": "tests/fixtures/ai/profile_quality_cases.json",
+    "sample_size": 3,
+    "extensible": true
+  },
+  "metrics": {
+    "precision_pct": 100.0,
+    "recall_pct": 100.0,
+    "sensitive_marker_hits": 0,
+    "auth_marker_hits": 0,
+    "provenance_pct": 100.0
+  },
+  "thresholds": {
+    "precision_pct_min": 95.0,
+    "recall_pct_min": 90.0,
+    "sensitive_marker_hits_max": 0,
+    "auth_marker_hits_max": 0,
+    "provenance_pct_min": 100.0
+  },
+  "verdict": {
+    "thresholds_met": true,
+    "allow_expansion": true
+  },
+  "notes": [
+    "Synthetic offline evaluation only; not real runtime acceptance evidence.",
+    "Does not change prompts, provider choice, or weights."
+  ]
+}

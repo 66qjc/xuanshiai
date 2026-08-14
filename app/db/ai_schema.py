@@ -22,15 +22,18 @@ AI_TABLES = {
     "ai_consent_grant": """
         CREATE TABLE IF NOT EXISTS `ai_consent_grant` (
             `id` bigint unsigned NOT NULL AUTO_INCREMENT,
-            `user_id` bigint unsigned NOT NULL,
+            `user_id` bigint unsigned DEFAULT NULL,
+            `user_id_coalesce` bigint unsigned GENERATED ALWAYS AS (COALESCE(`user_id`, 0)) STORED,
+            `user_tombstone` char(64) DEFAULT NULL,
             `scope` varchar(64) NOT NULL COMMENT 'profile_text_extract/search_parse/compatibility_shadow',
             `version` varchar(32) NOT NULL COMMENT '授权文案版本',
             `policy_revision` varchar(64) NOT NULL COMMENT '策略版本，当前冻结 ai-policy-2026-08-07-v1',
             `granted_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
             `revoked_at` datetime DEFAULT NULL,
             `revoke_reason` varchar(255) DEFAULT NULL,
+            `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
             PRIMARY KEY (`id`),
-            UNIQUE KEY `uk_ai_consent_user_scope_version` (`user_id`, `scope`, `version`, `granted_at`),
+            UNIQUE KEY `uk_ai_consent_user_scope_version` (`user_id_coalesce`, `scope`, `version`, `granted_at`),
             KEY `idx_ai_consent_user_scope_revoked` (`user_id`, `scope`, `revoked_at`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='AI 授权授予与撤回记录'
     """,
@@ -38,7 +41,8 @@ AI_TABLES = {
         CREATE TABLE IF NOT EXISTS `ai_task` (
             `id` bigint unsigned NOT NULL AUTO_INCREMENT,
             `task_id` varchar(64) NOT NULL COMMENT '对外任务ID',
-            `owner_user_id` bigint unsigned NOT NULL,
+            `owner_user_id` bigint unsigned DEFAULT NULL,
+            `owner_tombstone` char(64) DEFAULT NULL,
             `task_type` varchar(32) NOT NULL COMMENT 'profile_extract/search_parse/search_execute/compatibility/cleanup...',
             `scene` varchar(32) NOT NULL,
             `idempotency_key` varchar(128) NOT NULL,
@@ -112,15 +116,17 @@ AI_TABLES = {
             `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
             PRIMARY KEY (`id`),
             UNIQUE KEY `uk_ai_profile_session_id` (`session_id`),
-            UNIQUE KEY `uk_ai_profile_session_active` (`user_id`, `subject`, `active_status`),
+            `active_slot` tinyint GENERATED ALWAYS AS (CASE WHEN `active_status` = 1 THEN 1 ELSE NULL END) STORED,
+            UNIQUE KEY `uk_ai_profile_session_active` (`user_id`, `subject`, `active_slot`),
             KEY `idx_ai_profile_session_user_status` (`user_id`, `status`, `updated_at`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='AI 画像会话（personal/ideal_partner）'
     """,
     "ai_profile_turn": """
         CREATE TABLE IF NOT EXISTS `ai_profile_turn` (
             `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `turn_id` varchar(128) NOT NULL COMMENT '稳定的服务端 turn ID',
             `session_id` varchar(64) NOT NULL,
-            `client_turn_id` varchar(64) NOT NULL,
+            `client_turn_id` varchar(128) NOT NULL,
             `user_id` bigint unsigned NOT NULL,
             `turn_no` int unsigned NOT NULL DEFAULT '0',
             `role` varchar(16) NOT NULL DEFAULT 'user' COMMENT 'user/assistant',
@@ -128,7 +134,9 @@ AI_TABLES = {
             `status` varchar(24) NOT NULL DEFAULT 'saved',
             `source_type` varchar(24) DEFAULT NULL,
             `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
             PRIMARY KEY (`id`),
+            UNIQUE KEY `uk_ai_profile_turn_id` (`turn_id`),
             UNIQUE KEY `uk_ai_profile_turn_session_client` (`session_id`, `client_turn_id`),
             KEY `idx_ai_profile_turn_session_no` (`session_id`, `turn_no`),
             KEY `idx_ai_profile_turn_user_created` (`user_id`, `created_at`)
@@ -148,6 +156,9 @@ AI_TABLES = {
             `prompt_version` varchar(32) DEFAULT NULL,
             `schema_version` varchar(32) NOT NULL DEFAULT 'profile-extract-v1',
             `published_revision_id` bigint unsigned DEFAULT NULL,
+            `last_operation_idempotency_key` varchar(128) DEFAULT NULL,
+            `last_operation_request_digest` char(64) DEFAULT NULL,
+            `last_operation_response_json` json DEFAULT NULL,
             `expires_at` datetime DEFAULT NULL,
             `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
             `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -166,6 +177,7 @@ AI_TABLES = {
             `display_value` varchar(500) DEFAULT NULL,
             `source_type` varchar(24) DEFAULT NULL,
             `source_turn_ids` json DEFAULT NULL,
+            `source_span` varchar(500) DEFAULT NULL,
             `confidence` decimal(5,4) NOT NULL DEFAULT '0.0000' COMMENT '0..1',
             `visibility` varchar(32) DEFAULT NULL,
             `consent_scope` varchar(64) DEFAULT NULL,
@@ -208,6 +220,7 @@ AI_TABLES = {
             `confidence` decimal(5,4) DEFAULT NULL,
             `source_type` varchar(24) DEFAULT NULL,
             `source_turn_ids` json DEFAULT NULL,
+            `source_span` varchar(500) DEFAULT NULL,
             `content_hash` char(64) NOT NULL,
             `schema_version` varchar(32) NOT NULL DEFAULT 'profile-extract-v1',
             `prompt_version` varchar(32) DEFAULT NULL,
@@ -248,6 +261,9 @@ AI_TABLES = {
             `condition_schema_version` varchar(32) NOT NULL DEFAULT 'search-condition-v1',
             `policy_revision` varchar(64) NOT NULL,
             `consent_snapshot_json` json DEFAULT NULL,
+            `last_patch_idempotency_key` varchar(128) DEFAULT NULL,
+            `last_patch_request_digest` char(64) DEFAULT NULL,
+            `last_patch_response_json` json DEFAULT NULL,
             `expires_at` datetime DEFAULT NULL,
             `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
             `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -289,6 +305,8 @@ AI_TABLES = {
             `policy_revision` varchar(64) NOT NULL,
             `consent_snapshot_json` json DEFAULT NULL,
             `source_revision_json` json DEFAULT NULL,
+            `result_total` int unsigned NOT NULL DEFAULT '0',
+            `degraded` tinyint NOT NULL DEFAULT '0',
             `expires_at` datetime DEFAULT NULL,
             `invalidated_at` datetime DEFAULT NULL,
             `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -303,18 +321,23 @@ AI_TABLES = {
             `id` bigint unsigned NOT NULL AUTO_INCREMENT,
             `snapshot_id` varchar(64) NOT NULL,
             `target_user_id` bigint unsigned NOT NULL,
+            `projection_id` bigint unsigned DEFAULT NULL,
+            `source_hash` char(64) DEFAULT NULL,
             `rank_position` int unsigned NOT NULL,
             `matched_condition_count` int unsigned NOT NULL DEFAULT '0',
             `matched_conditions` json DEFAULT NULL,
             `unknown_conditions` json DEFAULT NULL,
             `reason_codes` json DEFAULT NULL,
             `profile_revision` int unsigned NOT NULL DEFAULT '0',
+            `consent_snapshot_json` json DEFAULT NULL,
+            `source_revision_json` json DEFAULT NULL,
             `result_expires_at` datetime DEFAULT NULL,
             `stale` tinyint NOT NULL DEFAULT '0',
             `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
             PRIMARY KEY (`id`),
             UNIQUE KEY `uk_ai_search_result_snapshot_target` (`snapshot_id`, `target_user_id`),
-            UNIQUE KEY `uk_ai_search_result_rank` (`snapshot_id`, `rank_position`),
+            KEY `idx_ai_search_result_snapshot_rank` (`snapshot_id`, `rank_position`),
             KEY `idx_ai_search_result_target_expires` (`target_user_id`, `result_expires_at`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='AI 搜索结果卡片引用、满足数与证据'
     """,
@@ -364,6 +387,8 @@ AI_TABLES = {
             `evidence_json` json DEFAULT NULL COMMENT '原因码引用，不存对方敏感原文',
             `profile_revision_pair_json` json DEFAULT NULL,
             `privacy_revision_pair_json` json DEFAULT NULL,
+            `source_revision_pair_json` json DEFAULT NULL,
+            `consent_snapshot_pair_json` json DEFAULT NULL,
             `experiment_bucket` varchar(24) NOT NULL DEFAULT 'shadow',
             `display_eligible` tinyint NOT NULL DEFAULT '0',
             `disclaimer` varchar(500) DEFAULT NULL,
@@ -372,6 +397,7 @@ AI_TABLES = {
             `invalidated_at` datetime DEFAULT NULL,
             `purge_after` datetime DEFAULT NULL,
             `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
             PRIMARY KEY (`id`),
             UNIQUE KEY `uk_ai_compat_snapshot_snapshot_id` (`snapshot_id`),
             UNIQUE KEY `uk_ai_compat_snapshot_pair` (`viewer_user_id`, `target_user_id`, `algorithm_version`, `snapshot_hash`),
@@ -381,6 +407,26 @@ AI_TABLES = {
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='AI 双向资料合拍参考 shadow 快照'
     """,
 }
+
+AI_CONSENT_OPERATION_TABLE = """
+    CREATE TABLE IF NOT EXISTS `ai_consent_operation` (
+        `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+        `operation_id` varchar(64) NOT NULL,
+        `user_id` bigint unsigned NOT NULL,
+        `scope` varchar(64) NOT NULL,
+        `operation` varchar(16) NOT NULL COMMENT 'grant/revoke',
+        `idempotency_key` varchar(128) NOT NULL,
+        `request_digest` char(64) NOT NULL,
+        `response_json` json NOT NULL,
+        `cleanup_task_id` varchar(64) DEFAULT NULL,
+        `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        PRIMARY KEY (`id`),
+        UNIQUE KEY `uk_ai_consent_operation_id` (`operation_id`),
+        UNIQUE KEY `uk_ai_consent_operation_key` (`user_id`, `operation`, `idempotency_key`),
+        KEY `idx_ai_consent_operation_scope` (`user_id`, `scope`, `created_at`)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='AI consent idempotency records'
+"""
 
 # ----------------------------------------------------------------------
 # Task 9 字段补全：ai_feature_projection 新增的版本向量/可见性列
@@ -418,10 +464,204 @@ def ensure_ai_projection_columns(cursor: Any) -> None:
     try:
         cursor.execute("SHOW COLUMNS FROM `ai_feature_projection`")
         existing = {row["Field"] for row in cursor.fetchall()}
-    except Exception:
+    except Exception:  # noqa: BLE001 - legacy bootstrap is best effort
         return
     for column_name, column_def in AI_PROJECTION_REQUIRED_COLUMNS.items():
         if column_name not in existing:
             cursor.execute(
                 f"ALTER TABLE `ai_feature_projection` ADD COLUMN {column_def}"
             )
+
+
+# These additive columns keep an older bootstrap-created database readable until
+# the reviewed hardening migration is applied. Index and constraint changes stay
+# in migrations/ai so production rollout remains explicit and auditable.
+AI_LEGACY_REQUIRED_COLUMNS: dict[str, dict[str, str]] = {
+    "ai_consent_grant": {
+        "updated_at": "`updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP",
+    },
+    "ai_profile_turn": {
+        "turn_id": "`turn_id` varchar(128) NULL COMMENT '稳定的服务端 turn ID'",
+        "updated_at": "`updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP",
+    },
+    "ai_profile_draft_field": {
+        "source_span": "`source_span` varchar(500) DEFAULT NULL",
+    },
+    "ai_profile_draft": {
+        "last_operation_idempotency_key": "`last_operation_idempotency_key` varchar(128) DEFAULT NULL",
+        "last_operation_request_digest": "`last_operation_request_digest` char(64) DEFAULT NULL",
+        "last_operation_response_json": "`last_operation_response_json` json DEFAULT NULL",
+    },
+    "ai_profile_revision_field": {
+        "source_span": "`source_span` varchar(500) DEFAULT NULL",
+    },
+    "ai_search_result": {
+        "projection_id": "`projection_id` bigint unsigned DEFAULT NULL",
+        "source_hash": "`source_hash` char(64) DEFAULT NULL",
+        "consent_snapshot_json": "`consent_snapshot_json` json DEFAULT NULL",
+        "source_revision_json": "`source_revision_json` json DEFAULT NULL",
+        "updated_at": "`updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP",
+    },
+    "ai_search_snapshot": {
+        "result_total": "`result_total` int unsigned NOT NULL DEFAULT '0'",
+        "degraded": "`degraded` tinyint NOT NULL DEFAULT '0'",
+    },
+    "ai_search_draft": {
+        "last_patch_idempotency_key": "`last_patch_idempotency_key` varchar(128) DEFAULT NULL",
+        "last_patch_request_digest": "`last_patch_request_digest` char(64) DEFAULT NULL",
+        "last_patch_response_json": "`last_patch_response_json` json DEFAULT NULL",
+    },
+    "ai_compatibility_snapshot": {
+        "source_revision_pair_json": "`source_revision_pair_json` json DEFAULT NULL",
+        "consent_snapshot_pair_json": "`consent_snapshot_pair_json` json DEFAULT NULL",
+        "updated_at": "`updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP",
+    },
+}
+
+# Task 10 retention columns are additive so bootstrap can bring an existing
+# phase-two database to a readable shape before the reviewed migration runs.
+AI_TASK10_REQUIRED_COLUMNS: dict[str, dict[str, str]] = {
+    "ai_task": {
+        "owner_tombstone": "`owner_tombstone` char(64) DEFAULT NULL",
+    },
+    "ai_consent_grant": {
+        "user_tombstone": "`user_tombstone` char(64) DEFAULT NULL",
+    },
+}
+
+
+def ensure_ai_legacy_columns(cursor: Any) -> None:
+    """Add Task 2's additive AI columns during legacy bootstrap.
+
+    The reviewed migration owns unique keys, generated columns and retention
+    indexes. This helper only makes old tables accept the new row payloads; it
+    is intentionally idempotent and safe to call after ``CREATE TABLE``.
+    """
+    for table_name, required_columns in AI_LEGACY_REQUIRED_COLUMNS.items():
+        try:
+            cursor.execute(f"SHOW COLUMNS FROM `{table_name}`")
+            existing = {row["Field"] for row in cursor.fetchall()}
+        except Exception:  # noqa: BLE001, S112 - legacy bootstrap is best effort
+            continue
+        for column_name, column_def in required_columns.items():
+            if column_name not in existing:
+                cursor.execute(
+                    f"ALTER TABLE `{table_name}` ADD COLUMN {column_def}"
+                )
+
+    for table_name, required_columns in AI_TASK10_REQUIRED_COLUMNS.items():
+        try:
+            cursor.execute(f"SHOW COLUMNS FROM `{table_name}`")
+            existing = {row["Field"] for row in cursor.fetchall()}
+        except Exception:  # noqa: BLE001, S112 - legacy bootstrap is best effort
+            continue
+        for column_name, column_def in required_columns.items():
+            if column_name not in existing:
+                cursor.execute(
+                    f"ALTER TABLE `{table_name}` ADD COLUMN {column_def}"
+                )
+        if table_name == "ai_task" and "owner_user_id" in existing:
+            cursor.execute(
+                "ALTER TABLE `ai_task` MODIFY COLUMN `owner_user_id` bigint unsigned DEFAULT NULL"
+            )
+        if table_name == "ai_consent_grant" and "user_id" in existing:
+            cursor.execute(
+                "ALTER TABLE `ai_consent_grant` MODIFY COLUMN `user_id` bigint unsigned DEFAULT NULL"
+            )
+            # Defect 47: once user_id is nullable (Task 10), tombstone rows
+            # with user_id=NULL escape the (user_id, scope, version,
+            # granted_at) unique key because SQL NULLs never compare
+            # equal. Add a stored generated column user_id_coalesce =
+            # COALESCE(user_id, 0) and rebuild the unique key on it so
+            # multiple tombstone rows for the same scope/version are
+            # rejected. This is idempotent: it checks information_schema
+            # before adding the column and swaps the key only once.
+            ensure_ai_consent_user_coalesce(cursor)
+
+    try:
+        cursor.execute("SHOW COLUMNS FROM `ai_profile_turn`")
+        profile_turn_columns = {row["Field"] for row in cursor.fetchall()}
+        if "turn_id" in profile_turn_columns:
+            cursor.execute(
+                "UPDATE `ai_profile_turn` "
+                "SET `turn_id` = CONCAT('legacy-turn-', `id`) "
+                "WHERE `turn_id` IS NULL OR `turn_id` = ''"
+            )
+            cursor.execute(
+                "ALTER TABLE `ai_profile_turn` "
+                "MODIFY COLUMN `turn_id` varchar(128) NOT NULL "
+                "COMMENT '稳定的服务端 turn ID'"
+            )
+            cursor.execute(
+                "ALTER TABLE `ai_profile_turn` "
+                "MODIFY COLUMN `client_turn_id` varchar(128) NOT NULL"
+            )
+    except Exception:  # noqa: BLE001 - legacy bootstrap is best effort
+        # The reviewed migration reports and classifies any incompatible data.
+        return
+
+
+def ensure_ai_consent_user_coalesce(cursor: Any) -> None:
+    """Idempotently add the ``user_id_coalesce`` generated column and rebuild
+    the consent unique key on it (Defect 47).
+
+    After Task 10 makes ``ai_consent_grant.user_id`` nullable, tombstone rows
+    (``user_id IS NULL``) are no longer deduplicated by the original
+    ``uk_ai_consent_user_scope_version (user_id, scope, version, granted_at)``
+    key, because SQL ``NULL`` values never compare equal and therefore never
+    violate a UNIQUE constraint. This helper adds a STORED generated column
+    ``user_id_coalesce = COALESCE(user_id, 0)`` and rebuilds the unique key on
+    that column so multiple tombstone rows for the same scope/version are
+    rejected just like real-user rows.
+
+    The operation is idempotent: it inspects ``information_schema`` and only
+    adds the column / swaps the key when they are missing or still reference
+    the raw ``user_id``. It is safe to call from ``ensure_ai_legacy_columns``
+    after the ``user_id`` nullability change.
+    """
+    try:
+        cursor.execute(
+            "SELECT column_name AS column_name FROM information_schema.columns "
+            "WHERE table_schema = DATABASE() AND table_name = 'ai_consent_grant'"
+        )
+        consent_columns = {str(row["column_name"]) for row in cursor.fetchall()}
+    except Exception:  # noqa: BLE001 - legacy bootstrap is best effort
+        return
+    if "user_id" not in consent_columns:
+        return
+
+    if "user_id_coalesce" not in consent_columns:
+        cursor.execute(
+            "ALTER TABLE `ai_consent_grant` "
+            "ADD COLUMN `user_id_coalesce` bigint unsigned "
+            "GENERATED ALWAYS AS (COALESCE(`user_id`, 0)) STORED "
+            "AFTER `user_id`"
+        )
+
+    # Rebuild the unique key on user_id_coalesce if it still references the
+    # raw user_id column (or does not exist yet).
+    try:
+        cursor.execute(
+            "SELECT index_name AS index_name, column_name AS column_name, seq_in_index AS seq_in_index "
+            "FROM information_schema.statistics "
+            "WHERE table_schema = DATABASE() AND table_name = 'ai_consent_grant' "
+            "AND index_name = 'uk_ai_consent_user_scope_version' "
+            "ORDER BY seq_in_index"
+        )
+        key_columns = [
+            str(row["column_name"]) for row in cursor.fetchall()
+        ]
+    except Exception:  # noqa: BLE001 - legacy bootstrap is best effort
+        return
+
+    needs_rebuild = not key_columns or key_columns[0] != "user_id_coalesce"
+    if needs_rebuild:
+        if key_columns:
+            cursor.execute(
+                "ALTER TABLE `ai_consent_grant` DROP INDEX `uk_ai_consent_user_scope_version`"
+            )
+        cursor.execute(
+            "ALTER TABLE `ai_consent_grant` "
+            "ADD UNIQUE KEY `uk_ai_consent_user_scope_version` "
+            "(`user_id_coalesce`, `scope`, `version`, `granted_at`)"
+        )

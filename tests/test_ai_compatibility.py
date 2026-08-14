@@ -31,14 +31,14 @@ from app.api.dependencies import CurrentUser, get_current_user
 from app.core.config import settings
 from app.db.session import get_db
 from app.main import app
+from app.schemas.ai_common import ProjectionKind
 from app.schemas.ai_compatibility import (
     CompatibilitySnapshotStatus,
 )
-from app.schemas.ai_common import ProjectionKind
 from app.services.ai.compatibility import (
-    COMPATIBILITY_RULES,
     COMPATIBILITY_ALGORITHM_VERSION,
     COMPATIBILITY_CONSENT_SCOPE,
+    COMPATIBILITY_RULES,
     DISCLAIMER,
     CandidateNotVisible,
     CompatibilityResultStale,
@@ -366,7 +366,12 @@ class CompatibilityStore:
             "privacy_revision": revision.privacy,
             "relationship_revision": revision.relationship,
             "policy_revision": revision.policy,
-            "consent_snapshot_json": {"scope": "profile_text_extract"},
+            "consent_snapshot_json": {
+                "scope": "profile_text_extract",
+                "version": "profile-text-v1",
+                "policy_revision": "ai-policy-2026-08-07-v1",
+                "granted_at": "2026-01-01T00:00:00",
+            },
             "visibility_class": "self_only" if kind == "ideal_partner_preference" else "searchable",
             "status": status,
             "invalidated_at": None,
@@ -395,10 +400,20 @@ class CompatibilityStore:
         result = compute_compatibility(viewer_fs, target_fs, COMPATIBILITY_RULES)
         result = with_evidence_codes(result, viewer_fs, target_fs, COMPATIBILITY_RULES)
         consent = {
-            "scope": COMPATIBILITY_CONSENT_SCOPE,
-            "version": "compatibility-shadow-v1",
-            "policy_revision": "ai-policy-2026-08-07-v1",
-            "granted_at": _now(),
+            "viewer": {
+                "scope": COMPATIBILITY_CONSENT_SCOPE,
+                "version": "compatibility-shadow-v1",
+                "policy_revision": "ai-policy-2026-08-07-v1",
+                "granted_at": datetime(2026, 1, 1),
+                "revoked_at": None,
+            },
+            "target": {
+                "scope": COMPATIBILITY_CONSENT_SCOPE,
+                "version": "compatibility-shadow-v1",
+                "policy_revision": "ai-policy-2026-08-07-v1",
+                "granted_at": datetime(2026, 1, 1),
+                "revoked_at": None,
+            },
         }
         return await write_shadow_snapshot(
             db,
@@ -488,7 +503,10 @@ class CompatibilityStore:
             },
             revision=target_rev,
         )
+        self.seed_consent(10, "profile_text_extract")
+        self.seed_consent(42, "profile_text_extract")
         self.seed_consent(10, COMPATIBILITY_CONSENT_SCOPE)
+        self.seed_consent(42, COMPATIBILITY_CONSENT_SCOPE)
         self.seed_legacy_card(10, 42)
 
     def seed_consent(self, user_id: int, scope: str) -> None:
@@ -496,9 +514,13 @@ class CompatibilityStore:
             {
                 "user_id": int(user_id),
                 "scope": scope,
-                "version": "compatibility-shadow-v1",
+                "version": (
+                    "profile-text-v1"
+                    if scope == "profile_text_extract"
+                    else "compatibility-shadow-v1"
+                ),
                 "policy_revision": "ai-policy-2026-08-07-v1",
-                "granted_at": _now() - timedelta(days=1),
+                "granted_at": datetime(2026, 1, 1),
             }
         )
 
@@ -531,6 +553,40 @@ class CompatibilityStore:
             "evidence_json": json.dumps([]),
             "profile_revision_pair_json": json.dumps({"viewer": 3, "target": 5}),
             "privacy_revision_pair_json": json.dumps({"viewer": 1, "target": 2}),
+            "source_revision_pair_json": json.dumps(
+                {
+                    "viewer": {
+                        "profile": 3,
+                        "preference": 2,
+                        "privacy": 1,
+                        "relationship": 0,
+                        "policy": 1,
+                    },
+                    "target": {
+                        "profile": 5,
+                        "preference": 4,
+                        "privacy": 2,
+                        "relationship": 0,
+                        "policy": 1,
+                    },
+                }
+            ),
+            "consent_snapshot_pair_json": json.dumps(
+                {
+                    "viewer": {
+                        "scope": COMPATIBILITY_CONSENT_SCOPE,
+                        "version": "compatibility-shadow-v1",
+                        "policy_revision": "ai-policy-2026-08-07-v1",
+                        "granted_at": "2026-01-01T00:00:00",
+                    },
+                    "target": {
+                        "scope": COMPATIBILITY_CONSENT_SCOPE,
+                        "version": "compatibility-shadow-v1",
+                        "policy_revision": "ai-policy-2026-08-07-v1",
+                        "granted_at": "2026-01-01T00:00:00",
+                    },
+                }
+            ),
             "experiment_bucket": "shadow",
             "display_eligible": 0,
             "disclaimer": DISCLAIMER,
@@ -573,6 +629,8 @@ class CompatibilityStore:
             "evidence_json": params.get("evidence_json"),
             "profile_revision_pair_json": params.get("profile_revision_pair_json"),
             "privacy_revision_pair_json": params.get("privacy_revision_pair_json"),
+            "source_revision_pair_json": params.get("source_revision_pair_json"),
+            "consent_snapshot_pair_json": params.get("consent_snapshot_pair_json"),
             "experiment_bucket": str(params["experiment_bucket"]),
             "display_eligible": int(params["display_eligible"] or 0),
             "disclaimer": params.get("disclaimer"),
@@ -734,6 +792,7 @@ class CompatibilityFakeSession:
                 for row in store.consents
                 if int(row["user_id"]) == int(values["user_id"])
                 and row["scope"] == str(values["scope"])
+                and row.get("revoked_at") is None
             ]
             return _MappingResult(matches)
         if "FROM user_match_recommend" in sql:
@@ -780,10 +839,18 @@ async def test_write_shadow_persists_compatibility_rule_v1_shadow_snapshot(
     viewer_rev = compatibility_store.revision_rows[10]
     target_rev = compatibility_store.revision_rows[42]
     consent = {
-        "scope": COMPATIBILITY_CONSENT_SCOPE,
-        "version": "compatibility-shadow-v1",
-        "policy_revision": "ai-policy-2026-08-07-v1",
-        "granted_at": _now(),
+        "viewer": {
+            "scope": COMPATIBILITY_CONSENT_SCOPE,
+            "version": "compatibility-shadow-v1",
+            "policy_revision": "ai-policy-2026-08-07-v1",
+            "granted_at": datetime(2026, 1, 1),
+        },
+        "target": {
+            "scope": COMPATIBILITY_CONSENT_SCOPE,
+            "version": "compatibility-shadow-v1",
+            "policy_revision": "ai-policy-2026-08-07-v1",
+            "granted_at": datetime(2026, 1, 1),
+        },
     }
     viewer_fs, target_fs = await load_compatibility_features(
         compat_db, 10, 42
@@ -810,6 +877,12 @@ async def test_write_shadow_persists_compatibility_rule_v1_shadow_snapshot(
     assert float(row["coverage"]) == 1.0
     assert json.loads(row["profile_revision_pair_json"]) == {"viewer": 3, "target": 5}
     assert json.loads(row["privacy_revision_pair_json"]) == {"viewer": 1, "target": 2}
+    source_pair = json.loads(row["source_revision_pair_json"])
+    assert source_pair["viewer"] == viewer_rev.as_dict()
+    assert source_pair["target"] == target_rev.as_dict()
+    consent_pair = json.loads(row["consent_snapshot_pair_json"])
+    assert consent_pair["viewer"]["scope"] == COMPATIBILITY_CONSENT_SCOPE
+    assert consent_pair["target"]["scope"] == COMPATIBILITY_CONSENT_SCOPE
     # 原因码含相互满足的稳定码，且每条都有 evidence_refs。
     reason_codes = json.loads(row["reason_codes"])
     assert "AGE_MUTUAL_WITHIN_RANGE" in reason_codes
@@ -817,6 +890,20 @@ async def test_write_shadow_persists_compatibility_rule_v1_shadow_snapshot(
     evidence = json.loads(row["evidence_json"])
     assert {item["reason_code"] for item in evidence} == set(reason_codes)
     assert evidence[0]["source_revisions"]["viewer"]["profile"] == 3
+
+    # 同一 pair/hash 的重算必须返回并持久化本次请求的 snapshot_id，不能返回
+    # 一个未落库的新 ID。
+    repeated_id = await write_shadow_snapshot(
+        compat_db,
+        10,
+        42,
+        result,
+        (viewer_rev, target_rev),
+        consent,
+        snapshot_id="cp_repeated",
+    )
+    assert repeated_id == "cp_repeated"
+    assert compatibility_store.snapshots[0]["snapshot_id"] == "cp_repeated"
 
 
 @pytest.mark.asyncio
@@ -844,21 +931,29 @@ async def test_read_compatibility_denies_hidden_candidate_with_404_code(
 
 
 @pytest.mark.asyncio
-async def test_read_compatibility_marks_stale_on_revision_change(
+async def test_read_compatibility_marks_stale_and_persists_on_revision_change(
     compatibility_store: CompatibilityStore,
     compat_db: CompatibilityFakeSession,
 ) -> None:
+    """读取路径在 revision 变化时必须落库标记 stale（审查 I-1 修复）。
+
+    修复前 ``_mark_snapshot_stale`` 的 UPDATE 随 ``get_db`` 关闭被回滚，store
+    里快照仍为 ``ready``。修复后读路径真正落库：快照在存储里变为 ``stale``，
+    这才是"读取时落库标记 stale"的正确语义。
+    """
     compatibility_store.seed_snapshot()
-    # 目标 profile revision 已推进：旧快照必须标 stale，不能当最新解释。
+    # 目标 profile revision 已推进：旧快照必须落库标 stale，不能当最新解释。
     compatibility_store.revision_rows[42] = RevisionVector(
         profile=6, preference=4, privacy=2, relationship=0, policy=1
     )
     result = await read_compatibility_snapshot(compat_db, 10, 42)
     assert result.status == CompatibilitySnapshotStatus.STALE
+    # 修复后读路径真正落库标记 stale，store 里快照状态变为 stale。
     assert compatibility_store.snapshots[0]["status"] == "stale"
+    assert compatibility_store.snapshots[0]["invalidated_at"] is not None
 
 
-def test_get_route_commits_stale_marking(
+def test_get_route_commits_stale_marking_for_stale_snapshot(
     monkeypatch: pytest.MonkeyPatch, compatibility_store: CompatibilityStore
 ) -> None:
     """GET 路由必须 commit：读取路径的 stale 落库标记才会真实持久化（审查 I-1）。
@@ -919,6 +1014,34 @@ async def test_read_compatibility_returns_ready_when_current(
     assert result.disclaimer == DISCLAIMER
     assert result.directions is not None
     assert result.directions.viewer_to_target == 82.0
+
+
+@pytest.mark.asyncio
+async def test_read_compatibility_blocks_when_target_consent_is_revoked(
+    compatibility_store: CompatibilityStore,
+    compat_db: CompatibilityFakeSession,
+) -> None:
+    compatibility_store.seed_snapshot()
+    for consent in compatibility_store.consents:
+        if consent["user_id"] == 42 and consent["scope"] == COMPATIBILITY_CONSENT_SCOPE:
+            consent["revoked_at"] = _now()
+    result = await read_compatibility_snapshot(compat_db, 10, 42)
+    assert result.status == CompatibilitySnapshotStatus.BLOCKED
+    assert compatibility_store.snapshots[0]["status"] == "ready"
+
+
+@pytest.mark.asyncio
+async def test_read_compatibility_blocks_when_projection_consent_is_revoked(
+    compatibility_store: CompatibilityStore,
+    compat_db: CompatibilityFakeSession,
+) -> None:
+    compatibility_store.seed_snapshot()
+    for consent in compatibility_store.consents:
+        if consent["user_id"] == 42 and consent["scope"] == "profile_text_extract":
+            consent["revoked_at"] = _now()
+    result = await read_compatibility_snapshot(compat_db, 10, 42)
+    assert result.status == CompatibilitySnapshotStatus.BLOCKED
+    assert compatibility_store.snapshots[0]["status"] == "ready"
 
 
 @pytest.mark.asyncio

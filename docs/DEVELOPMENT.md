@@ -171,6 +171,34 @@ $env:DOCS_ENABLED = "false"
 uv run uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
+### 10.6 AI 一期真实依赖验收环境（Task 1）
+
+`compose.ai-test.yml` 只用于一期集成测试，不连接本地开发库。它启动 MySQL 8、Redis 7 以及两个独立的 AI Worker 进程：
+
+```powershell
+docker compose -f compose.ai-test.yml up -d mysql redis worker-a worker-b
+docker compose -f compose.ai-test.yml ps
+```
+
+默认映射到 `127.0.0.1:3307`（MySQL）和 `127.0.0.1:6380`（Redis），数据库为 `xuanshiai_ai_test`，root 空密码只在这个临时测试服务中启用。可以用 `AI_TEST_MYSQL_DATABASE`、`AI_TEST_MYSQL_PORT` 和 `AI_TEST_REDIS_PORT` 覆盖默认值。
+
+启动服务后，测试 fixture 会运行现有 `database_setup_marriage.initialize_database()`，然后从真实 MySQL 读取 `information_schema` 并启动真实子进程：
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests/integration/ai/test_ai_schema_real_db.py -q
+.\.venv\Scripts\python.exe -m pytest tests/integration/ai/test_ai_worker_real_db.py -q
+```
+
+测试不在依赖不可用时跳过；连接失败、bootstrap 失败和真实 schema/Worker 合约失败都必须显式暴露。Task 1 的初始 P0 已在 Task 2 收口：补齐 `ai_profile_turn`、`ai_search_result`、projection/session 生命周期字段，active-session 历史唯一约束已兼容；真实 bootstrap、schema、迁移和双 Worker 验收由 `tests/integration/ai/` 覆盖。
+
+停止并清理这组专用服务和测试卷：
+
+```powershell
+docker compose -f compose.ai-test.yml down -v --remove-orphans
+```
+
+如果服务停在 `Created` 或健康检查异常，先执行 `docker compose -f compose.ai-test.yml ps --all` 和 `docker compose -f compose.ai-test.yml logs mysql redis worker-a worker-b`；确认只涉及 `xuanshiai-ai-test-*` 后，再执行上面的 `down -v` 重新建立干净的测试卷。
+
 ## 五、测试与代码检查
 
 运行全部测试：

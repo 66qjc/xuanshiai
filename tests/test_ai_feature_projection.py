@@ -29,7 +29,9 @@ from app.services.ai.features import (
 )
 from app.services.derivation_outbox import (
     CLEANUP_HANDLERS,
+    CleanupSubjectInvalid,
     run_cleanup_consumer_round,
+    run_cleanup_for_user,
 )
 from app.services.revisions import RevisionVector
 
@@ -174,7 +176,16 @@ class ProjectionStore:
         event_type: str = "ai_profile_field_deleted",
         source_revision: RevisionVector,
         priority: int = 40,
+        subject: str | None = "personal",
+        field_key: str | None = "interest_tags",
     ) -> dict[str, Any]:
+        payload: dict[str, Any] | None = None
+        if subject is not None or field_key is not None:
+            payload = {}
+            if subject is not None:
+                payload["subject"] = subject
+            if field_key is not None:
+                payload["field_key"] = field_key
         return {
             "event_id": event_id,
             "aggregate_type": "user",
@@ -187,6 +198,9 @@ class ProjectionStore:
             "occurred_at": _now(),
             "priority": priority,
             "lease_until": None,
+            "payload_minimal": (
+                json.dumps(payload, ensure_ascii=False) if payload else None
+            ),
         }
 
     def seed_search_result(self, target_user_id: int = 10) -> dict[str, Any]:
@@ -387,6 +401,12 @@ class ProjectionFakeSession:
         values = dict(params or {})
         self.calls.append((sql, values))
         store = self.store
+        if "FROM ai_profile_revision" in sql and "WHERE r.id = :revision_id" in sql:
+            revision = store.revisions.get(int(values["revision_id"]))
+            if revision is None or revision["user_id"] != int(values["user_id"]) \
+                or revision["subject"] != str(values["subject"]):
+                return _MappingResult([])
+            return _MappingResult([revision])
         if "FROM ai_profile_revision" in sql and "ORDER BY r.revision_no" in sql:
             return _MappingResult(
                 [store.latest_revision(int(values["user_id"]), str(values["subject"]))]
@@ -419,6 +439,8 @@ class ProjectionFakeSession:
             return _WriteResult(rowcount=store.mark_compat_stale(int(values["user_id"])))
         if "UPDATE derivation_outbox" in sql:
             return _WriteResult(rowcount=1)
+        if "UPDATE derivation_consumer_receipt" in sql:
+            return _WriteResult(rowcount=1)
         if "derivation_consumer_receipt" in sql and "INSERT" in sql:
             receipt = (str(values["event_id"]), str(values["consumer_name"]))
             if receipt in store.receipts:
@@ -428,10 +450,44 @@ class ProjectionFakeSession:
         if "FROM derivation_outbox" in sql and "LEFT JOIN derivation_consumer_receipt" in sql:
             rows = store.outbox_rows if hasattr(store, "outbox_rows") else []
             return _MappingResult(rows)
+        if "DELETE" in sql or "UPDATE ai_profile_" in sql:
+            # purge_ai_resources 的物理清理语句：投影测试不追踪这些表的行级
+            # 变化，按 no-op 返回即可（无效化语义由上面的 UPDATE 路径覆盖）。
+            return _WriteResult(rowcount=1)
+        if "SELECT draft_id FROM ai_search_snapshot" in sql:
+            return _MappingResult([])
         raise AssertionError(f"unhandled sql: {sql}")
 
     async def commit(self) -> None:
         self.commits += 1
+
+    async def rollback(self) -> None:
+        # 独立事务消费失败时回滚：fake session 直改 store，无挂起写入需撤销。
+        pass
+
+    async def __aenter__(self) -> "ProjectionFakeSession":
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        # 与真实 session_factory() 一致：退出上下文即关闭（这里无连接需释放）。
+        return None
+
+
+def _patch_session_factory(monkeypatch: pytest.MonkeyPatch, store: ProjectionStore) -> None:
+    """Patch ``app.db.session.session_factory`` so the per-event independent
+    transaction (``_consume_one_independent``) opens a fake session backed by
+    the same in-memory store instead of a real DB connection.
+
+    The factory returns a fresh ``ProjectionFakeSession`` on each call — mirroring
+    the real ``async_sessionmaker`` semantics — but all sessions share the store,
+    so the consumer's reads/writes land in the same fixture state the test asserts.
+    """
+    from app.db import session as session_module
+
+    def _fake_factory() -> ProjectionFakeSession:
+        return ProjectionFakeSession(store)
+
+    monkeypatch.setattr(session_module, "session_factory", _fake_factory)
 
 
 @pytest.fixture
@@ -606,6 +662,42 @@ async def test_build_feature_projection_ideal_partner_is_self_only(
     assert projection.visibility_class == ProjectionVisibility.SELF_ONLY
     # self_only 投影绝不能作为候选资料返回（由可见性类强制，读路径不得放行）。
     assert projection.visibility_class is not ProjectionVisibility.SEARCHABLE
+
+
+@pytest.mark.asyncio
+async def test_build_feature_projection_uses_pinned_revision_and_consent_snapshot(
+    store: ProjectionStore, db: ProjectionFakeSession
+) -> None:
+    first_id = store.seed_revision(
+        user_id=10, subject="personal", revision_no=1, revision_id=11,
+        source_revision=RevisionVector(profile=1)
+    )
+    store.seed_revision_field(first_id, "interest_tags", ["旅行"], subject="personal")
+    second_id = store.seed_revision(
+        user_id=10, subject="personal", revision_no=2, revision_id=12,
+        source_revision=RevisionVector(profile=2)
+    )
+    store.seed_revision_field(second_id, "interest_tags", ["音乐"], subject="personal")
+    store.seed_consent(10)
+    pinned_consent = {
+        "scope": "profile_text_extract",
+        "version": "profile-text-v1",
+        "policy_revision": "ai-policy-2026-08-07-v1",
+        "granted_at": store.consents[-1]["granted_at"].isoformat(),
+    }
+
+    projection = await build_feature_projection(
+        db,
+        10,
+        ProjectionKind.PERSONAL_SEARCHABLE,
+        RevisionVector(profile=1),
+        published_revision_id=first_id,
+        consent_snapshot=pinned_consent,
+    )
+
+    assert projection.fields == {"interest_tags": ["旅行"]}
+    assert projection.source_revision == RevisionVector(profile=1)
+    assert projection.consent_snapshot == pinned_consent
 
 
 @pytest.mark.asyncio
@@ -793,7 +885,25 @@ def test_cleanup_handlers_are_real_invalidation_consumers() -> None:
 
 
 @pytest.mark.asyncio
+async def test_cleanup_requires_subject_and_never_falls_back_to_all_projections(
+    db: ProjectionFakeSession,
+) -> None:
+    with pytest.raises(CleanupSubjectInvalid):
+        await run_cleanup_for_user(
+            db, 10, "ai_profile_deleted", RevisionVector(profile=1), subject=None
+        )
+
+    with pytest.raises(CleanupSubjectInvalid):
+        await run_cleanup_for_user(
+            db, 10, "ai_profile_deleted", RevisionVector(profile=1), subject="unknown"
+        )
+
+    assert db.calls == []
+
+
+@pytest.mark.asyncio
 async def test_cleanup_consumer_supersedes_stale_events(
+    monkeypatch: pytest.MonkeyPatch,
     store: ProjectionStore, db: ProjectionFakeSession
 ) -> None:
     # 投影已按 profile=2 构建；删除事件记录的是更早的 profile=1。
@@ -815,6 +925,10 @@ async def test_cleanup_consumer_supersedes_stale_events(
         )
     ]
 
+    # 每事件独立事务消费：_consume_one_independent 通过 session_factory() 开
+    # 新 session，patch 成复用同一 store 的 fake session。
+    _patch_session_factory(monkeypatch, store)
+
     stats = await run_cleanup_consumer_round(
         db, "worker-1", now=_now(), limit=10
     )
@@ -829,6 +943,7 @@ async def test_cleanup_consumer_supersedes_stale_events(
 
 @pytest.mark.asyncio
 async def test_cleanup_consumer_applies_current_events_and_invalidates(
+    monkeypatch: pytest.MonkeyPatch,
     store: ProjectionStore, db: ProjectionFakeSession
 ) -> None:
     store.seed_projection(
@@ -851,6 +966,8 @@ async def test_cleanup_consumer_applies_current_events_and_invalidates(
         )
     ]
 
+    _patch_session_factory(monkeypatch, store)
+
     stats = await run_cleanup_consumer_round(
         db, "worker-1", now=_now(), limit=10
     )
@@ -867,6 +984,7 @@ async def test_cleanup_consumer_applies_current_events_and_invalidates(
 
 @pytest.mark.asyncio
 async def test_cleanup_consumer_duplicate_receipt_is_intercepted(
+    monkeypatch: pytest.MonkeyPatch,
     store: ProjectionStore, db: ProjectionFakeSession
 ) -> None:
     store.revision_row = {
@@ -884,6 +1002,8 @@ async def test_cleanup_consumer_duplicate_receipt_is_intercepted(
         )
     ]
     store.receipts.append(("evt-dup", "cleanup"))
+
+    _patch_session_factory(monkeypatch, store)
 
     stats = await run_cleanup_consumer_round(
         db, "worker-1", now=_now(), limit=10

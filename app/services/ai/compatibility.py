@@ -40,12 +40,12 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.schemas.ai_common import ProjectionKind
 from app.schemas.ai_compatibility import (
     CompatibilityDirectionScores,
     CompatibilitySnapshotRead,
     CompatibilitySnapshotStatus,
 )
-from app.schemas.ai_common import ProjectionKind
 from app.services.ai.tasks import (
     AiTaskRecord,
     enqueue_task,
@@ -70,6 +70,7 @@ COMPATIBILITY_EXPERIMENT_BUCKET = "shadow"
 COMPATIBILITY_CONSENT_SCOPE = "compatibility_shadow"
 COMPATIBILITY_POLICY_REVISION = "ai-policy-2026-08-07-v1"
 COMPATIBILITY_TASK_TYPE = "compatibility"
+PROJECTION_CONSENT_SCOPE = "profile_text_extract"
 DISCLAIMER = "仅根据双方当前可见且已确认资料整理，供了解和破冰参考"
 # 双方方向 coverage 均达 0.50 才允许生成可比较 shadow score（§9.2）。
 COVERAGE_THRESHOLD = 0.50
@@ -475,7 +476,7 @@ def compute_compatibility(
     first, first_coverage, first_reasons = directional_score(viewer, target, rules)
     second, second_coverage, second_reasons = directional_score(target, viewer, rules)
     coverage = min(first_coverage, second_coverage)
-    if first is None or second is None or coverage < 0.5:
+    if first is None or second is None or coverage < COVERAGE_THRESHOLD:
         return CompatibilityResult.blocked(
             coverage=coverage,
             reason_codes=tuple(sorted(set(first_reasons + second_reasons + ("COVERAGE_INSUFFICIENT",)))),
@@ -596,17 +597,78 @@ def _is_expired(expires_at: datetime | None) -> bool:
 
 
 def _consent_snapshot(consent: dict[str, Any] | None) -> dict[str, Any]:
+    return _consent_snapshot_for_scope(consent, COMPATIBILITY_CONSENT_SCOPE)
+
+
+def _consent_snapshot_for_scope(
+    consent: dict[str, Any] | None, default_scope: str
+) -> dict[str, Any]:
     if not consent:
         return {}
     granted_at = consent.get("granted_at")
+    if hasattr(granted_at, "isoformat"):
+        granted_at = granted_at.isoformat()
     return {
-        "scope": str(consent.get("scope") or COMPATIBILITY_CONSENT_SCOPE),
+        "scope": str(consent.get("scope") or default_scope),
         "version": str(consent.get("version") or ""),
-        "policy_revision": str(
-            consent.get("policy_revision") or COMPATIBILITY_POLICY_REVISION
-        ),
-        "granted_at": granted_at.isoformat() if granted_at else None,
+        "policy_revision": str(consent.get("policy_revision") or ""),
+        "granted_at": granted_at,
     }
+
+
+def _normalize_consent_pair(consent: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
+    if not consent:
+        return {"viewer": {}, "target": {}}
+    viewer = consent.get("viewer") if isinstance(consent.get("viewer"), dict) else None
+    target = consent.get("target") if isinstance(consent.get("target"), dict) else None
+    if viewer is not None or target is not None:
+        return {
+            "viewer": _consent_snapshot(viewer or {}),
+            "target": _consent_snapshot(target or {}),
+        }
+    # Low-level shadow writers historically accepted one consent snapshot. The
+    # worker/recompute path always supplies both sides; a missing target remains
+    # unreadable until a dual-consent snapshot is written.
+    logger.debug(
+        "_normalize_consent_pair single-side downgrade: consent has no "
+        "viewer/target pair, using viewer-only snapshot (compatibility path "
+        "only; new code must pass a dual-side restructured consent)"
+    )
+    return {"viewer": _consent_snapshot(consent), "target": {}}
+
+
+def _consent_snapshot_matches(
+    stored: dict[str, Any] | None, current: dict[str, Any] | None
+) -> bool:
+    if not stored or not current:
+        return False
+    stored_snapshot = {
+        "scope": str(stored.get("scope") or ""),
+        "version": str(stored.get("version") or ""),
+        "policy_revision": str(stored.get("policy_revision") or ""),
+        "granted_at": str(stored.get("granted_at") or ""),
+    }
+    current_snapshot = {
+        "scope": str(current.get("scope") or ""),
+        "version": str(current.get("version") or ""),
+        "policy_revision": str(current.get("policy_revision") or ""),
+        "granted_at": str(current.get("granted_at") or ""),
+    }
+    return stored_snapshot == current_snapshot
+
+
+async def _pair_consents_current(
+    db: AsyncSession,
+    viewer_id: int,
+    target_id: int,
+    stored_pair: dict[str, Any] | None,
+) -> bool:
+    pair = _normalize_consent_pair(stored_pair)
+    viewer = await _load_active_consent(db, viewer_id, COMPATIBILITY_CONSENT_SCOPE)
+    target = await _load_active_consent(db, target_id, COMPATIBILITY_CONSENT_SCOPE)
+    return _consent_snapshot_matches(
+        pair.get("viewer"), _consent_snapshot(viewer)
+    ) and _consent_snapshot_matches(pair.get("target"), _consent_snapshot(target))
 
 
 async def _first_row(result: Any) -> dict[str, Any] | None:
@@ -668,13 +730,9 @@ def _snapshot_hash(
                 list(result.directions) if result.pair_score is not None else None
             ),
             "reason_codes": list(result.reason_codes),
-            "profile_revision_pair": {
-                "viewer": viewer_rev.profile,
-                "target": target_rev.profile,
-            },
-            "privacy_revision_pair": {
-                "viewer": viewer_rev.privacy,
-                "target": target_rev.privacy,
+            "source_revision_pair": {
+                "viewer": viewer_rev.as_dict(),
+                "target": target_rev.as_dict(),
             },
         },
         ensure_ascii=False,
@@ -689,10 +747,10 @@ async def _load_projection_rows(
 ) -> list[dict[str, Any]]:
     result = await db.execute(
         text(
-            "SELECT subject_user_id, projection_kind, fields_json, "
+            "SELECT id, subject_user_id, projection_kind, fields_json, source_hash, "
             "source_revision_json, profile_revision, preference_revision, "
             "privacy_revision, relationship_revision, policy_revision, "
-            "status, expires_at "
+            "consent_snapshot_json, status, expires_at "
             "FROM ai_feature_projection "
             "WHERE subject_user_id IN (:uid_viewer, :uid_target) "
             "AND projection_kind IN ('personal_compatibility', "
@@ -704,6 +762,55 @@ async def _load_projection_rows(
     return list(result.mappings().all())
 
 
+async def _load_current_projection_rows(
+    db: AsyncSession, viewer_id: int, target_id: int
+) -> list[dict[str, Any]]:
+    rows = await _load_projection_rows(db, viewer_id, target_id)
+    revision_cache: dict[int, RevisionVector] = {}
+    consent_cache: dict[tuple[int, str], dict[str, Any] | None] = {}
+    current: list[dict[str, Any]] = []
+    for row in rows:
+        user_id = int(row["subject_user_id"])
+        if _is_expired(row.get("expires_at")):
+            continue
+        if user_id not in revision_cache:
+            revision_cache[user_id] = await _load_revision_vector(db, user_id)
+        stored_revision = _maybe_json(row.get("source_revision_json"))
+        if not isinstance(stored_revision, dict):
+            stored_revision = {
+                "profile": int(row.get("profile_revision") or 0),
+                "preference": int(row.get("preference_revision") or 0),
+                "privacy": int(row.get("privacy_revision") or 0),
+                "relationship": int(row.get("relationship_revision") or 0),
+                "policy": int(row.get("policy_revision") or 0),
+            }
+        if stored_revision != revision_cache[user_id].as_dict():
+            continue
+        stored_consent = _maybe_json(row.get("consent_snapshot_json"))
+        if not isinstance(stored_consent, dict):
+            continue
+        scope = str(stored_consent.get("scope") or "")
+        if scope != PROJECTION_CONSENT_SCOPE:
+            continue
+        cache_key = (user_id, scope)
+        if cache_key not in consent_cache:
+            consent_cache[cache_key] = await _load_active_consent(db, user_id, scope)
+        active_snapshot = _consent_snapshot_for_scope(
+            consent_cache[cache_key], scope
+        )
+        if not _consent_snapshot_matches(stored_consent, active_snapshot):
+            continue
+        current.append(dict(row))
+    # A user can have historical projections for the same kind. Only the
+    # newest current projection is an eligible compatibility input.
+    latest: dict[tuple[int, str], dict[str, Any]] = {}
+    for row in current:
+        key = (int(row["subject_user_id"]), str(row["projection_kind"]))
+        if key not in latest or int(row.get("id") or 0) > int(latest[key].get("id") or 0):
+            latest[key] = row
+    return list(latest.values())
+
+
 async def load_compatibility_features(
     db: AsyncSession, viewer_id: int, target_id: int
 ) -> tuple[FeatureSet, FeatureSet]:
@@ -713,7 +820,7 @@ async def load_compatibility_features(
     （preference）；target 同理。缺投影/未激活时对应字段为空 dict，由规则引擎
     记 DIMENSION_UNKNOWN/coverage_insufficient。
     """
-    rows = await _load_projection_rows(db, viewer_id, target_id)
+    rows = await _load_current_projection_rows(db, viewer_id, target_id)
     by_user_kind: dict[tuple[int, str], dict[str, Any]] = {}
     for row in rows:
         by_user_kind[(int(row["subject_user_id"]), str(row["projection_kind"]))] = row
@@ -746,15 +853,20 @@ async def compute_and_write_shadow(
     target_id: int,
     revisions: tuple[RevisionVector, RevisionVector],
     consent: dict[str, Any] | None,
+    snapshot_id: str | None = None,
 ) -> str:
     """加载投影 → 计算双向规则 → 并入证据码 → 写 shadow 快照。"""
+    if not await _pair_consents_current(
+        db, viewer_id, target_id, _normalize_consent_pair(consent)
+    ):
+        raise CompatibilityConsentRequired()
     viewer_fs, target_fs = await load_compatibility_features(db, viewer_id, target_id)
     result = compute_compatibility(viewer_fs, target_fs, COMPATIBILITY_RULES)
     result = with_evidence_codes(
         result, viewer_fs, target_fs, COMPATIBILITY_RULES
     )
     return await write_shadow_snapshot(
-        db, viewer_id, target_id, result, revisions, consent
+        db, viewer_id, target_id, result, revisions, consent, snapshot_id=snapshot_id
     )
 
 
@@ -766,7 +878,8 @@ _SNAPSHOT_INSERT_COLUMNS = (
     "snapshot_id, viewer_user_id, target_user_id, algorithm_version, snapshot_hash, "
     "status, score_semantics, compatibility_index, coverage, direction_json, "
     "reason_codes, evidence_json, profile_revision_pair_json, "
-    "privacy_revision_pair_json, experiment_bucket, display_eligible, disclaimer, "
+    "privacy_revision_pair_json, source_revision_pair_json, "
+    "consent_snapshot_pair_json, experiment_bucket, display_eligible, disclaimer, "
     "calculated_at, expires_at, created_at"
 )
 
@@ -791,6 +904,9 @@ async def write_shadow_snapshot(
     if int(viewer_id) == int(target_id):
         raise CompatibilityInputInvalid("不能与自己计算资料合拍参考")
     viewer_rev, target_rev = revisions
+    consent_pair = _normalize_consent_pair(consent)
+    if not consent_pair["viewer"] or not consent_pair["target"]:
+        raise CompatibilityConsentRequired()
     if snapshot_id is None:
         snapshot_id = f"cp_{uuid.uuid4().hex}"
     evidence_refs = build_compatibility_evidence(result)
@@ -818,9 +934,11 @@ async def write_shadow_snapshot(
             " :algorithm_version, :snapshot_hash, :status, :score_semantics, "
             " :compatibility_index, :coverage, :direction_json, :reason_codes, "
             " :evidence_json, :profile_revision_pair_json, "
-            " :privacy_revision_pair_json, :experiment_bucket, :display_eligible, "
+            " :privacy_revision_pair_json, :source_revision_pair_json, "
+            " :consent_snapshot_pair_json, :experiment_bucket, :display_eligible, "
             " :disclaimer, UTC_TIMESTAMP(), :expires_at, UTC_TIMESTAMP()) "
             "ON DUPLICATE KEY UPDATE "
+            " snapshot_id = VALUES(snapshot_id), "
             " status = VALUES(status), "
             " compatibility_index = VALUES(compatibility_index), "
             " coverage = VALUES(coverage), direction_json = VALUES(direction_json), "
@@ -828,6 +946,8 @@ async def write_shadow_snapshot(
             " evidence_json = VALUES(evidence_json), "
             " profile_revision_pair_json = VALUES(profile_revision_pair_json), "
             " privacy_revision_pair_json = VALUES(privacy_revision_pair_json), "
+            " source_revision_pair_json = VALUES(source_revision_pair_json), "
+            " consent_snapshot_pair_json = VALUES(consent_snapshot_pair_json), "
             " calculated_at = VALUES(calculated_at), "
             " expires_at = VALUES(expires_at), "
             " invalidated_at = NULL, purge_after = NULL, "
@@ -860,6 +980,13 @@ async def write_shadow_snapshot(
                 {"viewer": viewer_rev.privacy, "target": target_rev.privacy},
                 ensure_ascii=False,
             ),
+            "source_revision_pair_json": json.dumps(
+                {"viewer": viewer_rev.as_dict(), "target": target_rev.as_dict()},
+                ensure_ascii=False,
+            ),
+            "consent_snapshot_pair_json": json.dumps(
+                consent_pair, ensure_ascii=False
+            ),
             "experiment_bucket": COMPATIBILITY_EXPERIMENT_BUCKET,
             "display_eligible": 0,
             "disclaimer": DISCLAIMER,
@@ -878,7 +1005,8 @@ _SNAPSHOT_READ_COLUMNS = (
     "id, snapshot_id, viewer_user_id, target_user_id, algorithm_version, "
     "snapshot_hash, status, score_semantics, compatibility_index, coverage, "
     "direction_json, reason_codes, evidence_json, profile_revision_pair_json, "
-    "privacy_revision_pair_json, experiment_bucket, display_eligible, disclaimer, "
+    "privacy_revision_pair_json, source_revision_pair_json, "
+    "consent_snapshot_pair_json, experiment_bucket, display_eligible, disclaimer, "
     "calculated_at, expires_at, invalidated_at, created_at"
 )
 
@@ -1012,18 +1140,45 @@ async def read_compatibility_snapshot(
     stored_privacy_pair = _maybe_json(row.get("privacy_revision_pair_json")) or {}
     current_profile_pair = {"viewer": viewer_rev.profile, "target": target_rev.profile}
     current_privacy_pair = {"viewer": viewer_rev.privacy, "target": target_rev.privacy}
+    stored_source_pair = _maybe_json(row.get("source_revision_pair_json")) or {}
+    current_source_pair = {
+        "viewer": viewer_rev.as_dict(),
+        "target": target_rev.as_dict(),
+    }
     stale_by_version = (
-        stored_profile_pair != current_profile_pair
+        stored_source_pair != current_source_pair
+        or stored_profile_pair != current_profile_pair
         or stored_privacy_pair != current_privacy_pair
     )
     stale_by_expiry = _is_expired(row.get("expires_at"))
 
     if stale_by_version or stale_by_expiry:
-        if stored_status != CompatibilitySnapshotStatus.STALE.value:
-            await _mark_snapshot_stale(db, viewer_id, target_user_id)
+        await _mark_snapshot_stale(db, viewer_id, target_user_id)
         return _snapshot_to_read(row, CompatibilitySnapshotStatus.STALE.value)
     if stored_status == CompatibilitySnapshotStatus.STALE.value:
         return _snapshot_to_read(row, CompatibilitySnapshotStatus.STALE.value)
+    if not await _pair_consents_current(
+        db,
+        viewer_id,
+        target_user_id,
+        _maybe_json(row.get("consent_snapshot_pair_json")) or {},
+    ):
+        return _snapshot_to_read(row, CompatibilitySnapshotStatus.BLOCKED.value)
+    current_projection_rows = await _load_current_projection_rows(
+        db, viewer_id, target_user_id
+    )
+    expected_projection_keys = {
+        (int(viewer_id), ProjectionKind.PERSONAL_COMPATIBILITY.value),
+        (int(viewer_id), ProjectionKind.IDEAL_PARTNER_PREFERENCE.value),
+        (int(target_user_id), ProjectionKind.PERSONAL_COMPATIBILITY.value),
+        (int(target_user_id), ProjectionKind.IDEAL_PARTNER_PREFERENCE.value),
+    }
+    current_projection_keys = {
+        (int(item["subject_user_id"]), str(item["projection_kind"]))
+        for item in current_projection_rows
+    }
+    if not expected_projection_keys.issubset(current_projection_keys):
+        return _snapshot_to_read(row, CompatibilitySnapshotStatus.BLOCKED.value)
     return _snapshot_to_read(row, stored_status)
 
 
@@ -1083,10 +1238,18 @@ async def request_compatibility_recompute(
     ):
         raise CompatibilityResultStale()
 
-    consent = await _load_active_consent(db, owner_user_id, COMPATIBILITY_CONSENT_SCOPE)
-    if consent is None:
+    viewer_consent = await _load_active_consent(
+        db, owner_user_id, COMPATIBILITY_CONSENT_SCOPE
+    )
+    target_consent = await _load_active_consent(
+        db, target_user_id, COMPATIBILITY_CONSENT_SCOPE
+    )
+    if viewer_consent is None or target_consent is None:
         raise CompatibilityConsentRequired()
-    consent_snapshot = _consent_snapshot(consent)
+    consent_snapshot = {
+        "viewer": _consent_snapshot(viewer_consent),
+        "target": _consent_snapshot(target_consent),
+    }
 
     snapshot_id = f"cp_{uuid.uuid4().hex}"
     request_hash = _hash_recompute_request(
@@ -1123,6 +1286,9 @@ async def request_compatibility_recompute(
                     "expected_target_profile_revision": int(
                         expected_target_profile_revision
                     ),
+                    "viewer_source_revision": owner_rev.as_dict(),
+                    "target_source_revision": target_rev.as_dict(),
+                    "consent_snapshot": consent_snapshot,
                 },
                 ensure_ascii=False,
             ),
@@ -1173,7 +1339,28 @@ async def compatibility_execute_handler(
 
     owner_rev = await _load_revision_vector(db, task.owner_user_id)
     target_rev = await _load_revision_vector(db, int(target_user_id))
-    consent = _consent_snapshot(task.consent_snapshot_json or {})
+    payload_viewer_revision = payload.get("viewer_source_revision")
+    payload_target_revision = payload.get("target_source_revision")
+    if (
+        not isinstance(payload_viewer_revision, dict)
+        or not isinstance(payload_target_revision, dict)
+        or payload_viewer_revision != owner_rev.as_dict()
+        or payload_target_revision != target_rev.as_dict()
+    ):
+        await fail_task(
+            db, task.task_id, worker_id,
+            error_code="RESULT_STALE", retryable=False,
+        )
+        return None
+    consent = task.consent_snapshot_json or payload.get("consent_snapshot") or {}
+    if not await _pair_consents_current(
+        db, task.owner_user_id, int(target_user_id), consent
+    ):
+        await fail_task(
+            db, task.task_id, worker_id,
+            error_code="RESULT_STALE", retryable=False,
+        )
+        return None
     result_snapshot_id = await compute_and_write_shadow(
         db,
         task.owner_user_id,
@@ -1182,12 +1369,10 @@ async def compatibility_execute_handler(
         consent,
         snapshot_id=str(snapshot_id) if snapshot_id else None,
     )
-    revisions = (
-        RevisionVector(**task.source_revision_json)
-        if task.source_revision_json
-        else RevisionVector()
-    )
-    return f"compatibility-snapshot:{result_snapshot_id}", revisions
+    # 返回实时加载的 owner_rev（而非入队快照 payload_viewer_revision）作为
+    # complete_task 的复核基准：让复核比对的是 handler 执行期间加载的版本，
+    # 而非任务入队时的快照，缩小 TOCTOU 窗口。
+    return f"compatibility-snapshot:{result_snapshot_id}", owner_rev
 
 
 # ----------------------------------------------------------------------

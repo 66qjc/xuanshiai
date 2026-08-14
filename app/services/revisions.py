@@ -103,6 +103,7 @@ async def increment_revision_and_enqueue(
     changed_fields: tuple[str, ...],
     event_type: str,
     priority: int = 50,
+    payload_extra: dict[str, Any] | None = None,
 ) -> RevisionVector:
     """Bump one revision dimension and enqueue a derivation event atomically.
 
@@ -112,6 +113,13 @@ async def increment_revision_and_enqueue(
     """
     assert_revision_kind(kind)
     column = _KIND_REVISION_COLUMNS[kind]
+    # 锁顺序说明（缺陷 36）：先 ODKU 再 SELECT FOR UPDATE 是安全的——
+    # ODKU 在唯一键 (user_id) 上原子地获取行锁并递增目标列，随后的
+    # SELECT FOR UPDATE 在同一事务内重新读取已更新的行。由于
+    # INSERT ... ON DUPLICATE KEY UPDATE ... RETURNING 在 MySQL 上不被
+    # 支持（仅 MariaDB 10.5+），此处保留两语句形式以保持 MySQL 兼容性。
+    # FOR UPDATE 是必要的：它显式持有行锁直到事务结束，阻止并发事务
+    # 在本事务读取向量后、提交前插入/更新同一用户的 revision 行。
     await db.execute(
         text(
             f"INSERT INTO user_revision_state (user_id, {column}, updated_at) "
@@ -144,6 +152,15 @@ async def increment_revision_and_enqueue(
         # reads the real row.
         field = column.removesuffix("_revision")
         revision = RevisionVector(**{field: 1})
+    payload = {
+        "changed_fields": list(changed_fields),
+        "source_revision": revision.as_dict(),
+        "subject_id": user_id,
+    }
+    if payload_extra:
+        # Callers may add stable identifiers/version snapshots, but the helper
+        # remains the only writer of the canonical changed-fields/vector keys.
+        payload.update(payload_extra)
     await db.execute(
         text(
             "INSERT INTO derivation_outbox "
@@ -160,11 +177,7 @@ async def increment_revision_and_enqueue(
             "source_revision_json": json.dumps(revision.as_dict(), ensure_ascii=False),
             "privacy_revision": revision.privacy,
             "payload_minimal": json.dumps(
-                {
-                    "changed_fields": list(changed_fields),
-                    "source_revision": revision.as_dict(),
-                    "subject_id": user_id,
-                },
+                payload,
                 ensure_ascii=False,
             ),
             "priority": priority,

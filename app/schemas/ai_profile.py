@@ -9,9 +9,10 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
-from typing import Any, Literal
+from types import MappingProxyType
+from typing import Any, Literal, Mapping
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictInt, StrictStr, TypeAdapter, model_validator
 
 from app.schemas.ai_common import AI_FIELD_ALLOWLIST, AiTaskStatus
 
@@ -21,6 +22,137 @@ class ProfileSubject(str, Enum):
 
     PERSONAL = "personal"
     IDEAL_PARTNER = "ideal_partner"
+
+
+class NumericPreferenceRange(BaseModel):
+    """One-sided or two-sided numeric preference, always serialized as min/max."""
+
+    min: StrictInt | None = None
+    max: StrictInt | None = None
+
+    @model_validator(mode="after")
+    def validate_bounds(self) -> "NumericPreferenceRange":
+        if self.min is None and self.max is None:
+            raise ValueError("a preference range needs min or max")
+        if self.min is not None and self.max is not None and self.min > self.max:
+            raise ValueError("preference range min cannot exceed max")
+        return self
+
+
+# These frozen dictionaries are the extraction contract.  They make the two
+# subjects intentionally non-interchangeable: personal values are facts,
+# while ideal_partner values are constraints consumed only by preference and
+# compatibility projections.
+PERSONAL_FACT_FIELD_KINDS: Mapping[str, str] = MappingProxyType(
+    {
+        "age": "integer",
+        "city_code": "string",
+        "marriage_status": "enum",
+        "education_level": "integer",
+        "height_cm": "integer",
+        "income_band": "integer",
+        "occupation_group": "enum",
+        "interest_tags": "tags",
+        "lifestyle_tags": "tags",
+        "relationship_goal": "enum",
+    }
+)
+IDEAL_PARTNER_FIELD_KINDS: Mapping[str, str] = MappingProxyType(
+    {
+        "age": "range",
+        "city_code": "set",
+        "marriage_status": "set",
+        "education_level": "range",
+        "height_cm": "range",
+        "income_band": "range",
+        "occupation_group": "set",
+        "interest_tags": "tags",
+        "lifestyle_tags": "tags",
+        "relationship_goal": "set",
+    }
+)
+PROFILE_ENUM_DICTIONARY: Mapping[str, frozenset[str]] = MappingProxyType(
+    {
+        "marriage_status": frozenset({"single", "divorced", "widowed"}),
+        "occupation_group": frozenset(
+            {"technology", "education", "healthcare", "finance", "public_service", "other"}
+        ),
+        "relationship_goal": frozenset({"marriage", "dating", "friendship"}),
+    }
+)
+
+_TAG_ADAPTER = TypeAdapter(tuple[StrictStr, ...])
+_STRING_ADAPTER = TypeAdapter(StrictStr)
+_INTEGER_ADAPTER = TypeAdapter(StrictInt)
+_RANGE_FIELDS = frozenset({"age", "education_level", "height_cm", "income_band"})
+_TAG_FIELDS = frozenset({"interest_tags", "lifestyle_tags"})
+_RANGE_LIMITS: Mapping[str, tuple[int, int | None]] = MappingProxyType(
+    {
+        "age": (18, 100),
+        "education_level": (1, 8),
+        "height_cm": (100, 250),
+        "income_band": (0, None),
+    }
+)
+
+
+def normalize_profile_extracted_value(
+    subject: ProfileSubject, field_key: str, value: Any
+) -> int | str | tuple[str, ...] | dict[str, int | None]:
+    """Validate and normalize one provider value using the frozen subject contract.
+
+    It deliberately rejects unknown/authentication fields instead of letting a
+    later storage layer silently skip them.  ``ValueError`` is converted by the
+    Gateway into the stable safe ``AI_INPUT_INVALID`` code.
+    """
+    try:
+        subject = ProfileSubject(subject)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("unknown profile subject") from exc
+    kinds = (
+        PERSONAL_FACT_FIELD_KINDS
+        if subject is ProfileSubject.PERSONAL
+        else IDEAL_PARTNER_FIELD_KINDS
+    )
+    kind = kinds.get(field_key)
+    if kind is None or field_key not in AI_FIELD_ALLOWLIST:
+        raise ValueError("unknown or non-profile field")
+
+    if kind == "range":
+        numeric_range = NumericPreferenceRange.model_validate(value)
+        floor, ceiling = _RANGE_LIMITS[field_key]
+        for bound in (numeric_range.min, numeric_range.max):
+            if bound is not None and (bound < floor or (ceiling is not None and bound > ceiling)):
+                raise ValueError("preference range is outside the allowed bounds")
+        return numeric_range.model_dump()
+
+    if kind in {"tags", "set"}:
+        values = _TAG_ADAPTER.validate_python(value)
+        if not values or len(set(values)) != len(values):
+            raise ValueError("tag or enum collection must be non-empty and unique")
+        if field_key in PROFILE_ENUM_DICTIONARY:
+            allowed = PROFILE_ENUM_DICTIONARY[field_key]
+            if not set(values).issubset(allowed):
+                raise ValueError("enum collection contains an unsupported value")
+        return values
+
+    if kind == "enum":
+        enum_value = _STRING_ADAPTER.validate_python(value)
+        if enum_value not in PROFILE_ENUM_DICTIONARY[field_key]:
+            raise ValueError("enum value is unsupported")
+        return enum_value
+
+    if kind == "integer":
+        integer = _INTEGER_ADAPTER.validate_python(value)
+        floor, ceiling = _RANGE_LIMITS.get(field_key, (0, None))
+        if integer < floor or (ceiling is not None and integer > ceiling):
+            raise ValueError("integer value is outside the allowed bounds")
+        return integer
+
+    text_value = _STRING_ADAPTER.validate_python(value)
+    if not text_value:
+        raise ValueError("string value must not be empty")
+    return text_value
 
 
 class ProfileSessionStatus(str, Enum):

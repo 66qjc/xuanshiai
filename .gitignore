@@ -36,6 +36,11 @@ start.sh
 .vscode/*.log
 .DS_Store
 Thumbs.db
+
+# Local tool artifacts
+.superpowers/
+graphify-out/
+inspiration_linker.db
 docs/后端功能模块划分汇总.md
 docs/后端功能清单评估.md
 docs/首页和我的页面后端任务划分.md

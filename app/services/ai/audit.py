@@ -29,9 +29,10 @@ execution plan:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Mapping
@@ -188,7 +189,7 @@ def _audit_row(event: GenerationAuditEvent) -> tuple[str, tuple[Any, ...]]:
         json.dumps(safety_meta, ensure_ascii=False, sort_keys=True),
         event.error_code,
     )
-    placeholders = ", ".join("?" for _ in values)
+    placeholders = ", ".join("%s" for _ in values)
     statement = (
         f"INSERT IGNORE INTO ai_generation_audit ({', '.join(_AUDIT_TABLE_COLUMNS)}) "
         f"VALUES ({placeholders})"
@@ -196,8 +197,13 @@ def _audit_row(event: GenerationAuditEvent) -> tuple[str, tuple[Any, ...]]:
     return statement, values
 
 
-def _persist_audit_row(event: GenerationAuditEvent) -> None:
-    """Best-effort synchronous write; never raises."""
+def _persist_audit_row_sync(event: GenerationAuditEvent) -> None:
+    """Best-effort synchronous write; never raises.
+
+    Runs inside a worker thread (via :func:`asyncio.to_thread`) from
+    :func:`record_generation_audit` so the blocking ``pymysql.connect`` call
+    never stalls the event loop.
+    """
     params = _db_connect_params()
     if params is None:
         logger.debug("ai_audit_skip_unparseable_db_url request_id=%s", event.request_id)
@@ -209,6 +215,7 @@ def _persist_audit_row(event: GenerationAuditEvent) -> None:
         with pymysql.connect(**params) as conn:
             with conn.cursor() as cur:
                 cur.execute(statement, values)
+            conn.commit()
     except Exception:  # noqa: BLE001 - audit must never block business
         logger.warning(
             "ai_audit_write_failed request_id=%s error_code=%s",
@@ -218,13 +225,16 @@ def _persist_audit_row(event: GenerationAuditEvent) -> None:
         )
 
 
-def record_generation_audit(event: GenerationAuditEvent) -> None:
-    """Record one generation audit event without blocking the caller.
+async def record_generation_audit(event: GenerationAuditEvent) -> None:
+    """Record one generation audit event without blocking the event loop.
 
     Always logs the minimal non-sensitive metadata; then best-effort persists a
-    row into ``ai_generation_audit``.  Raw prompts, original answers and raw
-    provider responses are never part of the row.  Any write failure is caught
-    and recorded as a local warning so business keeps running.
+    row into ``ai_generation_audit``.  The synchronous DB write is offloaded to
+    a worker thread via :func:`asyncio.to_thread` so the blocking
+    ``pymysql.connect`` call never stalls the event loop.  Raw prompts,
+    original answers and raw provider responses are never part of the row.  Any
+    write failure is caught and recorded as a local warning so business keeps
+    running.
     """
     if not settings.ai_audit_enabled:
         return
@@ -246,7 +256,7 @@ def record_generation_audit(event: GenerationAuditEvent) -> None:
         event.display_eligible,
     )
     try:
-        _persist_audit_row(event)
+        await asyncio.to_thread(_persist_audit_row_sync, event)
     except Exception:  # noqa: BLE001 - belt and braces around the sink
         logger.warning(
             "ai_audit_persist_unhandled request_id=%s",
@@ -278,9 +288,16 @@ KNOWN_METRICS = frozenset({
 #: 积压类指标超过阈值时打印本地告警（queue/backlog 告警语义）。
 _BACKLOG_METRICS = frozenset({"outbox_backlog", "purge_backlog"})
 
-#: 进程内指标注册表：name -> [(value, tags), ...]。本地可观测与测试快照用，
-#: 生产仍以结构化日志为真实时序出口。
-_METRIC_REGISTRY: dict[str, list[tuple[float, dict[str, str]]]] = defaultdict(list)
+#: 单个指标序列保留的最大样本数。超过后丢弃最旧样本，保证注册表在
+#: 长生命周期进程内不会无界增长。
+_METRIC_MAX_SAMPLES = 10_000
+
+#: 进程内指标注册表：name -> deque[(value, tags), ...]。本地可观测与测试快照
+#: 用，生产仍以结构化日志为真实时序出口。每个序列上限为
+#: :data:`_METRIC_MAX_SAMPLES`，超过后丢弃最旧样本。
+_METRIC_REGISTRY: dict[str, deque[tuple[float, dict[str, str]]]] = defaultdict(
+    lambda: deque(maxlen=_METRIC_MAX_SAMPLES)
+)
 
 
 def metric_snapshot() -> dict[str, list[tuple[float, dict[str, str]]]]:
@@ -292,7 +309,9 @@ def emit_ai_metric(name: str, value: float, tags: Mapping[str, str] | None = Non
     """Emit one operational metric without ever blocking the caller.
 
     ``name`` should be one of :data:`KNOWN_METRICS`; unknown names are still
-    recorded but logged as a warning.  Backlog metrics above
+    recorded but logged as a warning.  Each per-name series is bounded by
+    :data:`_METRIC_MAX_SAMPLES`; the oldest sample is dropped once the limit is
+    reached, so the registry never grows unbounded.  Backlog metrics above
     ``settings.ai_metrics_backlog_warn_threshold`` raise a local warning.
     """
     try:

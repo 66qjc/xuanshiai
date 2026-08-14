@@ -144,8 +144,14 @@ def build_projection_payload(subject: str, confirmed_fields: list[dict]) -> dict
     payload: dict[str, Any] = {}
     for field in confirmed_fields:
         key = field["field_key"]
-        if key in PROFILE_ALLOWLIST:
-            payload[key] = field["value"]
+        if key not in PROFILE_ALLOWLIST:
+            # Projection is a privacy boundary: tolerate polluted historical
+            # revisions but never copy authentication/verification fields out.
+            continue
+        field_subject = field.get("subject")
+        if field_subject is not None and str(field_subject) != subject:
+            raise ProjectionBuildError("projection contains a cross-subject field")
+        payload[key] = field["value"]
     return payload
 
 
@@ -204,6 +210,23 @@ async def _load_latest_revision(
     return await _first_row(result)
 
 
+async def _load_revision_by_id(
+    db: AsyncSession, user_id: int, subject: str, revision_id: int
+) -> dict[str, Any] | None:
+    """Load the exact published revision pinned by a projection task."""
+    result = await db.execute(
+        text(
+            "SELECT r.id, r.user_id, r.subject, r.revision_no, r.policy_revision, "
+            "       r.source_revision_json, r.published_at "
+            "FROM ai_profile_revision r "
+            "WHERE r.id = :revision_id AND r.user_id = :user_id AND r.subject = :subject "
+            "LIMIT 1"
+        ),
+        {"revision_id": revision_id, "user_id": user_id, "subject": subject},
+    )
+    return await _first_row(result)
+
+
 async def _load_revision_fields(
     db: AsyncSession, revision_id: int
 ) -> list[dict[str, Any]]:
@@ -239,6 +262,36 @@ async def _load_consent_snapshot(
         "policy_revision": row.get("policy_revision") or "",
         "granted_at": granted_at.isoformat() if granted_at else None,
     }
+
+
+async def _consent_snapshot_is_current(
+    db: AsyncSession, user_id: int, snapshot: dict[str, Any]
+) -> bool:
+    """Require the pinned grant/version to still be active before projection write."""
+    scope = str(snapshot.get("scope") or "")
+    version = str(snapshot.get("version") or "")
+    if scope != PROFILE_CONSENT_SCOPE or not version:
+        return False
+    result = await db.execute(
+        text(
+            "SELECT version, policy_revision, granted_at FROM ai_consent_grant "
+            "WHERE user_id = :user_id AND scope = :scope AND version = :version "
+            "AND revoked_at IS NULL ORDER BY granted_at DESC LIMIT 1"
+        ),
+        {"user_id": user_id, "scope": scope, "version": version},
+    )
+    row = await _first_row(result)
+    if row is None:
+        return False
+    if snapshot.get("policy_revision") and str(row.get("policy_revision") or "") != str(
+        snapshot["policy_revision"]
+    ):
+        return False
+    granted_at = row.get("granted_at")
+    current_granted_at = (
+        granted_at.isoformat() if hasattr(granted_at, "isoformat") else str(granted_at or "")
+    )
+    return current_granted_at == str(snapshot.get("granted_at") or "")
 
 
 async def _load_current_revision(db: AsyncSession, user_id: int) -> RevisionVector:
@@ -337,7 +390,10 @@ async def build_feature_projection(
     db: AsyncSession,
     user_id: int,
     projection_kind: ProjectionKind,
-    revision_vector: RevisionVector,
+    revision_vector: RevisionVector | None,
+    *,
+    published_revision_id: int | None = None,
+    consent_snapshot: dict[str, Any] | None = None,
 ) -> FeatureProjection:
     """Build and persist one minimal, versioned feature projection.
 
@@ -356,14 +412,32 @@ async def build_feature_projection(
     visibility = _visibility_for_kind(projection_kind)
     revision = await _load_revision_vector_or_default(db, user_id, revision_vector)
 
-    consent_snapshot = await _load_consent_snapshot(db, user_id, PROFILE_CONSENT_SCOPE)
+    if consent_snapshot is None:
+        consent_snapshot = await _load_consent_snapshot(
+            db, user_id, PROFILE_CONSENT_SCOPE
+        )
     if not consent_snapshot:
         raise ProjectionBuildError("no active profile_text_extract consent")
+    if not await _consent_snapshot_is_current(db, user_id, consent_snapshot):
+        raise ProjectionBuildError("pinned consent is no longer active")
 
-    latest = await _load_latest_revision(db, user_id, subject)
+    latest = (
+        await _load_revision_by_id(db, user_id, subject, published_revision_id)
+        if published_revision_id is not None
+        else await _load_latest_revision(db, user_id, subject)
+    )
     if latest is None:
         raise ProjectionBuildError(f"no published {subject} revision")
     revision_id = int(latest["id"])
+    latest_source_revision = _maybe_json(latest.get("source_revision_json"))
+    if not isinstance(latest_source_revision, dict):
+        raise ProjectionBuildError("published revision has no source revision")
+    if latest_source_revision != revision.as_dict():
+        raise ProjectionBuildError("published revision vector is stale")
+    if consent_snapshot.get("policy_revision") and str(
+        latest.get("policy_revision") or ""
+    ) != str(consent_snapshot["policy_revision"]):
+        raise ProjectionBuildError("published revision policy is stale")
     field_rows = await _load_revision_fields(db, revision_id)
 
     confirmed_fields: list[dict[str, Any]] = []
@@ -372,6 +446,7 @@ async def build_feature_projection(
         confirmed_fields.append(
             {
                 "field_key": str(field["field_key"]),
+                "subject": str(field.get("subject") or subject),
                 "value": _maybe_json(field.get("value_json")),
             }
         )
@@ -475,17 +550,6 @@ async def build_feature_projection(
         expires_at=expires_at,
         purge_after=None,
     )
-
-
-async def _load_revision_vector_or_default(
-    db: AsyncSession,
-    user_id: int,
-    revision_vector: RevisionVector | None,
-) -> RevisionVector:
-    """Return the passed vector, or reload the current one from the DB."""
-    if revision_vector is not None:
-        return revision_vector
-    return await _load_current_revision(db, user_id)
 
 
 def _maybe_json(value: Any) -> Any:

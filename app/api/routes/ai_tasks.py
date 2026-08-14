@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -69,6 +70,34 @@ def _error_response(exc: TaskError) -> HTTPException:
     )
 
 
+_NON_TERMINAL_POLLABLE = {
+    AiTaskStatus.QUEUED,
+    AiTaskStatus.LEASED,
+    AiTaskStatus.RUNNING,
+    AiTaskStatus.RETRY_WAIT,
+}
+
+# poll_after_ms 下限：避免客户端在退避窗口内空转轮询。
+_MIN_POLL_AFTER_MS = 1000
+
+
+def _compute_poll_after_ms(status: AiTaskStatus, next_run_at: datetime | None) -> int:
+    """Derive the client poll interval from the task state.
+
+    终态返回 0；``retry_wait`` 用 ``next_run_at - now`` 推导（至少
+    ``_MIN_POLL_AFTER_MS``），让客户端在退避窗口内不空转；其余非终态
+    状态用固定下限（缺陷 35）。
+    """
+    if status not in _NON_TERMINAL_POLLABLE:
+        return 0
+    if status is AiTaskStatus.RETRY_WAIT and next_run_at is not None:
+        # next_run_at 来自 MySQL DATETIME（naive UTC），用 naive UTC now 比较。
+        now = datetime.now(UTC).replace(tzinfo=None)
+        delta_ms = max(0, int((next_run_at - now).total_seconds() * 1000))
+        return max(delta_ms, _MIN_POLL_AFTER_MS)
+    return _MIN_POLL_AFTER_MS
+
+
 @router.get(
     "/tasks/{task_id}",
     response_model=TaskDetailResponse,
@@ -97,7 +126,7 @@ async def get_ai_task(
         task_id=task.task_id,
         status=task.status,
         stage=task.stage,
-        poll_after_ms=1000 if task.status in {AiTaskStatus.QUEUED, AiTaskStatus.LEASED, AiTaskStatus.RUNNING, AiTaskStatus.RETRY_WAIT} else 0,
+        poll_after_ms=_compute_poll_after_ms(task.status, task.next_run_at),
         expires_at=task.lease_until if task.lease_until is not None else None,
         result_ref=task.result_ref,
         error_code=task.error_code,
@@ -126,4 +155,5 @@ async def cancel_ai_task(
         task = await request_cancel(db, task_id, current.id)
     except TaskError as exc:
         raise _error_response(exc) from exc
+    await db.commit()
     return CancelAcceptedResponse(task_id=task.task_id, status=task.status)

@@ -101,6 +101,32 @@ class FakeAiSession:
         sql = str(statement)
         values = dict(params or {})
         self.calls.append((sql, values))
+        # 后门禁复查（缺陷 2 修复）无条件执行：complete_task 在写结果前会
+        # 重新读取 user_revision_state 与（当 consent 快照带 scope 时）
+        # ai_consent_grant，对比版本向量与授权是否仍匹配。FakeAiSession 必
+        # 须为这两条只读 SELECT 返回合理的 mock 行，否则触发 unhandled sql。
+        if "FROM user_revision_state" in sql:
+            # 默认返回与 _FULL_REVISION 一致的版本向量，使版本匹配的完成
+            # 用例走 succeeded；supersede 用例靠调用方传入不同的 revisions
+            # 参数触发，而不是靠这里返回不同的 current。
+            return _MappingResult(
+                [
+                    {
+                        "profile_revision": 1,
+                        "preference_revision": 0,
+                        "privacy_revision": 0,
+                        "relationship_revision": 0,
+                        "policy_revision": 1,
+                    }
+                ]
+            )
+        if "FROM ai_consent_grant" in sql:
+            # consent 快照匹配。scrub 用例的 consent_snapshot_json=
+            # {"scope": "profile_text_extract"} 不含 version/policy_revision，
+            # 因此 consent_matches 要求 current_consent 非 None 且 version
+            # 等于空串、policy_revision 检查因 snapshot 无 policy_revision
+            # 被跳过。返回一行 version="" 满足匹配。
+            return _MappingResult([{"version": "", "policy_revision": None, "granted_at": None}])
         if "INSERT INTO ai_task" in sql:
             inserted = self._store.insert(values)
             return _WriteResult(rowcount=1 if inserted else 0)
@@ -269,6 +295,11 @@ class TaskStore:
             row["lease_until"] = params.get("lease_until")
         else:
             raise AssertionError(f"unhandled update: {sql}")
+        if "payload_summary = NULL" in sql:
+            row["payload_summary"] = None
+            row["consent_snapshot_json"] = None
+            row["source_revision_json"] = None
+            row["result_ref"] = None
         row["updated_at"] = datetime.now(UTC).replace(tzinfo=None)
         return True
 
@@ -318,6 +349,20 @@ class TaskStore:
 @pytest.fixture
 def task_store() -> TaskStore:
     return TaskStore()
+
+
+@pytest.fixture(autouse=True)
+def _enable_ai_features(monkeypatch: pytest.MonkeyPatch) -> None:
+    """门禁复查无条件执行后，complete_task 会调用 require_ai_feature。
+
+    默认配置里 ai_profile_enabled=False，会导致 profile_extract 任务在完成
+    时被判 feature disabled 而走 supersede（甚至 leased->superseded 非法转
+    换）。本模块的完成类用例语义上假定 AI 功能开启，故统一打开三个 flag。
+    """
+    monkeypatch.setattr(settings, "ai_master_enabled", True)
+    monkeypatch.setattr(settings, "ai_profile_enabled", True)
+    monkeypatch.setattr(settings, "ai_search_enabled", True)
+    monkeypatch.setattr(settings, "ai_compatibility_shadow_enabled", True)
 
 
 # ----------------------------------------------------------------------
@@ -714,7 +759,34 @@ async def test_complete_task_writes_result_only_when_version_matches(task_store)
     )
 
     assert completed.status is AiTaskStatus.SUCCEEDED
-    assert completed.result_ref == "res:1"
+    assert completed.result_ref is None
+
+
+@pytest.mark.asyncio
+async def test_terminal_task_scrubs_payload_and_resource_reference(task_store) -> None:
+    db = task_store.session
+    task = await task_store.seed(
+        status="running",
+        lease_owner="worker-1",
+        payload_summary={"resource_id": "raw-resource-1", "answer": "must not remain"},
+        consent_snapshot_json={"scope": "profile_text_extract"},
+        source_revision_json=dict(_FULL_REVISION),
+    )
+
+    completed = await complete_task(
+        db,
+        task.task_id,
+        "worker-1",
+        "res:1",
+        revisions=RevisionVector(profile=1, policy=1),
+    )
+
+    stored = task_store.tasks[task.task_id]
+    assert completed.status is AiTaskStatus.SUCCEEDED
+    assert stored["payload_summary"] is None
+    assert stored["consent_snapshot_json"] is None
+    assert stored["source_revision_json"] is None
+    assert stored["result_ref"] is None
 
 
 @pytest.mark.asyncio
@@ -894,9 +966,10 @@ async def test_reap_caps_exhausted_leased_task_in_retry_wait(task_store) -> None
     assert recovered == [task.task_id]
     final = await task_store.get(task.task_id)
     assert final is not None
-    # leased -> failed 是非法转换，超限 leased 任务封顶计数后留 retry_wait，
-    # 下一轮真正 running 后经 fail_task/reap 收敛到终态。
-    assert final.status is AiTaskStatus.RETRY_WAIT
+    # 缺陷 34 修复：leased 任务在 attempt_count >= max_attempts 时不再回退
+    # retry_wait（会与 leased 形成死循环），reaper 走特殊路径直接终态 failed
+    # 并告警 ai_task_reap_leased_at_attempts_cap。
+    assert final.status is AiTaskStatus.FAILED
     assert final.attempt_count == 3
     assert final.lease_owner is None
     assert final.lease_until is None

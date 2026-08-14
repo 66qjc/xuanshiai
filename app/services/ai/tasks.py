@@ -30,6 +30,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.schemas.ai_common import AiTaskStatus
+from app.services.ai.flags import AiFeature, AiFeatureDisabledError, require_ai_feature
 from app.services.revisions import RevisionVector
 
 logger = logging.getLogger(__name__)
@@ -167,7 +168,7 @@ class AiTaskRecord:
     finished_at: datetime | None
 
     @classmethod
-    def from_row(cls, row: Any) -> "AiTaskRecord":
+    def from_row(cls, row: Any) -> AiTaskRecord:
         return cls(
             id=int(row["id"]),
             task_id=str(row["task_id"]),
@@ -238,6 +239,14 @@ def _safe_error_message(code: str) -> str:
     return _SAFE_ERROR_MESSAGES.get(code, _DEFAULT_SAFE_ERROR_MESSAGE)
 
 
+def _owner_tombstone_value(task: AiTaskRecord) -> str | None:
+    if task.owner_user_id is None:
+        return None
+    return uuid.uuid5(
+        uuid.NAMESPACE_URL, f"ai-task-owner:{task.owner_user_id}:{task.task_id}"
+    ).hex
+
+
 async def _first_row(result: Any) -> dict[str, Any] | None:
     return result.mappings().first()
 
@@ -258,14 +267,20 @@ async def _get_by_id(
 
 
 async def _find_by_idempotency(
-    db: AsyncSession, owner_user_id: int, task_type: str, idempotency_key: str
+    db: AsyncSession,
+    owner_user_id: int,
+    task_type: str,
+    idempotency_key: str,
+    *,
+    for_update: bool = False,
 ) -> AiTaskRecord | None:
+    lock = " FOR UPDATE" if for_update else ""
     result = await db.execute(
         text(
             f"SELECT {_SELECT_COLUMNS} FROM ai_task "
             "WHERE owner_user_id = :owner_user_id AND task_type = :task_type "
             "AND idempotency_key = :idempotency_key "
-            "LIMIT 1"
+            f"LIMIT 1{lock}"
         ),
         {
             "owner_user_id": owner_user_id,
@@ -289,19 +304,106 @@ def _revisions_changed(stored: dict[str, Any] | None, current: Any) -> bool:
     return (stored or {}) != _revision_dict(current)
 
 
+_TASK_FEATURES = {
+    "profile_extract": AiFeature.PROFILE,
+    "profile_projection": AiFeature.PROFILE,
+    "search_parse": AiFeature.SEARCH,
+    "search_execute": AiFeature.SEARCH,
+    "compatibility": AiFeature.COMPATIBILITY_SHADOW,
+}
+
+
+async def _load_current_completion_context(
+    db: AsyncSession, task: AiTaskRecord
+) -> tuple[bool, bool, RevisionVector]:
+    """Re-read release gate, active consent and revisions before writing output."""
+    feature = _TASK_FEATURES.get(task.task_type)
+    feature_enabled = True
+    if feature is not None:
+        try:
+            require_ai_feature(feature, settings)
+        except AiFeatureDisabledError:
+            feature_enabled = False
+
+    result = await db.execute(
+        text(
+            "SELECT profile_revision, preference_revision, privacy_revision, "
+            "relationship_revision, policy_revision "
+            "FROM user_revision_state WHERE user_id = :user_id"
+        ),
+        {"user_id": task.owner_user_id},
+    )
+    row = await _first_row(result)
+    current_revision = RevisionVector(
+        profile=int(row["profile_revision"] or 0) if row else 0,
+        preference=int(row["preference_revision"] or 0) if row else 0,
+        privacy=int(row["privacy_revision"] or 0) if row else 0,
+        relationship=int(row["relationship_revision"] or 0) if row else 0,
+        policy=int(row["policy_revision"] or 0) if row else 0,
+    )
+
+    consent_matches = True
+    snapshot = task.consent_snapshot_json or {}
+    scope = str(snapshot.get("scope") or "")
+    if scope:
+        consent_result = await db.execute(
+            text(
+                "SELECT version, policy_revision, granted_at "
+                "FROM ai_consent_grant "
+                "WHERE user_id = :user_id AND scope = :scope AND revoked_at IS NULL "
+                "ORDER BY granted_at DESC LIMIT 1"
+            ),
+            {"user_id": task.owner_user_id, "scope": scope},
+        )
+        current_consent = await _first_row(consent_result)
+        consent_matches = current_consent is not None and str(
+            current_consent["version"]
+        ) == str(snapshot.get("version") or "")
+        if current_consent is not None and snapshot.get("policy_revision"):
+            consent_matches = consent_matches and str(
+                current_consent["policy_revision"]
+            ) == str(snapshot["policy_revision"])
+    return feature_enabled, consent_matches, current_revision
+
+
 async def _supersede(db: AsyncSession, task: AiTaskRecord, now: datetime) -> AiTaskRecord:
     assert_transition(task.status, AiTaskStatus.SUPERSEDED)
     await db.execute(
         text(
             "UPDATE ai_task SET status = 'superseded', finished_at = :now, "
-            "lease_owner = NULL, lease_until = NULL, updated_at = UTC_TIMESTAMP() "
+            "lease_owner = NULL, lease_until = NULL, "
+            "owner_tombstone = COALESCE(owner_tombstone, :owner_tombstone), "
+            "consent_snapshot_json = NULL, source_revision_json = NULL, "
+            "payload_summary = NULL, result_ref = NULL, "
+            "updated_at = UTC_TIMESTAMP() "
             "WHERE task_id = :task_id"
         ),
-        {"now": now, "task_id": task.task_id},
+        {
+            "now": now,
+            "task_id": task.task_id,
+            "owner_tombstone": _owner_tombstone_value(task),
+        },
     )
     updated = await _get_by_id(db, task.task_id)
     assert updated is not None
     return updated
+
+
+async def _supersede_guarded(
+    db: AsyncSession, task: AiTaskRecord
+) -> AiTaskRecord:
+    """Move ``task`` to ``superseded`` inside a savepoint when the driver supports it.
+
+    The completion gate (consent / version re-check) runs unconditionally before
+    this; the savepoint only protects the supersede sub-write so a failure here
+    can roll back the inner write without erasing the caller's draft/outbox work.
+    On drivers without ``begin_nested`` the write still happens — the gate must
+    not fail open (缺陷 2).
+    """
+    if hasattr(db, "begin_nested"):
+        async with db.begin_nested():
+            return await _supersede(db, task, now=_now_utc())
+    return await _supersede(db, task, now=_now_utc())
 
 
 # ----------------------------------------------------------------------
@@ -340,36 +442,50 @@ async def enqueue_task(
     task_id = uuid.uuid4().hex
     scene = str(consent_dict.get("scope", task_type)) if consent_dict else task_type
     try:
-        await db.execute(
-            text(
-                "INSERT INTO ai_task "
-                "(task_id, owner_user_id, task_type, scene, idempotency_key, "
-                " request_digest, status, attempt_count, max_attempts, next_run_at, "
-                " consent_snapshot_json, source_revision_json, payload_summary, "
-                " created_at, updated_at) "
-                "VALUES (:task_id, :owner_user_id, :task_type, :scene, "
-                " :idempotency_key, :request_digest, 'queued', 0, :max_attempts, "
-                " NULL, :consent_snapshot_json, :source_revision_json, "
-                " NULL, UTC_TIMESTAMP(), UTC_TIMESTAMP())"
-            ),
-            {
-                "task_id": task_id,
-                "owner_user_id": owner_user_id,
-                "task_type": task_type,
-                "scene": scene,
-                "idempotency_key": idempotency_key,
-                "request_digest": request_hash,
-                "max_attempts": settings.ai_max_attempts,
-                "consent_snapshot_json": (
-                    json.dumps(consent_dict, ensure_ascii=False) if consent_dict else None
-                ),
-                "source_revision_json": json.dumps(revision_dict, ensure_ascii=False),
-            },
+        insert_statement = text(
+            "INSERT INTO ai_task "
+            "(task_id, owner_user_id, task_type, scene, idempotency_key, "
+            " request_digest, status, attempt_count, max_attempts, next_run_at, "
+            " consent_snapshot_json, source_revision_json, payload_summary, "
+            " created_at, updated_at) "
+            "VALUES (:task_id, :owner_user_id, :task_type, :scene, "
+            " :idempotency_key, :request_digest, 'queued', 0, :max_attempts, "
+            " NULL, :consent_snapshot_json, :source_revision_json, "
+            " NULL, UTC_TIMESTAMP(), UTC_TIMESTAMP())"
         )
+        insert_params = {
+            "task_id": task_id,
+            "owner_user_id": owner_user_id,
+            "task_type": task_type,
+            "scene": scene,
+            "idempotency_key": idempotency_key,
+            "request_digest": request_hash,
+            "max_attempts": settings.ai_max_attempts,
+            "consent_snapshot_json": (
+                json.dumps(consent_dict, ensure_ascii=False) if consent_dict else None
+            ),
+            "source_revision_json": json.dumps(revision_dict, ensure_ascii=False),
+        }
+        # A duplicate-key race must roll back only this INSERT. Rolling back the
+        # caller's transaction can erase an unrelated draft/outbox write.
+        if hasattr(db, "begin_nested"):
+            async with db.begin_nested():
+                await db.execute(insert_statement, insert_params)
+        else:
+            await db.execute(insert_statement, insert_params)
     except IntegrityError:
         # A concurrent enqueue with the same key won the race.
-        await db.rollback()
-        existing = await _find_by_idempotency(db, owner_user_id, task_type, idempotency_key)
+        # The caller may already have established a REPEATABLE READ snapshot
+        # while checking visibility. A locking read is a MySQL current read,
+        # so it observes the committed winner that caused this duplicate-key
+        # error instead of re-raising the race.
+        existing = await _find_by_idempotency(
+            db,
+            owner_user_id,
+            task_type,
+            idempotency_key,
+            for_update=True,
+        )
         if existing is None:
             raise
         if existing.request_digest != request_hash:
@@ -517,11 +633,21 @@ async def request_cancel(
     await db.execute(
         text(
             "UPDATE ai_task SET status = 'cancelled', finished_at = :now, "
+            "owner_tombstone = COALESCE(owner_tombstone, :owner_tombstone), "
+            "consent_snapshot_json = NULL, source_revision_json = NULL, "
+            "payload_summary = NULL, result_ref = NULL, "
             "updated_at = UTC_TIMESTAMP() "
             "WHERE task_id = :task_id AND owner_user_id = :owner_user_id "
             "AND status IN ('queued', 'leased', 'running', 'retry_wait')"
         ),
-        {"now": now, "task_id": task_id, "owner_user_id": owner_user_id},
+        {
+            "now": now,
+            "task_id": task_id,
+            "owner_user_id": owner_user_id,
+            "owner_tombstone": uuid.uuid5(
+                uuid.NAMESPACE_URL, f"ai-task-owner:{owner_user_id}:{task_id}"
+            ).hex,
+        },
     )
     updated = await _get_by_id(db, task_id)
     assert updated is not None
@@ -533,6 +659,37 @@ async def request_cancel(
             status_code=409,
         )
     return updated
+
+
+def build_task_owner_tombstone(owner_user_id: int | None, task_id: str) -> str | None:
+    if owner_user_id is None:
+        return None
+    return uuid.uuid5(
+        uuid.NAMESPACE_URL, f"ai-task-owner:{int(owner_user_id)}:{task_id}"
+    ).hex
+
+
+async def tombstone_owner_tasks(
+    db: AsyncSession,
+    owner_user_id: int,
+    *,
+    task_type: str | None = None,
+) -> None:
+    """Tombstone terminal owners and clear any retained task resource refs."""
+    filters = ["owner_user_id = :owner_user_id", "finished_at IS NOT NULL"]
+    params: dict[str, Any] = {"owner_user_id": owner_user_id}
+    if task_type:
+        filters.append("task_type = :task_type")
+        params["task_type"] = task_type
+    await db.execute(
+        text(
+            "UPDATE ai_task SET owner_tombstone = COALESCE(owner_tombstone, SHA2(CONCAT('ai-task-owner:', owner_user_id, ':', task_id), 256)), "
+            "consent_snapshot_json = NULL, source_revision_json = NULL, "
+            "payload_summary = NULL, result_ref = NULL "
+            f"WHERE {' AND '.join(filters)}"
+        ),
+        params,
+    )
 
 
 async def complete_task(
@@ -558,9 +715,25 @@ async def complete_task(
     if task.lease_owner is not None and task.lease_owner != worker_id:
         # Worker 已失去租约；结果交由新持有者处理，不覆盖。
         return task
+    # 安全复查（consent 复查、版本向量对比）必须无条件执行：不能依赖
+    # 驱动是否支持嵌套事务（savepoint），否则不支持 begin_nested 的驱动
+    # 会完全跳过完成门禁，导致旧版本/已撤回 consent 的结果覆盖新状态。
+    # 只有需要回滚保护的子写（supersede）才在 savepoint 内执行；安全
+    # 复查本身是只读 SELECT，不依赖 savepoint。
+    feature_enabled, consent_matches, current_revision = (
+        await _load_current_completion_context(db, task)
+    )
+    if not feature_enabled or not consent_matches:
+        return await _supersede_guarded(db, task)
+    if task.source_revision_json and (
+        task.source_revision_json != current_revision.as_dict()
+    ):
+        return await _supersede_guarded(db, task)
+    if revisions is not None and _revision_dict(revisions) != current_revision.as_dict():
+        return await _supersede_guarded(db, task)
     if _revisions_changed(task.source_revision_json, revisions):
         if task.status is AiTaskStatus.RUNNING:
-            return await _supersede(db, task, now=_now_utc())
+            return await _supersede_guarded(db, task)
         return task
     if task.status is not AiTaskStatus.RUNNING:
         # 未启动的任务不能直接完成（leased -> succeeded 非法）。
@@ -571,10 +744,18 @@ async def complete_task(
         text(
             "UPDATE ai_task SET status = 'succeeded', result_ref = :result_ref, "
             "finished_at = :now, error_code = NULL, error_message = NULL, "
+            "owner_tombstone = COALESCE(owner_tombstone, :owner_tombstone), "
+            "consent_snapshot_json = NULL, source_revision_json = NULL, "
+            "payload_summary = NULL, "
             "updated_at = UTC_TIMESTAMP() "
             "WHERE task_id = :task_id"
         ),
-        {"result_ref": result_ref, "now": now, "task_id": task_id},
+        {
+            "result_ref": result_ref,
+            "now": now,
+            "task_id": task_id,
+            "owner_tombstone": _owner_tombstone_value(task),
+        },
     )
     updated = await _get_by_id(db, task_id)
     assert updated is not None
@@ -651,7 +832,11 @@ async def _fail_terminal(
         text(
             "UPDATE ai_task SET status = 'failed', error_code = :error_code, "
             "error_message = :error_message, finished_at = :now, "
-            "lease_owner = NULL, lease_until = NULL, updated_at = UTC_TIMESTAMP() "
+            "lease_owner = NULL, lease_until = NULL, "
+            "owner_tombstone = COALESCE(owner_tombstone, :owner_tombstone), "
+            "consent_snapshot_json = NULL, source_revision_json = NULL, "
+            "payload_summary = NULL, result_ref = NULL, "
+            "updated_at = UTC_TIMESTAMP() "
             "WHERE task_id = :task_id"
         ),
         {
@@ -659,6 +844,7 @@ async def _fail_terminal(
             "error_message": _safe_error_message(error_code),
             "now": now,
             "task_id": task.task_id,
+            "owner_tombstone": _owner_tombstone_value(task),
         },
     )
     updated = await _get_by_id(db, task.task_id)
@@ -682,11 +868,13 @@ async def reap_expired_leases(
     cannot loop ``running -> retry_wait -> claimed`` forever (review finding
     I-3): once the counter would exceed ``max_attempts`` the recovery is
     terminal — a ``running`` task moves to ``failed`` (``running -> failed``
-    is a legal transition), while a ``leased`` task at the cap is parked in
-    ``retry_wait`` with the counter capped because ``leased -> failed`` is
-    illegal and the next round that actually starts it terminates through
-    ``fail_task``/reap-on-``running``.  ``lease_owner``/``lease_until`` are
-    always cleared.  The recovery is idempotent and safe under concurrent
+    is a legal transition).  A ``leased`` task at the cap is also moved
+    directly to ``failed`` via a special reaper path: ``leased -> failed`` is
+    illegal in the state machine, but the reaper is a recovery mechanism whose
+    UPDATE bypasses ``assert_transition``; without this, a task stuck in the
+    ``retry_wait <-> leased`` cycle (worker claims but never starts) would
+    never reach a terminal state (缺陷 34).  ``lease_owner``/``lease_until``
+    are always cleared.  The recovery is idempotent and safe under concurrent
     workers thanks to ``FOR UPDATE SKIP LOCKED``.
     """
     result = await db.execute(
@@ -725,18 +913,32 @@ async def reap_expired_leases(
                     },
                 )
             else:
-                # leased 状态 attempt 已超限：leased -> failed 非法，封顶计数后
-                # 留 retry_wait，下一轮真正 running 后经 fail_task/reap 收敛到终态。
+                # leased 状态 attempt 已超限：``leased -> failed`` 在状态机中
+                # 非法，正常路径需经 leased -> retry_wait -> leased -> running
+                # -> failed 才能终态。但如果 worker 持续 claim 但从不
+                # ``start_task``（崩溃或租约反复过期），任务会永远卡在
+                # ``retry_wait <-> leased`` 循环中无法终态（缺陷 34）。
+                # reaper 是恢复机制，其 UPDATE 不经 ``assert_transition``，
+                # 因此这里作为特殊路径直接终态 ``failed`` 并告警，打破死循环。
+                logger.warning(
+                    "ai_task_reap_leased_at_attempts_cap task_id=%s "
+                    "attempt_count=%d max_attempts=%d",
+                    row["task_id"],
+                    attempt_count,
+                    max_attempts,
+                )
                 await db.execute(
                     text(
-                        "UPDATE ai_task SET status = 'retry_wait', "
-                        "attempt_count = :attempt_count, next_run_at = :now, "
+                        "UPDATE ai_task SET status = 'failed', "
+                        "error_code = :error_code, "
+                        "error_message = :error_message, finished_at = :now, "
                         "lease_owner = NULL, lease_until = NULL, "
                         "updated_at = UTC_TIMESTAMP() "
                         "WHERE task_id = :task_id"
                     ),
                     {
-                        "attempt_count": max_attempts,
+                        "error_code": _LEASE_LOST_ERROR_CODE,
+                        "error_message": _safe_error_message(_LEASE_LOST_ERROR_CODE),
                         "now": now,
                         "task_id": row["task_id"],
                     },

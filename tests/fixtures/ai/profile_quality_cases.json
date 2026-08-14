@@ -1,0 +1,35 @@
+[
+  {
+    "case_id": "m04-profile-1",
+    "subject": "personal",
+    "source_text": "周末喜欢旅行和看展，住在杭州，本科。",
+    "expected_fields": ["interest_tags", "city_code", "education_level"],
+    "predicted_fields": ["interest_tags", "city_code", "education_level"],
+    "forbidden_published_fields": [],
+    "sensitive_false_publish": false,
+    "auth_false_publish": false,
+    "provenance_complete": true
+  },
+  {
+    "case_id": "m04-profile-2",
+    "subject": "personal",
+    "source_text": "想认真恋爱结婚，身高172cm，在互联网做技术。",
+    "expected_fields": ["relationship_goal", "height_cm", "occupation_group"],
+    "predicted_fields": ["relationship_goal", "height_cm", "occupation_group"],
+    "forbidden_published_fields": [],
+    "sensitive_false_publish": false,
+    "auth_false_publish": false,
+    "provenance_complete": true
+  },
+  {
+    "case_id": "m04-profile-3",
+    "subject": "personal",
+    "source_text": "周末愿意户外，月收入一档到二档，未婚。",
+    "expected_fields": ["lifestyle_tags", "income_band", "marriage_status"],
+    "predicted_fields": ["lifestyle_tags", "income_band", "marriage_status"],
+    "forbidden_published_fields": [],
+    "sensitive_false_publish": false,
+    "auth_false_publish": false,
+    "provenance_complete": true
+  }
+]

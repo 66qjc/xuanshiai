@@ -5,7 +5,7 @@
 ### 变更记录
 
 - 2026-08-08：新增 7 个 `/api/v1/ai/search-*` 路径；错误统一为 `AiErrorDetail` 形状（含 `request_id`）；`SearchPolicyDenied → 422 AI_POLICY_DENIED`、`SearchInputInvalid → 400 AI_INPUT_INVALID` 固定映射，这两个异常路径不触发数据库查询。旧 `/api/v1/discovery/search`（手工筛选）保持兼容，新搜索失败时前端回退手工筛选。
-- 2026-08-08（Task 12 纠偏）：错误码速查补 `400 INVALID_CANDIDATE_CURSOR` 行（与 `app/api/routes/ai_search.py` 读取结果页的 cursor 校验映射一致）。
+- 2026-08-11（二期 M03）：解析请求摘要不再包含随机 draft ID；PATCH 持久化最近一次 Idempotency-Key/响应；search_execute 最多物化 200 条并保存精确 total/degraded；结果 GET 只读物化行并复核 owner/candidate revision、consent、projection source hash。
 
 通用请求头（所有接口）：
 
@@ -23,7 +23,7 @@ X-Request-ID: req_01J...                # 可选，1-128 位 [A-Za-z0-9._:-]，�
 - 条件 `user_action` 固定为 `pending / confirmed / edited / removed`。**只有已确认的 hard 条件才会进入筛选**；未确认草稿不能创建候选查询任务（`409 RESULT_STALE`）。
 - 解析额度：每用户每分钟 5 次（`ai_search_parse_rate_per_minute`，默认 5），超限返回 `429 AI_QUOTA_EXCEEDED`。
 - 所有写接口幂等：同 `user_id + 接口 + Idempotency-Key + 请求摘要` 回放第一次结果；请求摘要不同返回 `409 TASK_IDEMPOTENCY_CONFLICT`。
-- 结果读取以 MySQL 为事实源；Redis 断开时从 MySQL 恢复，不阻塞主链路。
+- 结果读取以 MySQL 为事实源；Redis 断开时从 MySQL 恢复，不阻塞主链路。Worker 完成搜索后，GET 不再重新执行候选搜索或 upsert。
 - 错误响应统一为：
 
 ```json
@@ -243,7 +243,7 @@ Content-Type: application/json
 
 - 仅 `awaiting_confirmation` 草稿可编辑；`confirmed/expired/failed` 草稿不可编辑（`409 RESULT_STALE`）。
 - `remove` 只标记不可见；重解析不恢复已删除条件。
-- `confirm` 后草稿仍为 `awaiting_confirmation`，只有**全部**未删除 hard 条件都确认后才可 `POST confirm` 创建快照。
+- `confirm` 后草稿仍为 `awaiting_confirmation`，只有**全部**未删除 hard 条件都确认后才可 `POST confirm` 创建快照。`city_code`/`marriage_status` 的 `in` 允许多值，仍由服务器编译为参数化 `IN`。
 - 幂等：本接口以 `condition_revision + 1` 作为新版本，客户端用返回值重试。
 
 ---
@@ -340,12 +340,12 @@ Content-Type: application/json
 | 字段 | 类型 | 必返 | 空值含义 | 枚举含义 | 业务含义 | 示例值 |
 | --- | --- | --- | --- | --- | --- | --- |
 | `snapshot_id` | string | 是 | — | — | 快照 ID | `ss_01JXc5...` |
-| `status` | string | 是 | — | `completed/stale/...` | 结果页状态；快照过期时为 `stale` | `completed` |
+| `status` | string | 是 | — | `completed/empty/partial/stale/...` | 物化状态；超过 200 条为 `partial` | `completed` |
 | `items` | array | 是 | 空数组表示无可见候选 | 结果项（见下） | 见下 |
 | `next_cursor` | string | 否 | `null` 表示没有下一页 | — | 下一页签名 cursor | `eyJzb3J0...` |
 | `total` | integer | 是 | `0` 表示无候选 | — | 精确候选总数（与手工 discovery 相同） | `1` |
 | `total_is_estimate` | boolean | 是 | — | 固定 `false`（精确 count） | 是否估算 | `false` |
-| `degraded` | boolean | 是 | — | 响应级降级标志 | 固定 `false` | `false` |
+| `degraded` | boolean | 是 | — | 超过 200 条物化上限时为 `true` | `false` |
 
 `items[]` 元素展开：
 
@@ -393,11 +393,12 @@ Content-Type: application/json
 
 ### 使用方法与业务规则
 
-- 前置：快照存在且未删除；每次读取重新执行可见性门禁，读取期间被拉黑/撤回的候选被排除（不在 `items` 中，但 `total` 是候选查询的精确 count）。
-- cursor 必须与当前快照查询绑定：跨查询使用他人 cursor → `400 INVALID_CANDIDATE_CURSOR`。
+- 前置：快照存在且未删除；Worker 先扫描 hard 筛选后的候选集，按 soft 命中数降序、候选基础顺序和 user_id 稳定 tie-break 物化最多 200 条，`total` 为精确总数。
+- 每条结果绑定 `personal_searchable` projection ID、source hash、候选 consent 快照和完整五维 revision。读取期间 owner revision、候选可见性/授权、投影 hash 或 revision 任一变化，该条按 stale 排除。
+- cursor 是快照绑定的物化结果 cursor；跨快照、伪造或超长 cursor → `400 INVALID_CANDIDATE_CURSOR`。
 - 软字段缺失为 `unknown`，不会当作硬失败；`matched_condition_count` 语义固定。
 - 结果过期：快照 `expires_at` 过期返回 `stale` 页（HTTP 200）；客户端应重新发起搜索。
-- Redis 断开时从 MySQL 恢复，结果仍可读。
+- Redis 断开时从 MySQL 恢复，结果仍可读；结果 GET 只执行物化结果、投影、授权和可见性读取，不执行候选搜索或结果 upsert。
 
 ---
 

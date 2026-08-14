@@ -89,6 +89,41 @@ class ConsentSnapshotSchema(BaseModel):
     granted_at: datetime
 
 
+class AiConsentGrantRequest(BaseModel):
+    """Versioned consent text metadata accepted by the public AI API."""
+
+    consent_version: str = Field(..., min_length=1, max_length=32)
+    policy_revision: str = Field(..., min_length=1, max_length=64)
+
+
+class AiConsentRead(BaseModel):
+    """One active consent grant; no raw policy text is returned."""
+
+    scope: str
+    version: str
+    policy_revision: str
+    granted_at: datetime
+
+
+class AiConsentListResponse(BaseModel):
+    """Current active consent grants for the authenticated user."""
+
+    consents: list[AiConsentRead] = Field(default_factory=list)
+    privacy_revision: int = Field(default=0, ge=0)
+
+
+class AiConsentOperationResponse(BaseModel):
+    """Grant/revoke result with the privacy revision and optional cleanup task."""
+
+    operation_id: str
+    scope: str
+    operation: str
+    status: str
+    consent: AiConsentRead | None = None
+    cleanup_task_id: str | None = None
+    privacy_revision: int = Field(default=0, ge=0)
+
+
 class ProjectionKind(str, Enum):
     """Frozen projection kinds (统一方案 §10.3)."""
 

@@ -243,7 +243,34 @@ X-Request-ID: req_01JXc5...
 
 ---
 
-## 4. 兼容性说明
+## 5. AI consent 授权
+
+授权接口前缀为 `/api/v1/ai/consents`，三个合法 scope 为：
+`profile_text_extract`、`search_parse`、`compatibility_shadow`。
+
+### GET `/api/v1/ai/consents`
+
+返回当前用户仍有效的授权和 `privacy_revision`。接口只返回 scope、文案版本、策略版本和授权时间，不返回原始授权文案。
+
+### PUT `/api/v1/ai/consents/{scope}`
+
+请求头：`Idempotency-Key`（8-128 位 ASCII）、`X-Expected-Privacy-Revision`（非负整数）。请求体：
+
+```json
+{"consent_version":"profile-text-v1","policy_revision":"ai-policy-2026-08-07-v1"}
+```
+
+成功返回 `200`，并在同一事务中写入 grant、privacy revision 和 derivation outbox。相同幂等键和摘要会回放原响应；摘要不同返回 `409 AI_CONSENT_IDEMPOTENCY_CONFLICT`，revision 过期返回 `409 AI_CONSENT_VERSION_CONFLICT`。
+
+### DELETE `/api/v1/ai/consents/{scope}`
+
+请求头同上，成功返回 `202` 和 `cleanup_task_id`。撤回事务会立即撤销授权、取消匹配 scope 的未完成任务、使草稿/快照/结果/投影不可读，并写入 privacy revision、outbox 和 cleanup task；Worker 负责后续物理清理。相同幂等键回放同一个 cleanup task。
+
+所有错误使用统一 `detail.code/message/request_id/retryable/retry_after_ms` 结构；撤回后新的 Provider 调用必须在完成前授权复核处被拦截。
+
+---
+
+## 6. 兼容性说明
 
 - 本文件接口为 2026-08-08 新增路径，不修改任何旧接口。
 - 新增 `result_ref`/`error_code`/`error_message` 字段对旧客户端向后兼容；`TaskPollState` 必需字段（`task_id/status/stage/poll_after_ms/expires_at`）在任务创建接口的 202 响应中已冻结，本接口保持一致。

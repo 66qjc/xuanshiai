@@ -20,6 +20,7 @@ from typing import Any
 import app.services.ai.profile as profile_mod
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 from sqlalchemy.exc import IntegrityError
 
 from app.api.dependencies import CurrentUser, get_current_user
@@ -31,8 +32,13 @@ from app.schemas.ai_profile import (
     ProfileDraftFieldRead,
     ProfileSubject,
 )
-from app.services.ai.base import ExtractedField, StructuredExtractResult
+from app.services.ai.base import (
+    ExtractedField,
+    StructuredExtractRequest,
+    StructuredExtractResult,
+)
 from app.services.ai.gateway import InvokeOutcome
+from app.services.ai.providers import MockAIProvider
 from app.services.ai.tasks import AiTaskRecord, TaskError
 from app.services.ai.profile import (
     AIInputError,
@@ -191,6 +197,17 @@ class TaskStore:
             row["finished_at"] = params.get("now")
             row["lease_owner"] = None
             row["lease_until"] = None
+        elif "SET status = 'superseded'" in sql:
+            # ``_supersede``：完成门禁（consent/版本复查）发现任务已被新状态
+            # 取代时，把 running 任务移到 superseded 终态，清空租约与 payload。
+            row["status"] = "superseded"
+            row["finished_at"] = params.get("now")
+            row["lease_owner"] = None
+            row["lease_until"] = None
+            row["consent_snapshot_json"] = None
+            row["source_revision_json"] = None
+            row["payload_summary"] = None
+            row["result_ref"] = None
         elif sql.startswith("UPDATE ai_task SET lease_until"):
             if row["status"] not in ("running", "leased") or row["lease_owner"] != params.get(
                 "worker_id"
@@ -199,6 +216,12 @@ class TaskStore:
             row["lease_until"] = params.get("lease_until")
         elif "SET payload_summary" in sql:
             row["payload_summary"] = params.get("payload_summary")
+            if "source_revision_json" in params:
+                row["source_revision_json"] = params.get("source_revision_json")
+            if "consent_snapshot_json" in params:
+                row["consent_snapshot_json"] = params.get("consent_snapshot_json")
+        elif "SET stage = :stage" in sql:
+            row["stage"] = params.get("stage")
         else:
             raise AssertionError(f"unhandled task update: {sql}")
         row["updated_at"] = _now()
@@ -358,6 +381,17 @@ class FakeProfileSession:
         if "UPDATE ai_profile_session" in sql:
             self._store.apply_session_update(sql, values)
             return _WriteResult(rowcount=1)
+        # ``_insert_turn`` 修复后改用 ``COALESCE(MAX(turn_no), 0)+1`` 取序号，
+        # 不再走 ``COUNT(*)``。此处匹配新 SQL 并返回当前最大 turn_no + 1。
+        if (
+            "FROM ai_profile_turn" in sql
+            and "COALESCE(MAX(turn_no)" in sql
+        ):
+            max_no = max(
+                (int(r["turn_no"]) for r in self._store.turns if r["session_id"] == values["session_id"]),
+                default=0,
+            )
+            return _MappingResult([{"next_no": max_no + 1}])
         if "FROM ai_profile_turn" in sql and "COUNT(*)" in sql:
             return _MappingResult(
                 [{"COUNT(*)": self._store.count_turns(values["session_id"])}]
@@ -365,10 +399,21 @@ class FakeProfileSession:
         if "FROM ai_profile_turn" in sql:
             row = self._store.find_turn(values["session_id"], values["client_turn_id"])
             return _MappingResult([row] if row else [])
+        # ``_revoke_consent`` 与 ``_load_latest_consent`` 的 ``FOR UPDATE`` 锁行 /
+        # 按 user_id+scope 取最新 grant：这些 SQL 不带 ``version`` 参数，需与
+        # ``_load_consent_grant``（按 user_id+scope+version 精确匹配）区分。
         if "FROM ai_consent_grant" in sql:
-            row = self._store.find_consent(
-                int(values["user_id"]), str(values["scope"]), str(values["version"])
-            )
+            user_id = int(values["user_id"])
+            scope = str(values["scope"])
+            if "version" in values:
+                row = self._store.find_consent(user_id, scope, str(values["version"]))
+            else:
+                # 取该 user+scope 下最新一条（granted_at 最大）未撤销 grant。
+                candidates = [
+                    c for c in self._store.consents
+                    if c["user_id"] == user_id and c["scope"] == scope
+                ]
+                row = candidates[-1] if candidates else None
             return _MappingResult([row] if row else [])
         if "FROM user_revision_state" in sql:
             row = self._store.revision_rows.get(int(values["user_id"]))
@@ -600,6 +645,7 @@ class ProfileStore:
             "display_value": params.get("display_value"),
             "source_type": str(params.get("source_type") or "user_answer"),
             "source_turn_ids": params.get("source_turn_ids"),
+            "source_span": params.get("source_span"),
             "confidence": float(params.get("confidence") or 0.0),
             "visibility": params.get("visibility"),
             "consent_scope": params.get("consent_scope"),
@@ -1095,13 +1141,15 @@ async def test_timeout_only_changes_task_status_to_retry_wait(profile_store, mon
 async def test_extraction_rejects_authentication_fields_not_in_allowlist(
     profile_store, monkeypatch
 ) -> None:
+    # Simulate an adapter that bypassed its initial Pydantic construction.  The
+    # Worker must still reject the whole extraction before it writes a draft.
     outcome = InvokeOutcome(
-        result=StructuredExtractResult(
+        result=StructuredExtractResult.model_construct(
             schema_version="profile-extract-v1",
             fields=(
-                ExtractedField(
+                ExtractedField.model_construct(
                     field_key="realname_status",
-                    subject="personal",
+                    subject=ProfileSubject.PERSONAL,
                     value=2,
                     source_quote="已实名",
                     confidence=0.99,
@@ -1119,11 +1167,58 @@ async def test_extraction_rejects_authentication_fields_not_in_allowlist(
         )
     )
     result = await _run_worker(profile_store, monkeypatch, _stub_gateway(outcome))
-    assert result["task"]["status"] == "succeeded"
-    field_keys = [f["field_key"] for f in profile_store.draft_fields]
-    assert "realname_status" not in field_keys
-    assert "interest_tags" in field_keys
-    assert all(f["confirmation_status"] == "suggested" for f in profile_store.draft_fields)
+    assert result["task"]["status"] == "failed"
+    assert result["task"]["error_code"] == "AI_INPUT_INVALID"
+    assert profile_store.drafts == []
+    assert profile_store.draft_fields == []
+
+
+@pytest.mark.asyncio
+async def test_extraction_rejects_forged_confidence_at_worker_boundary(
+    profile_store, monkeypatch
+) -> None:
+    field = ExtractedField.model_construct(
+        field_key="interest_tags",
+        subject=ProfileSubject.PERSONAL,
+        value=("旅行",),
+        source_quote="喜欢旅行",
+        source_span="喜欢旅行",
+        confidence=1.7,
+        confirmation_status="suggested",
+    )
+    outcome = InvokeOutcome(
+        result=StructuredExtractResult.model_construct(
+            schema_version="profile-extract-v1", fields=(field,)
+        )
+    )
+    result = await _run_worker(profile_store, monkeypatch, _stub_gateway(outcome))
+    assert result["task"]["status"] == "failed"
+    assert result["task"]["error_code"] == "AI_INPUT_INVALID"
+    assert profile_store.drafts == []
+    assert profile_store.draft_fields == []
+
+
+@pytest.mark.asyncio
+async def test_extraction_rejects_forged_result_schema_version_at_worker_boundary(
+    profile_store, monkeypatch
+) -> None:
+    field = ExtractedField(
+        field_key="interest_tags",
+        subject=ProfileSubject.PERSONAL,
+        value=["旅行"],
+        source_quote="喜欢旅行",
+        confirmation_status="suggested",
+    )
+    outcome = InvokeOutcome(
+        result=StructuredExtractResult.model_construct(
+            schema_version="profile-extract-v0", fields=(field,)
+        )
+    )
+    result = await _run_worker(profile_store, monkeypatch, _stub_gateway(outcome))
+    assert result["task"]["status"] == "failed"
+    assert result["task"]["error_code"] == "AI_INPUT_INVALID"
+    assert profile_store.drafts == []
+    assert profile_store.draft_fields == []
 
 
 @pytest.mark.asyncio
@@ -1135,6 +1230,7 @@ async def test_extraction_writes_full_source_evidence(profile_store) -> None:
     assert len(stored) >= 1
     for field in stored:
         assert field["source_turn_ids"] is not None
+        assert field["source_span"]
         assert field["schema_version"] == "profile-extract-v1"
         assert field["prompt_version"] == "profile-extract-prompt-v1"
         assert field["content_hash"]
@@ -1545,21 +1641,17 @@ async def test_create_session_service_rejects_unknown_subject(profile_store) -> 
 
 
 @pytest.mark.asyncio
-async def test_ideal_partner_extraction_forces_subject_and_leaves_personal_untouched(
+async def test_ideal_partner_extraction_rejects_provider_subject_mismatch(
     profile_store, monkeypatch
 ) -> None:
-    """I-3：ideal_partner 会话抽取的草稿字段 subject 强制为 ideal_partner。
-
-    mock provider 恒返回 ``subject="personal"``；写入层必须以 session.subject
-    为准覆盖，personal 事实表保持不变（没有任何 personal 标签的字段写入）。
-    """
+    """Cross-subject provider output is rejected before any draft write."""
     outcome = InvokeOutcome(
         result=StructuredExtractResult(
             schema_version="profile-extract-v1",
             fields=(
                 ExtractedField(
                     field_key="city_code",
-                    subject="personal",  # provider 恒返回 personal
+                    subject="personal",
                     value="330100",
                     source_quote="住在杭州",
                     confidence=0.95,
@@ -1610,18 +1702,53 @@ async def test_ideal_partner_extraction_forces_subject_and_leaves_personal_untou
     )
     monkeypatch.setattr(profile_mod, "AIGateway", _stub_gateway(outcome))
     result = await worker_mod._process(profile_store.db, task, "worker-1")
-    assert result == "completed"
+    assert result == "failed"
+    final = await profile_store.task_store.get(task.task_id)
+    assert final is not None
+    assert final["status"] == "failed"
+    assert final["error_code"] == "AI_INPUT_INVALID"
+    assert profile_store.drafts == []
+    assert profile_store.draft_fields == []
 
-    # 草稿字段主体强制为会话的 ideal_partner，而不是 provider 返回的 personal。
-    assert profile_store.draft_fields
-    assert all(f["subject"] == "ideal_partner" for f in profile_store.draft_fields)
-    # personal 事实表不变：没有任何 personal 标签的字段被写入。
-    assert not any(f["subject"] == "personal" for f in profile_store.draft_fields)
-    # 草稿行主体同样是 ideal_partner。
-    assert profile_store.drafts
-    assert all(d["subject"] == "ideal_partner" for d in profile_store.drafts)
-    # 会话推进到 awaiting_confirmation。
-    assert (await profile_store.get(session["session_id"]))["status"] == "awaiting_confirmation"
+
+@pytest.mark.asyncio
+async def test_mock_extraction_returns_subject_aware_ideal_partner_constraints() -> None:
+    """ideal_partner mock values are preferences, never personal fact scalars."""
+    result = await MockAIProvider().structured_extract(
+        StructuredExtractRequest(
+            subject="ideal_partner",
+            turn_texts=("希望另一半身高160到180，月收入至少一万",),
+            consent_version="profile-text-v1",
+            policy_revision="ai-policy-2026-08-07-v1",
+        )
+    )
+
+    fields = {field.field_key: field for field in result.fields}
+    assert all(field.subject is ProfileSubject.IDEAL_PARTNER for field in fields.values())
+    assert fields["height_cm"].value == {"min": 160, "max": 180}
+    assert fields["income_band"].value == {"min": 10000, "max": None}
+    assert fields["interest_tags"].value == ("旅行", "音乐")
+    assert fields["height_cm"].source_span
+    assert fields["height_cm"].schema_version == "profile-extract-v1"
+    assert fields["height_cm"].prompt_version == "profile-extract-prompt-v1"
+    assert fields["height_cm"].policy_revision == "ai-policy-2026-08-07-v1"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        {"field_key": "realname_status", "subject": "personal", "value": 1},
+        {"field_key": "height_cm", "subject": "personal", "value": {"min": 160, "max": 180}},
+        {"field_key": "height_cm", "subject": "ideal_partner", "value": 172},
+        {"field_key": "age", "subject": "ideal_partner", "value": {"min": 36, "max": 26}},
+    ),
+)
+def test_extracted_field_rejects_unknown_forged_or_subject_invalid_values(
+    payload: dict[str, Any],
+) -> None:
+    """Bad provider values fail schema validation before a draft can be created."""
+    with pytest.raises(ValidationError):
+        ExtractedField.model_validate(payload)
 
 
 @pytest.mark.asyncio

@@ -703,7 +703,7 @@ async def _target_rows(db: AsyncSession, viewer_id: int, target_ids: list[int]) 
     }
     params.update(visibility.params)
     result = await db.execute(
-        text(CARD_SELECT + f""" WHERE u.id IN ({placeholders})
+        text(CARD_SELECT + CARD_FROM + f""" WHERE u.id IN ({placeholders})
                  AND {visibility.clause}"""),
         params,
     )

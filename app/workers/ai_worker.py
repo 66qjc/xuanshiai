@@ -38,6 +38,7 @@ from typing import Any
 from app.core.config import settings
 from app.db.session import session_factory
 from app.services.ai.profile import extract_profile_turn
+from app.services.ai.audit import emit_ai_metric
 from app.services.ai.tasks import (
     AiTaskRecord,
     claim_tasks,
@@ -79,10 +80,12 @@ def _heartbeat_interval() -> float:
 
 
 async def _run_with_heartbeat(
-    db: Any,
     handler: Callable[..., Awaitable[Any]],
     task: AiTaskRecord,
     worker_id: str,
+    *,
+    db: Any = None,
+    session_provider: Any = None,
 ) -> Any:
     """Await ``handler`` while renewing the task lease every interval.
 
@@ -95,15 +98,35 @@ async def _run_with_heartbeat(
     still recovers the task (fallback, not the happy path).  On cancellation
     the child handler task is cancelled too.
     """
+    async def invoke_handler() -> Any:
+        if session_provider is None:
+            return await handler(db, task, worker_id)
+        async with session_provider() as handler_db:
+            try:
+                outcome = await handler(handler_db, task, worker_id)
+                await handler_db.commit()
+                return outcome
+            except Exception:
+                await handler_db.rollback()
+                raise
+
+    async def renew_lease() -> None:
+        if session_provider is None:
+            await heartbeat_lease(db, task.task_id, worker_id, _now())
+            return
+        async with session_provider() as heartbeat_db:
+            await heartbeat_lease(heartbeat_db, task.task_id, worker_id, _now())
+            await heartbeat_db.commit()
+
     interval = _heartbeat_interval()
-    handler_task = asyncio.create_task(handler(db, task, worker_id))
+    handler_task = asyncio.create_task(invoke_handler())
     try:
         while True:
             done, _ = await asyncio.wait({handler_task}, timeout=interval)
             if handler_task in done:
                 return handler_task.result()
             try:
-                await heartbeat_lease(db, task.task_id, worker_id, _now())
+                await renew_lease()
             except Exception:  # noqa: BLE001 - heartbeat must never kill the handler
                 logger.warning(
                     "ai_worker_heartbeat_failed task_id=%s",
@@ -116,11 +139,36 @@ async def _run_with_heartbeat(
 
 
 async def _process(
-    db: Any, task: AiTaskRecord, worker_id: str
+    db: Any, task: AiTaskRecord, worker_id: str, *, session_provider: Any = None
 ) -> str:
     """Run one claimed task; returns ``completed``/``failed``/``skipped``."""
+    async def start_in_session() -> AiTaskRecord:
+        if session_provider is None:
+            started = await start_task(db, task.task_id, worker_id)
+            return started
+        async with session_provider() as lifecycle_db:
+            try:
+                started = await start_task(lifecycle_db, task.task_id, worker_id)
+                await lifecycle_db.commit()
+                return started
+            except Exception:
+                await lifecycle_db.rollback()
+                raise
+
+    async def finish_in_session(operation: Callable[[Any], Awaitable[Any]]) -> Any:
+        if session_provider is None:
+            return await operation(db)
+        async with session_provider() as finalize_db:
+            try:
+                result = await operation(finalize_db)
+                await finalize_db.commit()
+                return result
+            except Exception:
+                await finalize_db.rollback()
+                raise
+
     try:
-        started = await start_task(db, task.task_id, worker_id)
+        started = await start_in_session()
     except Exception:  # noqa: BLE001 - lease or status race, leave for reaper
         logger.exception("ai_worker_start_failed task_id=%s", task.task_id)
         return "skipped"
@@ -135,12 +183,14 @@ async def _process(
             started.task_id,
         )
         try:
-            await fail_task(
-                db,
-                started.task_id,
-                worker_id,
-                error_code="AI_FEATURE_DISABLED",
-                retryable=False,
+            await finish_in_session(
+                lambda finalize_db: fail_task(
+                    finalize_db,
+                    started.task_id,
+                    worker_id,
+                    error_code="AI_FEATURE_DISABLED",
+                    retryable=False,
+                )
             )
         except Exception:  # noqa: BLE001 - 终态写入失败，留给 reaper/下一轮兜底
             logger.exception(
@@ -148,32 +198,49 @@ async def _process(
             )
         return "failed"
     try:
-        outcome = await _run_with_heartbeat(db, handler, started, worker_id)
+        outcome = await _run_with_heartbeat(
+            handler,
+            started,
+            worker_id,
+            db=db,
+            session_provider=session_provider,
+        )
     except Exception as exc:  # noqa: BLE001 - boundary conversion
+        emit_ai_metric("provider_5xx", 1, {"task_type": started.task_type})
         logger.warning(
             "ai_worker_exec_failed task_id=%s error=%s",
             started.task_id,
             type(exc).__name__,
         )
-        await fail_task(
-            db,
-            started.task_id,
-            worker_id,
-            error_code="AI_TEMPORARILY_UNAVAILABLE",
-            retryable=True,
+        await finish_in_session(
+            lambda finalize_db: fail_task(
+                finalize_db,
+                started.task_id,
+                worker_id,
+                error_code="AI_TEMPORARILY_UNAVAILABLE",
+                retryable=True,
+            )
         )
+        emit_ai_metric("retry_rate", 1, {"task_type": started.task_type})
         return "failed"
     if outcome is None:
-        await fail_task(
-            db,
-            started.task_id,
-            worker_id,
-            error_code="AI_TEMPORARILY_UNAVAILABLE",
-            retryable=True,
+        await finish_in_session(
+            lambda finalize_db: fail_task(
+                finalize_db,
+                started.task_id,
+                worker_id,
+                error_code="AI_TEMPORARILY_UNAVAILABLE",
+                retryable=True,
+            )
         )
+        emit_ai_metric("retry_rate", 1, {"task_type": started.task_type})
         return "failed"
     result_ref, revisions = outcome
-    await complete_task(db, started.task_id, worker_id, result_ref, revisions)
+    await finish_in_session(
+        lambda finalize_db: complete_task(
+            finalize_db, started.task_id, worker_id, result_ref, revisions
+        )
+    )
     return "completed"
 
 
@@ -186,30 +253,47 @@ async def _run_round(worker_id: str, batch_size: int) -> tuple[int, int, int]:
         # 库（review finding I-2）——``--once`` 非 dry-run 在此也是纯只读空转。
         logger.info("ai_worker_no_handlers_skip_round worker_id=%s", worker_id)
         return 0, 0, 0
-    async with session_factory() as db:
+    async with session_factory() as reap_db:
         now = _now()
         try:
-            reaped = await reap_expired_leases(db, now, limit=batch_size)
+            reaped = await reap_expired_leases(reap_db, now, limit=batch_size)
+            await reap_db.commit()
         except Exception:  # noqa: BLE001 - reaping must not stop the round
+            await reap_db.rollback()
             logger.exception("ai_worker_reap_failed")
             reaped = []
-        if reaped:
-            logger.info("ai_worker_reaped count=%d", len(reaped))
+    if reaped:
+        logger.info("ai_worker_reaped count=%d", len(reaped))
+        emit_ai_metric("lease_reclaimed", len(reaped), {"worker_id": worker_id})
+
+    async with session_factory() as claim_db:
         try:
-            claimed = await claim_tasks(db, worker_id, now, limit=batch_size)
+            claimed = await claim_tasks(claim_db, worker_id, now, limit=batch_size)
+            await claim_db.commit()
         except Exception:  # noqa: BLE001 - claiming must not stop the round
+            await claim_db.rollback()
             logger.exception("ai_worker_claim_failed")
             claimed = []
-        completed = 0
-        failed = 0
-        for task in claimed:
-            outcome = await _process(db, task, worker_id)
-            if outcome == "completed":
-                completed += 1
-            elif outcome == "failed":
-                failed += 1
-        await db.commit()
-        return len(claimed), completed, failed
+
+    completed = 0
+    failed = 0
+    for task in claimed:
+        if task.created_at is not None:
+            # 遍历 claimed 时重新取 _now() 计算 queue_age：reap 阶段的 now
+            # 已经过时（claim 期间发生了 IO/等待），用陈旧 now 会让 age 偏小。
+            age_now = _now()
+            age = max(0.0, (age_now - task.created_at).total_seconds())
+            emit_ai_metric("queue_age", age, {"task_type": task.task_type})
+        outcome = await _process(
+            None, task, worker_id, session_provider=session_factory
+        )
+        if outcome == "completed":
+            completed += 1
+        elif outcome == "failed":
+            failed += 1
+    if failed:
+        emit_ai_metric("retry_rate", failed, {"worker_id": worker_id})
+    return len(claimed), completed, failed
 
 
 async def _run_cleanup_round(worker_id: str, batch_size: int) -> dict[str, int]:
@@ -217,9 +301,43 @@ async def _run_cleanup_round(worker_id: str, batch_size: int) -> dict[str, int]:
     if session_factory is None:
         raise RuntimeError("数据库驱动未安装，无法运行 AI Worker 消费者")
     from app.services.derivation_outbox import run_cleanup_consumer_round
+    from sqlalchemy import text
 
     async with session_factory() as db:
-        stats = await run_cleanup_consumer_round(db, worker_id, _now(), batch_size)
+        now = _now()
+        stats = await run_cleanup_consumer_round(db, worker_id, now, batch_size)
+        # 缺陷 12：deletion_propagation_seconds 应测量事件 occurred_at 到当前
+        # 的处理延迟（秒），而非把应用事件计数当秒数。从 derivation_outbox 中
+        # 取本轮刚标记 succeeded 的事件的 occurred_at 计算平均延迟：用子查询
+        # 限定到最近 applied 条 succeeded 行，再对外层算 AVG。
+        applied = int(stats.get("applied", 0))
+        if applied > 0:
+            delay_result = await db.execute(
+                text(
+                    "SELECT AVG(TIMESTAMPDIFF(SECOND, occurred_at, :now)) "
+                    "AS avg_delay FROM ( "
+                    "  SELECT occurred_at FROM derivation_outbox "
+                    "  WHERE status = 'succeeded' AND occurred_at <= :now "
+                    "  ORDER BY occurred_at DESC LIMIT :applied"
+                    ") AS recent"
+                ),
+                {"now": now, "applied": applied},
+            )
+            delay_row = delay_result.mappings().first()
+            avg_delay = float(delay_row["avg_delay"]) if delay_row and delay_row["avg_delay"] is not None else 0.0
+            emit_ai_metric("deletion_propagation_seconds", max(0.0, avg_delay), {"worker_id": worker_id})
+        else:
+            emit_ai_metric("deletion_propagation_seconds", 0.0, {"worker_id": worker_id})
+        # 缺陷 13：outbox_backlog 应为 derivation_outbox 中 status='pending' 的
+        # 积压总数，而非本轮认领数（claimed）。
+        backlog_result = await db.execute(
+            text(
+                "SELECT COUNT(*) AS cnt FROM derivation_outbox WHERE status = 'pending'"
+            )
+        )
+        backlog_row = backlog_result.mappings().first()
+        backlog = int(backlog_row["cnt"]) if backlog_row else 0
+        emit_ai_metric("outbox_backlog", float(backlog), {"worker_id": worker_id})
         await db.commit()
         return stats
 

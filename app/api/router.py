@@ -7,6 +7,7 @@ from app.api.routes import location
 from app.api.routes import (
     admin,
     ai_compatibility,
+    ai_consents,
     ai_profile,
     ai_search,
     ai_tasks,
@@ -81,6 +82,7 @@ api_router.include_router(organization.promotion_router, tags=["组织与归属"
 api_router.include_router(organization.partner_router, tags=["组织与归属"])
 api_router.include_router(finance.router, tags=["财务与结算"])
 api_router.include_router(ai_tasks.router, prefix="/ai", tags=["AI"])
+api_router.include_router(ai_consents.router, prefix="/ai", tags=["AI"])
 api_router.include_router(ai_profile.router, prefix="/ai", tags=["AI"])
 api_router.include_router(ai_search.router, prefix="/ai", tags=["AI"])
 api_router.include_router(ai_compatibility.router, prefix="/ai", tags=["AI"])

@@ -1,0 +1,54 @@
+[
+  {
+    "pair_id": "m06-pair-a1",
+    "group": "group_a",
+    "completeness_bucket": "high",
+    "viewer_profile": "balanced-city-and-interest",
+    "target_profile": "balanced-city-and-interest",
+    "coverage": 0.95,
+    "false_blocked": false,
+    "replay_consistent": true,
+    "evidence_consistent": true,
+    "display_eligible": false,
+    "reason_codes": ["AGE_MUTUAL_WITHIN_RANGE", "INTEREST_OVERLAP"]
+  },
+  {
+    "pair_id": "m06-pair-a2",
+    "group": "group_a",
+    "completeness_bucket": "high",
+    "viewer_profile": "balanced-goal-and-city",
+    "target_profile": "balanced-goal-and-city",
+    "coverage": 0.93,
+    "false_blocked": false,
+    "replay_consistent": true,
+    "evidence_consistent": true,
+    "display_eligible": false,
+    "reason_codes": ["CITY_MATCH", "GOAL_MATCH"]
+  },
+  {
+    "pair_id": "m06-pair-b1",
+    "group": "group_b",
+    "completeness_bucket": "high",
+    "viewer_profile": "dimension-missing-shadow",
+    "target_profile": "dimension-missing-shadow",
+    "coverage": 0.80,
+    "false_blocked": true,
+    "replay_consistent": true,
+    "evidence_consistent": true,
+    "display_eligible": false,
+    "reason_codes": ["AGE_MUTUAL_WITHIN_RANGE", "DIMENSION_UNKNOWN"]
+  },
+  {
+    "pair_id": "m06-pair-b2",
+    "group": "group_b",
+    "completeness_bucket": "high",
+    "viewer_profile": "dimension-missing-shadow",
+    "target_profile": "dimension-missing-shadow",
+    "coverage": 0.79,
+    "false_blocked": true,
+    "replay_consistent": true,
+    "evidence_consistent": true,
+    "display_eligible": false,
+    "reason_codes": ["CITY_MATCH", "DIMENSION_UNKNOWN"]
+  }
+]

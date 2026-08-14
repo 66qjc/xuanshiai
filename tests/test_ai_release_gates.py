@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -108,7 +109,18 @@ def local_tmp_dir() -> Any:
 
 
 def _run_verify(environment: str, report: Path) -> subprocess.CompletedProcess:
-    """Run the release verify script as a subprocess and return its result."""
+    """Run the release verify script as a subprocess and return its result.
+
+    The child process must import the *local* ``app`` package rather than an
+    editable install of a sibling repository that may be shadowing it on
+    ``sys.path`` (the local ``cwd`` entry alone is not enough because editable
+    install finders sit higher in ``sys.meta_path``).  ``PYTHONPATH`` is set to
+    ``PROJECT_ROOT`` so the local source wins.  ``stdin`` is pointed at
+    ``DEVNULL`` to avoid ``OSError [WinError 6]`` when pytest has redirected the
+    parent stdin to a non-inheritable handle on Windows.
+    """
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(PROJECT_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
     return subprocess.run(
         [
             sys.executable,
@@ -121,6 +133,8 @@ def _run_verify(environment: str, report: Path) -> subprocess.CompletedProcess:
         cwd=PROJECT_ROOT,
         capture_output=True,
         text=True,
+        stdin=subprocess.DEVNULL,
+        env=env,
     )
 
 

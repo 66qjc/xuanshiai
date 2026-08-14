@@ -1,0 +1,33 @@
+{
+  "target": "ai",
+  "requires": [
+    "ai_consent_grant",
+    "ai_task",
+    "ai_generation_audit",
+    "ai_profile_session",
+    "ai_profile_turn",
+    "ai_search_result",
+    "ai_feature_projection",
+    "ai_compatibility_snapshot"
+  ],
+  "versions": [
+    {
+      "version": "20260809_01_hardening",
+      "up": "20260809_01_hardening_up.sql",
+      "down": "20260809_01_hardening_down.sql",
+      "sha256": {
+        "up": "330a38838b47258979c5ae074a77adca1bfa3d19e12b6eb2d9b94fad306abb34",
+        "down": "ae2d468d472c38b01cd280ace073aaadab44bba2f4a0e0629dd687dc1290d23f"
+      }
+    },
+    {
+      "version": "20260809_02_outbox_cleanup",
+      "up": "20260809_02_outbox_cleanup_up.sql",
+      "down": "20260809_02_outbox_cleanup_down.sql",
+      "sha256": {
+        "up": "e798f1d619feab06f4292804004cbe371fd6627dc9105b4d937c931e422c2d1d",
+        "down": "2eddc54426d990bf21fa6d7e9598863436a411aa7b55887fb61c5a3e5ab2ec46"
+      }
+    }
+  ]
+}

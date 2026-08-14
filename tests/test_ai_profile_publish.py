@@ -41,6 +41,7 @@ from app.services.ai.profile import (
     publish_profile_draft,
     restore_profile_revision,
 )
+from app.services.ai.tasks import TaskError
 from tests.test_ai_profile_sessions import (
     _MappingResult,
     _WriteResult,
@@ -73,6 +74,11 @@ class PublishFakeSession(FakeProfileSession):
         store = self._store
 
         # ---- ai_profile_revision / ai_profile_revision_field ----
+        if sql.startswith("UPDATE ai_profile_revision SET source_revision_json"):
+            revision = store.revisions.get(int(values["revision_id"]))
+            if revision is not None:
+                revision["source_revision_json"] = values["source_revision_json"]
+            return _WriteResult(rowcount=1)
         if "INSERT INTO ai_profile_revision_field" in sql:
             store.insert_revision_field(values)
             return _WriteResult(rowcount=1)
@@ -271,6 +277,7 @@ class ProfileStore(Task7ProfileStore):
             "display_value": ", ".join(value) if isinstance(value, list) else str(value),
             "source_type": "user_answer",
             "source_turn_ids": json.dumps(["turn-001"]),
+            "source_span": "原始回答片段",
             "confidence": 0.9,
             "visibility": "self",
             "consent_scope": "profile_text_extract",
@@ -411,6 +418,7 @@ class ProfileStore(Task7ProfileStore):
                 "confidence": float(params.get("confidence") or 0.0),
                 "source_type": str(params.get("source_type") or "user_answer"),
                 "source_turn_ids": params.get("source_turn_ids"),
+                "source_span": params.get("source_span"),
                 "content_hash": str(params.get("content_hash") or ""),
                 "schema_version": str(params.get("schema_version") or "profile-extract-v1"),
                 "prompt_version": params.get("prompt_version"),
@@ -495,6 +503,10 @@ class ProfileStore(Task7ProfileStore):
             row["status"] = "deleted"
         elif "expected_revision = :revision" in sql:
             row["expected_revision"] = int(params["revision"])
+        elif "last_operation_idempotency_key" in sql:
+            row["last_operation_idempotency_key"] = params.get("key")
+            row["last_operation_request_digest"] = params.get("request_digest")
+            row["last_operation_response_json"] = params.get("response_json")
         else:
             raise AssertionError(f"unhandled draft update: {sql}")
         row["updated_at"] = _now()
@@ -554,6 +566,7 @@ class ProfileStore(Task7ProfileStore):
                 "event_type": str(params["event_type"]),
                 "changed_fields": params.get("changed_fields"),
                 "source_revision_json": params.get("source_revision_json"),
+                "payload_minimal": params.get("payload_minimal"),
                 "priority": int(params.get("priority") or 50),
             }
         )
@@ -907,6 +920,84 @@ async def test_editable_draft_confirm_and_publish_are_unaffected(profile_store) 
     assert await profile_store.published_field_keys(10, "personal") == ["interest_tags"]
 
 
+@pytest.mark.asyncio
+async def test_confirm_patch_idempotency_replays_and_conflicts(profile_store) -> None:
+    draft = await profile_store.seed_draft(
+        owner_user_id=10,
+        subject="personal",
+        fields=[{"field_key": "interest_tags", "value": ["鐪嬪睍"], "status": "suggested"}],
+        revision=1,
+    )
+    action = ProfileDraftFieldPatchRequest(
+        field_key="interest_tags",
+        action=ProfileFieldPatchAction.CONFIRM,
+        expected_revision=1,
+    )
+    first = await confirm_profile_draft(
+        profile_store.db,
+        draft["draft_id"],
+        10,
+        [action],
+        expected_revision=1,
+        idempotency_key="confirm-patch-01",
+    )
+    replay = await confirm_profile_draft(
+        profile_store.db,
+        draft["draft_id"],
+        10,
+        [action],
+        expected_revision=1,
+        idempotency_key="confirm-patch-01",
+    )
+    assert replay.revision == first.revision == 2
+    conflicting = ProfileDraftFieldPatchRequest(
+        field_key="interest_tags",
+        action=ProfileFieldPatchAction.REJECT,
+        expected_revision=1,
+    )
+    with pytest.raises(TaskError) as excinfo:
+        await confirm_profile_draft(
+            profile_store.db,
+            draft["draft_id"],
+            10,
+            [conflicting],
+            expected_revision=1,
+            idempotency_key="confirm-patch-01",
+        )
+    assert excinfo.value.code == "TASK_IDEMPOTENCY_CONFLICT"
+
+
+@pytest.mark.asyncio
+async def test_confirm_patch_replays_original_response_after_later_patch(profile_store) -> None:
+    draft = await profile_store.seed_draft(
+        owner_user_id=10,
+        subject="personal",
+        fields=[{"field_key": "interest_tags", "value": ["鐪嬪睍"], "status": "suggested"}],
+        revision=1,
+    )
+    confirm = ProfileDraftFieldPatchRequest(
+        field_key="interest_tags",
+        action=ProfileFieldPatchAction.CONFIRM,
+        expected_revision=1,
+    )
+    first = await confirm_profile_draft(
+        profile_store.db, draft["draft_id"], 10, [confirm], 1, "confirm-history-01"
+    )
+    reject = ProfileDraftFieldPatchRequest(
+        field_key="interest_tags",
+        action=ProfileFieldPatchAction.REJECT,
+        expected_revision=2,
+    )
+    await confirm_profile_draft(
+        profile_store.db, draft["draft_id"], 10, [reject], 2, "confirm-history-02"
+    )
+    replay = await confirm_profile_draft(
+        profile_store.db, draft["draft_id"], 10, [confirm], 1, "confirm-history-01"
+    )
+    assert first.revision == replay.revision == 2
+    assert replay.fields[0].confirmation_status == "confirmed"
+
+
 # ----------------------------------------------------------------------
 # 发布：confirmed-only、空 confirmed、幂等回放、版本递增
 # ----------------------------------------------------------------------
@@ -963,6 +1054,48 @@ async def test_publish_increments_only_the_subjects_revision(profile_store) -> N
     after = profile_store.revision_rows[10]
     assert after["profile_revision"] == before["profile_revision"] + 1
     assert after["preference_revision"] == before["preference_revision"]
+
+
+@pytest.mark.asyncio
+async def test_publish_pins_revision_consent_and_published_revision_on_projection_task(
+    profile_store,
+) -> None:
+    draft = await profile_store.seed_draft(
+        owner_user_id=10,
+        subject="personal",
+        fields=[{"field_key": "interest_tags", "value": ["看展"], "status": "confirmed"}],
+        revision=1,
+    )
+    profile_store.drafts_by_id[draft["draft_id"]]["consent_snapshot_json"] = {
+        "scope": "profile_text_extract",
+        "version": "profile-text-v1",
+        "policy_revision": "ai-policy-2026-08-07-v1",
+        "granted_at": "2026-08-11T00:00:00",
+    }
+
+    submission = await profile_store.publish(
+        draft["draft_id"], owner_user_id=10, expected_revision=1
+    )
+    task = await profile_store.find_task(submission.task_id)
+    assert task is not None
+    assert json.loads(task["source_revision_json"]) == {
+        "profile": 1,
+        "preference": 0,
+        "privacy": 0,
+        "relationship": 0,
+        "policy": 0,
+    }
+    assert json.loads(task["consent_snapshot_json"])["version"] == "profile-text-v1"
+    payload = json.loads(task["payload_summary"])
+    assert payload["published_revision_id"] == submission.revision.revision_id
+    assert payload["source_revision"] == json.loads(task["source_revision_json"])
+    event = next(
+        event for event in profile_store.outbox_events
+        if event["event_type"] == "ai_profile_published"
+    )
+    event_payload = json.loads(event["payload_minimal"])
+    assert event_payload["published_revision_id"] == submission.revision.revision_id
+    assert event_payload["subject"] == "personal"
 
 
 # ----------------------------------------------------------------------
@@ -1147,6 +1280,7 @@ async def test_restore_creates_new_draft_without_touching_old_revision(profile_s
     assert restored.draft_id != draft["draft_id"]
     assert restored.revision == 0
     assert all(f.confirmation_status == "suggested" for f in restored.fields)
+    assert restored.fields[0].source_span == "原始回答片段"
     # 旧 revision 行保持不变（只读）。
     assert old_revision_id in profile_store.revisions
     assert profile_store.count_revisions(10) == 1
@@ -1227,3 +1361,7 @@ async def test_delete_queued_task_is_persisted(profile_store) -> None:
     row = await profile_store.find_task(task["task_id"])
     assert row is not None
     assert row["status"] == "queued"
+    payload = json.loads(row["payload_summary"])
+    assert set(payload) == {"scope", "resource_id", "version", "purge_deadline"}
+    assert payload["scope"] == "profile"
+    assert payload["resource_id"] == "profile:10:personal"
