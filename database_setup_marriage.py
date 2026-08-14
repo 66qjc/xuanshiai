@@ -98,7 +98,10 @@ def get_db_config():
 def get_logger(name):
     """获取日志记录器"""
     logger = logging.getLogger(name)
-    if not logger.handlers:
+    root_logger = logging.getLogger()
+    # The FastAPI application configures the root logger before importing this
+    # module. Reusing it prevents each initialization message from being logged twice.
+    if not logger.handlers and not root_logger.handlers:
         if hasattr(sys.stdout, "reconfigure"):
             sys.stdout.reconfigure(encoding="utf-8", errors="replace")
         handler = logging.StreamHandler(sys.stdout)
@@ -538,7 +541,7 @@ class DatabaseManager:
             cursor.execute(f"""
                 SELECT CONSTRAINT_NAME, DELETE_RULE
                 FROM information_schema.REFERENTIAL_CONSTRAINTS
-                WHERE TABLE_SCHEMA = DATABASE()
+                WHERE CONSTRAINT_SCHEMA = DATABASE()
                 AND TABLE_NAME = '{table_name}'
                 AND CONSTRAINT_NAME = '{fk_name}'
             """)

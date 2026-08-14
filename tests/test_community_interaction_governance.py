@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import logging
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
@@ -809,3 +810,42 @@ def test_database_bootstrap_replaces_reviewer_cascade_with_set_null() -> None:
 
     assert any("DROP FOREIGN KEY `fk_user_report_reviewed_by`" in sql for sql in cursor.statements)
     assert any("ON DELETE SET NULL" in sql for sql in cursor.statements)
+
+
+def test_database_bootstrap_queries_foreign_keys_by_constraint_schema() -> None:
+    class Cursor:
+        def __init__(self) -> None:
+            self.statements: list[str] = []
+
+        def execute(self, statement: str) -> None:
+            self.statements.append(" ".join(statement.split()))
+
+        def fetchone(self) -> dict[str, str] | None:
+            return {"CONSTRAINT_NAME": "fk_user_report_reviewed_by", "DELETE_RULE": "SET NULL"}
+
+    cursor = Cursor()
+    manager = object.__new__(DatabaseManager)
+
+    manager._add_foreign_key(cursor, "user_report", "reviewed_by", on_delete="SET NULL")
+
+    assert "CONSTRAINT_SCHEMA = DATABASE()" in cursor.statements[0]
+    assert "TABLE_SCHEMA = DATABASE()" not in cursor.statements[0]
+
+
+def test_database_logger_reuses_configured_root_handler() -> None:
+    import database_setup_marriage
+
+    logger_name = "tests.database_setup.reuses_root"
+    target_logger = logging.getLogger(logger_name)
+    root_logger = logging.getLogger()
+    original_handlers = list(target_logger.handlers)
+    root_handler = logging.NullHandler()
+    target_logger.handlers.clear()
+    root_logger.addHandler(root_handler)
+    try:
+        result = database_setup_marriage.get_logger(logger_name)
+        assert result is target_logger
+        assert target_logger.handlers == []
+    finally:
+        root_logger.removeHandler(root_handler)
+        target_logger.handlers[:] = original_handlers
