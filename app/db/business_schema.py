@@ -133,6 +133,20 @@ BUSINESS_TABLES = {
             KEY `idx_lead_follow_up_lead` (`lead_id`, `created_at`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='客源线索跟进记录'
     """,
+    "customer_lead_abandonment": """
+        CREATE TABLE IF NOT EXISTS `customer_lead_abandonment` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `lead_id` bigint unsigned NOT NULL,
+            `reason` varchar(500) NOT NULL,
+            `abandoned_by` bigint unsigned NOT NULL,
+            `abandoned_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `restored_by` bigint unsigned DEFAULT NULL,
+            `restored_at` datetime DEFAULT NULL,
+            `restore_reason` varchar(500) DEFAULT NULL,
+            PRIMARY KEY (`id`),
+            KEY `idx_lead_abandonment_active` (`lead_id`, `restored_at`, `abandoned_at`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='客源弃海和恢复审计记录'
+    """,
     "member_follow_up": """
         CREATE TABLE IF NOT EXISTS `member_follow_up` (
             `id` bigint unsigned NOT NULL AUTO_INCREMENT,
