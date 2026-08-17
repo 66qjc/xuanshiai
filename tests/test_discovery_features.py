@@ -7,7 +7,7 @@ from pydantic import ValidationError
 from app.main import app
 from app.schemas.discovery import ApplicationCreateRequest, DiscoveryFilters, DiscoverySearch
 from app.services import discovery
-from app.services.discovery import _card
+from app.services.discovery import _card, _consume_browse
 
 
 client = TestClient(app)
@@ -143,3 +143,23 @@ def test_media_review_status_does_not_hide_an_otherwise_visible_user() -> None:
         discovery.list_favorites,
     ):
         assert "pending_media" not in inspect.getsource(function)
+
+
+@pytest.mark.asyncio
+async def test_browse_quota_uses_redis_fallback_for_remaining_count(monkeypatch: pytest.MonkeyPatch) -> None:
+    class Session:
+        async def execute(self, *_args: object, **_kwargs: object) -> None:
+            return None
+
+    async def consume_from_fallback(*_args: object, **_kwargs: object) -> bool:
+        return True
+
+    async def fallback_used(*_args: object, **_kwargs: object) -> int:
+        return 1
+
+    monkeypatch.setattr(discovery, "consume_daily", consume_from_fallback)
+    monkeypatch.setattr(discovery, "get_daily_used", fallback_used)
+
+    remaining = await _consume_browse(Session(), user_id=1, match_score=50, is_vip=False, target_user_id=2)
+
+    assert remaining == discovery.settings.browse_daily_limit - 1

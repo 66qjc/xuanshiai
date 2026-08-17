@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.profile_tags import TAG_OPTIONS_BY_CATEGORY
-from app.core.redis import consume_daily, refund_daily, redis_client
+from app.core.redis import consume_daily, get_daily_used, refund_daily, redis_client
 from app.schemas.discovery import (
     ApplicationCreateRequest,
     ApplicationRejectRequest,
@@ -439,12 +439,12 @@ async def _consume_browse(db: AsyncSession, user_id: int, match_score: float, is
     regular_key = await _quota_key("browse", user_id)
     if await consume_daily(regular_key, limit):
         await _record_quota_usage(db, user_id, "browse", "package" if is_vip else "free", "Daily profile view", target_user_id)
-        return limit - int(await redis_client.get(regular_key) or 0)
+        return limit - await get_daily_used(regular_key)
     if match_score > 80:
         bonus_key = await _quota_key("browse_bonus", user_id)
         if await consume_daily(bonus_key, settings.browse_high_match_bonus):
             await _record_quota_usage(db, user_id, "browse", "bonus", "High-match profile bonus", target_user_id)
-            return settings.browse_high_match_bonus - int(await redis_client.get(bonus_key) or 0)
+            return settings.browse_high_match_bonus - await get_daily_used(bonus_key)
     if await consume_extra(db, user_id, "browse", "积分兑换资料查看次数", target_user_id):
         return 0
     raise HTTPException(429, detail="今日完整浏览额度已用完")
