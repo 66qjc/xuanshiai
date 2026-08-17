@@ -281,7 +281,6 @@ async def _fetch_rows(
         "COALESCE(pr.show_profile, 1) = 1",
         "COALESCE(pr.who_can_see_me, 1) <> 4", "COALESCE(pr.match_status, 1) = 1",
         "(:viewer_is_vip = 1 OR COALESCE(pr.who_can_see_me, 1) <> 3)",
-        "NOT EXISTS (SELECT 1 FROM user_media pending_media WHERE pending_media.user_id = u.id AND pending_media.deleted_at IS NULL AND pending_media.review_status IN (0, 2, 3))",
         "NOT EXISTS (SELECT 1 FROM user_block bl WHERE (bl.user_id = :viewer_id AND bl.target_user_id = u.id) OR (bl.user_id = u.id AND bl.target_user_id = :viewer_id))",
     ]
     if nickname:
@@ -503,9 +502,6 @@ async def _target_rows(db: AsyncSession, viewer_id: int, target_ids: list[int]) 
                  AND COALESCE(pr.who_can_see_me, 1) <> 4
                  AND NOT EXISTS (SELECT 1 FROM user_restriction ban WHERE ban.user_id = u.id AND ban.restriction_type = 'TOTAL_BAN' AND ban.status = 1 AND ban.starts_at <= UTC_TIMESTAMP() AND (ban.ends_at IS NULL OR ban.ends_at > UTC_TIMESTAMP()))
                  AND COALESCE(pr.match_status, 1) = 1
-                 AND NOT EXISTS (SELECT 1 FROM user_media pending_media
-                     WHERE pending_media.user_id = u.id AND pending_media.deleted_at IS NULL
-                       AND pending_media.review_status IN (0, 2, 3))
                  AND (:viewer_is_vip = 1 OR COALESCE(pr.who_can_see_me, 1) <> 3)"""),
         params,
     )
@@ -521,9 +517,6 @@ async def browse_history(db: AsyncSession, viewer_id: int, page: int, page_size:
         AND COALESCE(pr.who_can_see_me, 1) <> 4
         AND COALESCE(pr.match_status, 1) = 1
         AND (:viewer_is_vip = 1 OR COALESCE(pr.who_can_see_me, 1) <> 3)
-        AND NOT EXISTS (SELECT 1 FROM user_media pending_media
-                        WHERE pending_media.user_id = u.id AND pending_media.deleted_at IS NULL
-                          AND pending_media.review_status IN (0, 2, 3))
         AND NOT EXISTS (SELECT 1 FROM user_block bl
                         WHERE (bl.user_id = :user_id AND bl.target_user_id = u.id)
                            OR (bl.user_id = u.id AND bl.target_user_id = :user_id))"""
@@ -556,9 +549,6 @@ async def visitors(db: AsyncSession, viewer_id: int, page: int, page_size: int) 
         AND COALESCE(pr.who_can_see_me, 1) <> 4
         AND COALESCE(pr.match_status, 1) = 1
         AND (:viewer_is_vip = 1 OR COALESCE(pr.who_can_see_me, 1) <> 3)
-        AND NOT EXISTS (SELECT 1 FROM user_media pending_media
-                        WHERE pending_media.user_id = u.id AND pending_media.deleted_at IS NULL
-                          AND pending_media.review_status IN (0, 2, 3))
         AND NOT EXISTS (SELECT 1 FROM user_block bl
                         WHERE (bl.user_id = :viewer_id AND bl.target_user_id = u.id)
                            OR (bl.user_id = u.id AND bl.target_user_id = :viewer_id))"""
@@ -636,9 +626,6 @@ async def list_favorites(db: AsyncSession, viewer_id: int, page: int, page_size:
         AND COALESCE(pr.who_can_see_me, 1) <> 4
         AND COALESCE(pr.match_status, 1) = 1
         AND (:viewer_is_vip = 1 OR COALESCE(pr.who_can_see_me, 1) <> 3)
-        AND NOT EXISTS (SELECT 1 FROM user_media pending_media
-                        WHERE pending_media.user_id = u.id AND pending_media.deleted_at IS NULL
-                          AND pending_media.review_status IN (0, 2, 3))
         AND NOT EXISTS (SELECT 1 FROM user_block bl
                         WHERE (bl.user_id = :user_id AND bl.target_user_id = u.id)
                            OR (bl.user_id = u.id AND bl.target_user_id = :user_id))"""

@@ -1,9 +1,12 @@
+import inspect
+
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from app.main import app
 from app.schemas.discovery import ApplicationCreateRequest, DiscoveryFilters, DiscoverySearch
+from app.services import discovery
 from app.services.discovery import _card
 
 
@@ -15,6 +18,12 @@ def test_discovery_filters_validate_ranges_and_page_size() -> None:
         DiscoveryFilters(age_min=40, age_max=20)
     with pytest.raises(ValidationError):
         DiscoveryFilters(page_size=21)
+    assert DiscoveryFilters(gender="2", marriage_status="3").gender == 2
+    assert DiscoveryFilters(gender="2", marriage_status="3").marriage_status == 3
+    with pytest.raises(ValidationError):
+        DiscoveryFilters(gender=3)
+    with pytest.raises(ValidationError):
+        DiscoveryFilters(marriage_status=4)
 
 
 def test_application_message_has_a_bounded_length() -> None:
@@ -41,6 +50,9 @@ def test_discovery_routes_are_registered_and_require_authentication() -> None:
     assert response.status_code == 401
 
     response = client.get("/api/v1/discovery/search?tag=旅行")
+    assert response.status_code == 401
+
+    response = client.get("/api/v1/discovery/recommendations?gender=2&marriage_status=1")
     assert response.status_code == 401
 
 
@@ -119,3 +131,15 @@ def test_discovery_card_respects_privacy_and_detail_lock() -> None:
     assert locked.education_level is None
     assert locked.occupation is None
     assert locked.interest_tags == []
+
+
+def test_media_review_status_does_not_hide_an_otherwise_visible_user() -> None:
+    """Public media filtering belongs to profile serialization, not target visibility."""
+    for function in (
+        discovery._fetch_rows,
+        discovery._target_rows,
+        discovery.browse_history,
+        discovery.visitors,
+        discovery.list_favorites,
+    ):
+        assert "pending_media" not in inspect.getsource(function)
