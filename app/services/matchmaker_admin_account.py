@@ -1,5 +1,7 @@
 """Administration services for independent matchmaker back-office accounts."""
 
+from datetime import datetime
+
 from fastapi import HTTPException
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -217,12 +219,32 @@ async def revoke_all_sessions(db: AsyncSession, account_id: int, actor_id: int) 
     await db.commit()
 
 
-async def list_login_logs(db: AsyncSession, page: int, page_size: int, account_id: int | None = None) -> MatchmakerAdminLoginLogPage:
-    condition = "1 = 1"
+async def list_login_logs(
+    db: AsyncSession,
+    page: int,
+    page_size: int,
+    account_id: int | None = None,
+    username: str | None = None,
+    from_time: datetime | None = None,
+    to_time: datetime | None = None,
+) -> MatchmakerAdminLoginLogPage:
+    if from_time and to_time and to_time < from_time:
+        raise HTTPException(422, detail="登录日志结束时间不能早于开始时间")
+    conditions = ["1 = 1"]
     params: dict[str, object] = {"limit": page_size, "offset": (page - 1) * page_size}
     if account_id is not None:
-        condition += " AND l.account_id = :account_id"
+        conditions.append("l.account_id = :account_id")
         params["account_id"] = account_id
+    if username:
+        conditions.append("l.username LIKE CONCAT('%', :username, '%')")
+        params["username"] = username
+    if from_time:
+        conditions.append("l.created_at >= :from_time")
+        params["from_time"] = from_time
+    if to_time:
+        conditions.append("l.created_at <= :to_time")
+        params["to_time"] = to_time
+    condition = " AND ".join(conditions)
     rows = await db.execute(text(f"""SELECT l.id, l.account_id, l.username, l.login_status, l.ip,
         l.user_agent, l.device_id, l.failure_reason, l.created_at
         FROM matchmaker_admin_login_log l WHERE {condition}

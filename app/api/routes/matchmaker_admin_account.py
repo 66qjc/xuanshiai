@@ -1,5 +1,7 @@
 """Independent matchmaker back-office account administration routes."""
 
+from datetime import datetime
+
 from fastapi import APIRouter, Depends, Path, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -60,11 +62,14 @@ async def login_logs(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     account_id: int | None = Query(None, ge=1),
+    username: str | None = Query(None, min_length=1, max_length=64),
+    from_time: datetime | None = Query(None, alias="from"),
+    to_time: datetime | None = Query(None, alias="to"),
     current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
     db: AsyncSession = Depends(get_db),
 ) -> MatchmakerAdminLoginLogPage:
     current.require("matchmaker.account.manage")
-    return await list_login_logs(db, page, page_size, account_id)
+    return await list_login_logs(db, page, page_size, account_id, username, from_time, to_time)
 
 
 @router.get("/accounts/{account_id}", response_model=MatchmakerAdminAccountItem)
@@ -128,4 +133,5 @@ async def revoke_account_sessions(
     current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
     db: AsyncSession = Depends(get_db),
 ) -> None:
+    current.require("matchmaker.account.manage")
     await revoke_all_sessions(db, account_id, current.account.id)

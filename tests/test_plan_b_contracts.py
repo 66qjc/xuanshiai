@@ -109,6 +109,17 @@ def test_sensitive_routes_use_permission_guards() -> None:
     assert 'admin.require("meeting.write")' in text["meeting"]
 
 
+def test_login_log_filters_are_exposed() -> None:
+    route_text = (ROOT / "app" / "api" / "routes" / "matchmaker_admin_account.py").read_text(encoding="utf-8")
+    service_text = (ROOT / "app" / "services" / "matchmaker_admin_account.py").read_text(encoding="utf-8")
+
+    assert 'alias="from"' in route_text
+    assert 'alias="to"' in route_text
+    assert 'l.username LIKE CONCAT' in service_text
+    assert 'l.created_at >= :from_time' in service_text
+    assert 'l.created_at <= :to_time' in service_text
+
+
 @pytest.mark.asyncio
 async def test_admin_account_create_persists_data_scope(monkeypatch) -> None:
     result = MagicMock()

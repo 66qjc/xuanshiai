@@ -31,6 +31,21 @@ def test_admin_home_routes_are_registered() -> None:
     assert "/loveadmin/api/loveUser/getAdminIndexStatistic" in paths
 
 
+def test_dashboard_schema_exposes_empty_state_for_extended_overview() -> None:
+    report = AdminDashboard(
+        from_date=date(2026, 8, 1),
+        to_date=date(2026, 8, 1),
+        metrics=DashboardMetrics(),
+        trends=[DailyTrend(date=date(2026, 8, 1))],
+    )
+
+    assert report.metrics.customer_lead_count == 0
+    assert report.pending.withdrawal == 0
+    assert report.member_gender.unspecified == 0
+    assert report.income_rank == []
+    assert report.trends[0].online_paid_amount == Decimal("0.00")
+
+
 def test_order_statistics_aggregate_month_and_paginate() -> None:
     report = AdminDashboard(
         from_date=date(2026, 8, 30),

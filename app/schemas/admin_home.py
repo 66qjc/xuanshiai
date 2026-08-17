@@ -50,12 +50,43 @@ class AdminBootstrap(BaseModel):
 
 class DashboardMetrics(BaseModel):
     member_count: int = Field(default=0, ge=0)
+    platform_user_count: int = Field(default=0, ge=0)
+    wechat_fan_count: int = Field(default=0, ge=0)
+    online_days: int = Field(default=0, ge=0)
     lead_count: int = Field(default=0, ge=0)
+    customer_lead_count: int = Field(default=0, ge=0)
     vip_count: int = Field(default=0, ge=0)
+    online_vip_count: int = Field(default=0, ge=0)
+    offline_vip_count: int = Field(default=0, ge=0)
     matchmaker_count: int = Field(default=0, ge=0)
+    service_matchmaker_count: int = Field(default=0, ge=0)
+    promotion_matchmaker_count: int = Field(default=0, ge=0)
+    successful_match_count: int = Field(default=0, ge=0)
+    male_member_count: int = Field(default=0, ge=0)
+    female_member_count: int = Field(default=0, ge=0)
     pending_withdrawal_count: int = Field(default=0, ge=0)
     online_income: Decimal = Decimal("0.00")
     offline_income: Decimal = Decimal("0.00")
+
+
+class DashboardPending(BaseModel):
+    withdrawal: int = Field(default=0, ge=0)
+    matchmaker_application: int = Field(default=0, ge=0)
+    matchmaker_service: int = Field(default=0, ge=0)
+    match_application: int = Field(default=0, ge=0)
+    report: int = Field(default=0, ge=0)
+
+
+class DashboardGender(BaseModel):
+    male: int = Field(default=0, ge=0)
+    female: int = Field(default=0, ge=0)
+    unspecified: int = Field(default=0, ge=0)
+
+
+class IncomeRankItem(BaseModel):
+    product_type: str
+    income: Decimal = Decimal("0.00")
+    proportion: Decimal = Decimal("0.00")
 
 
 class DailyTrend(BaseModel):
@@ -65,6 +96,8 @@ class DailyTrend(BaseModel):
     paid_count: int = Field(default=0, ge=0)
     completed_refund_count: int = Field(default=0, ge=0)
     paid_amount: Decimal = Decimal("0.00")
+    online_paid_amount: Decimal = Decimal("0.00")
+    offline_paid_amount: Decimal = Decimal("0.00")
     completed_refund_amount: Decimal = Decimal("0.00")
     net_amount: Decimal = Decimal("0.00")
 
@@ -73,6 +106,9 @@ class AdminDashboard(BaseModel):
     from_date: date
     to_date: date
     metrics: DashboardMetrics
+    pending: DashboardPending = Field(default_factory=DashboardPending)
+    member_gender: DashboardGender = Field(default_factory=DashboardGender)
+    income_rank: list[IncomeRankItem] = Field(default_factory=list)
     trends: list[DailyTrend]
 
 
