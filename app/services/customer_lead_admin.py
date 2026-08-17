@@ -34,6 +34,18 @@ async def _validate_owner(db: AsyncSession, assignment: CustomerLeadAssignment) 
 
 
 async def create_lead(db: AsyncSession, account_id: int, request: CustomerLeadCreate) -> CustomerLead:
+    contact_conditions: list[str] = []
+    params: dict[str, Any] = {}
+    if request.phone:
+        contact_conditions.append("phone = :phone")
+        params["phone"] = request.phone
+    if request.wechat:
+        contact_conditions.append("wechat = :wechat")
+        params["wechat"] = request.wechat
+    duplicate = await db.execute(text("SELECT id FROM customer_lead WHERE status NOT IN ('LOST', 'CLOSED') AND (" + " OR ".join(contact_conditions) + ") LIMIT 1"), params)
+    existing_id = duplicate.scalar()
+    if existing_id:
+        raise HTTPException(409, detail=f"该联系方式已存在客源线索（ID: {existing_id}）")
     result = await db.execute(text("""INSERT INTO customer_lead
         (name, phone, wechat, source, intention_level, remark, created_by)
         VALUES (:name, :phone, :wechat, :source, :intention_level, :remark, :created_by)"""), {

@@ -16,6 +16,18 @@ class MemberListItem(BaseModel):
     vip_end_at: datetime | None
     matchmaker_id: int | None
     created_at: datetime
+    avatar: str | None = None
+    birthday: date | None = None
+    is_married: int | None = None
+    height: int | None = None
+    income: float | None = None
+    hometown: str | None = None
+    residence: str | None = None
+    education: str | None = None
+    job: str | None = None
+    auth_status: int | None = None
+    last_follow_at: datetime | None = None
+    next_follow_at: datetime | None = None
 
 
 class MemberPage(BaseModel):
@@ -50,3 +62,6 @@ class MemberStatistics(BaseModel):
     female: int
     vip: int
     active: int
+    unassigned: int = 0
+    never_followed: int = 0
+    follow_due_today: int = 0

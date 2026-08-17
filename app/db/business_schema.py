@@ -147,6 +147,35 @@ BUSINESS_TABLES = {
             KEY `idx_lead_abandonment_active` (`lead_id`, `restored_at`, `abandoned_at`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='客源弃海和恢复审计记录'
     """,
+    "customer_lead_review": """
+        CREATE TABLE IF NOT EXISTS `customer_lead_review` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT, `lead_id` bigint unsigned NOT NULL,
+            `status` varchar(16) NOT NULL COMMENT 'APPROVED/REJECTED', `reason` varchar(500) DEFAULT NULL,
+            `reviewed_by` bigint unsigned NOT NULL, `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`), KEY `idx_lead_review` (`lead_id`, `created_at`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='客源审核历史'
+    """,
+    "customer_lead_call_note": """
+        CREATE TABLE IF NOT EXISTS `customer_lead_call_note` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT, `lead_id` bigint unsigned NOT NULL,
+            `content` varchar(200) NOT NULL, `created_by` bigint unsigned NOT NULL,
+            `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`), KEY `idx_lead_call_note` (`lead_id`, `created_at`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='客源通话小记'
+    """,
+    "customer_lead_tag": """
+        CREATE TABLE IF NOT EXISTS `customer_lead_tag` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT, `name` varchar(64) NOT NULL, `color` varchar(16) DEFAULT NULL,
+            `enabled` tinyint NOT NULL DEFAULT 1, `sort` int NOT NULL DEFAULT 0,
+            PRIMARY KEY (`id`), UNIQUE KEY `uk_customer_lead_tag` (`name`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='客源标签配置'
+    """,
+    "customer_lead_tag_relation": """
+        CREATE TABLE IF NOT EXISTS `customer_lead_tag_relation` (
+            `lead_id` bigint unsigned NOT NULL, `tag_id` bigint unsigned NOT NULL,
+            PRIMARY KEY (`lead_id`, `tag_id`), KEY `idx_customer_lead_tag` (`tag_id`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='客源标签关联'
+    """,
     "member_follow_up": """
         CREATE TABLE IF NOT EXISTS `member_follow_up` (
             `id` bigint unsigned NOT NULL AUTO_INCREMENT,
