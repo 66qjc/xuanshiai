@@ -68,6 +68,12 @@ def test_social_routes_are_registered_and_require_authentication() -> None:
     response = client.get("/api/v1/relations/matches")
     assert response.status_code == 401
 
+    response = client.get("/api/v1/admin/reports?status=1")
+    assert response.status_code == 401
+
+    response = client.get("/api/v1/admin/report-appeals?status=2")
+    assert response.status_code == 401
+
 
 def test_social_actions_require_authentication() -> None:
     response = client.put("/api/v1/users/1/like")

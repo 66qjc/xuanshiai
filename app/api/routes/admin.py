@@ -104,7 +104,7 @@ async def review_user_media(media_id: int = Path(..., ge=1), body: MediaReviewRe
 async def list_reports(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
-    status: Literal[0, 1, 2] | None = Query(default=None),
+    status: int | None = Query(default=None, ge=0, le=2),
     target_type: Literal["user", "post", "comment", "paper_plane"] | None = Query(default=None),
     admin: CurrentUser = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db),
@@ -130,7 +130,7 @@ async def review_user_report(report_id: int = Path(..., ge=1), body: ReportRevie
 async def report_appeals(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
-    status: Literal[0, 1, 2] | None = Query(default=None),
+    status: int | None = Query(default=None, ge=0, le=2),
     admin: CurrentUser = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db),
 ) -> AdminReportAppealPage:
