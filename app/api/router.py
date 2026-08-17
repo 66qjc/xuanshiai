@@ -17,6 +17,7 @@ from app.api.routes import (
     activity_admin,
     member_follow_up_admin,
     reward_rule_admin,
+    admin_home,
     auth,
     certifications,
     community,
@@ -63,6 +64,8 @@ api_router.include_router(social.router, tags=["消息"])
 api_router.include_router(community.router, tags=["社区"])
 api_router.include_router(media.router, tags=["社区"])
 api_router.include_router(admin.router, tags=["管理后台"])
+api_router.include_router(admin_home.router, tags=["管理端首页"])
+api_router.include_router(admin_home.legacy_router, tags=["管理端首页兼容"])
 api_router.include_router(matchmaker_admin.router, tags=["红娘后台"])
 api_router.include_router(matchmaker_admin_account.router, tags=["红娘后台"])
 api_router.include_router(matchmaker_member_admin.router, tags=["红娘后台"])

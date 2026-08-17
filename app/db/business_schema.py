@@ -1,6 +1,101 @@
 """一期商业化和组织归属领域的数据库表定义。"""
 
 BUSINESS_TABLES = {
+    "admin_sms_statistics": """
+        CREATE TABLE IF NOT EXISTS `admin_sms_statistics` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `tenant_id` bigint unsigned NOT NULL DEFAULT 1,
+            `success_count` bigint unsigned NOT NULL DEFAULT 0,
+            `failed_count` bigint unsigned NOT NULL DEFAULT 0,
+            `remaining_count` bigint unsigned NOT NULL DEFAULT 0,
+            `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`), KEY `idx_admin_sms_tenant` (`tenant_id`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='管理端短信资源汇总；余额以账本任务同步写入'
+    """,
+    "admin_academy_category": """
+        CREATE TABLE IF NOT EXISTS `admin_academy_category` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `tenant_id` bigint unsigned NOT NULL DEFAULT 1,
+            `parent_id` bigint unsigned DEFAULT NULL,
+            `name` varchar(128) NOT NULL,
+            `description` varchar(500) DEFAULT NULL,
+            `image` varchar(500) DEFAULT NULL,
+            `category_type` varchar(32) NOT NULL DEFAULT 'Guides',
+            `sort` int NOT NULL DEFAULT 0,
+            `enabled` tinyint NOT NULL DEFAULT 1,
+            `matchmaker_class_enabled` tinyint NOT NULL DEFAULT 0,
+            PRIMARY KEY (`id`), KEY `idx_academy_tree` (`tenant_id`, `category_type`, `enabled`, `parent_id`, `sort`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='管理端婚创学苑栏目'
+    """,
+    "admin_recharge_item": """
+        CREATE TABLE IF NOT EXISTS `admin_recharge_item` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `tenant_id` bigint unsigned NOT NULL DEFAULT 1,
+            `name` varchar(128) NOT NULL,
+            `resource_type` varchar(32) NOT NULL,
+            `quantity` int unsigned NOT NULL,
+            `price` decimal(12,2) NOT NULL,
+            `sort` int NOT NULL DEFAULT 0,
+            `enabled` tinyint NOT NULL DEFAULT 1,
+            PRIMARY KEY (`id`), KEY `idx_recharge_visible` (`tenant_id`, `enabled`, `sort`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='只读充值商品目录，不记录支付或余额'
+    """,
+    "admin_announcement_version": """
+        CREATE TABLE IF NOT EXISTS `admin_announcement_version` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `tenant_id` bigint unsigned NOT NULL DEFAULT 1,
+            `name` varchar(64) NOT NULL,
+            `is_first` tinyint NOT NULL DEFAULT 0,
+            `published_at` datetime DEFAULT NULL,
+            PRIMARY KEY (`id`), KEY `idx_announcement_version_published` (`tenant_id`, `published_at`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='已发布更新报告版本'
+    """,
+    "admin_announcement": """
+        CREATE TABLE IF NOT EXISTS `admin_announcement` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `tenant_id` bigint unsigned NOT NULL DEFAULT 1,
+            `version_id` bigint unsigned DEFAULT NULL,
+            `category` varchar(64) NOT NULL DEFAULT '',
+            `title` varchar(255) NOT NULL,
+            `title_color` varchar(32) DEFAULT NULL,
+            `title_bold` tinyint NOT NULL DEFAULT 0,
+            `top` tinyint NOT NULL DEFAULT 0,
+            `sort_order` int NOT NULL DEFAULT 0,
+            `link_to` varchar(500) DEFAULT NULL,
+            `published_at` datetime DEFAULT NULL,
+            `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`), KEY `idx_announcement_list` (`tenant_id`, `published_at`, `category`, `top`, `sort_order`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='管理端更新公告'
+    """,
+    "admin_announcement_read": """
+        CREATE TABLE IF NOT EXISTS `admin_announcement_read` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `account_id` bigint unsigned NOT NULL,
+            `announcement_id` bigint unsigned NOT NULL,
+            `read_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`), UNIQUE KEY `uk_announcement_read` (`account_id`, `announcement_id`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='按管理员记录公告已读状态'
+    """,
+    "admin_feedback_message": """
+        CREATE TABLE IF NOT EXISTS `admin_feedback_message` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `tenant_id` bigint unsigned NOT NULL DEFAULT 1,
+            `ticket_id` bigint unsigned NOT NULL,
+            `sender_type` varchar(16) NOT NULL COMMENT 'CUSTOMER/SERVICE/SYSTEM',
+            `content` varchar(4000) DEFAULT NULL,
+            `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`), KEY `idx_feedback_last_message` (`tenant_id`, `ticket_id`, `created_at`, `id`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='工单消息；首页仅读取未读状态'
+    """,
+    "admin_feedback_read": """
+        CREATE TABLE IF NOT EXISTS `admin_feedback_read` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `account_id` bigint unsigned NOT NULL,
+            `feedback_id` bigint unsigned NOT NULL,
+            `read_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`), UNIQUE KEY `uk_feedback_read` (`account_id`, `feedback_id`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='管理员工单消息已读关系'
+    """,
     "customer_lead": """
         CREATE TABLE IF NOT EXISTS `customer_lead` (
             `id` bigint unsigned NOT NULL AUTO_INCREMENT,

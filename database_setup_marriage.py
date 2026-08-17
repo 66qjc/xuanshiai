@@ -2535,6 +2535,7 @@ class DatabaseManager:
 
         # 兼容已存在的旧库：CREATE TABLE IF NOT EXISTS 不会补齐新增字段。
         self._ensure_required_columns(cursor)
+        self._ensure_admin_home_columns(cursor)
 
         self._backfill_comment_roots(cursor)
 
@@ -2545,6 +2546,21 @@ class DatabaseManager:
         self._add_all_foreign_keys(cursor)
 
         logger.info(f"✅ 数据库表结构初始化完成（{len(tables)}张表）")
+
+    def _ensure_admin_home_columns(self, cursor) -> None:
+        """Backfill tenant boundaries for databases created before the admin-home module."""
+        for table_name in (
+            "admin_sms_statistics",
+            "admin_academy_category",
+            "admin_recharge_item",
+            "admin_announcement_version",
+            "admin_announcement",
+        ):
+            cursor.execute(f"SHOW COLUMNS FROM `{table_name}` LIKE 'tenant_id'")
+            if not cursor.fetchone():
+                cursor.execute(
+                    f"ALTER TABLE `{table_name}` ADD COLUMN `tenant_id` bigint unsigned NOT NULL DEFAULT 1 AFTER `id`"
+                )
 
     def _backfill_comment_roots(self, cursor) -> None:
         """Resolve legacy nested replies to their top-level root, one depth at a time."""
