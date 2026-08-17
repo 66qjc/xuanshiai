@@ -196,12 +196,15 @@ class ProfileResponse(BaseModel):
     industry: str | None
     education_level: int | None
     income: float | None
+    income_display: str | None = None
     hometown_province_code: str | None
     hometown_city_code: str | None
     hometown_district_code: str | None
+    hometown_display: str | None = None
     residence_province_code: str | None
     residence_city_code: str | None
     residence_district_code: str | None
+    residence_display: str | None = None
     self_intro: str | None
     interest_tags: list[str]
     personality_tags: list[str]

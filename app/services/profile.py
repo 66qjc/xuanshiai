@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.profile_tags import TAG_CATEGORIES
+from app.services.regions import region_display
 from app.schemas.admin import MediaReviewRequest, MediaReviewResponse
 from app.schemas.auth import (
     CompletionItemResponse,
@@ -238,6 +239,18 @@ async def get_profile(db: AsyncSession, user_id: int, public: bool = False) -> d
     data["photos"] = photos
     data["video"] = videos[0] if videos else None
     data["background_wall"] = backgrounds[0]["file_url"] if backgrounds else None
+    income = data.get("income")
+    data["income_display"] = (
+        f"{float(income) / 10000:.1f}".rstrip("0").rstrip(".") + "w"
+        if income is not None
+        else None
+    )
+    data["hometown_display"] = region_display(
+        data.get("hometown_province_code"), data.get("hometown_city_code"), data.get("hometown_district_code")
+    )
+    data["residence_display"] = region_display(
+        data.get("residence_province_code"), data.get("residence_city_code"), data.get("residence_district_code")
+    )
     if public:
         # Public profile responses must not expose exact location or income by default.
         for field in ("income", "hometown_province_code", "hometown_city_code", "hometown_district_code", "residence_province_code", "residence_city_code", "residence_district_code"):

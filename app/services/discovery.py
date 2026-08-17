@@ -210,6 +210,7 @@ def _card(row: dict[str, Any], score: float, reason: str, detail_locked: bool = 
         match_score=score,
         match_reason=reason,
         is_favorite=bool(row.get("is_favorite")),
+        is_vip=bool(row.get("is_vip")),
         is_pure_free=not bool(row.get("is_vip")) and not bool(row.get("is_boosted")),
         is_boosted=bool(row.get("is_boosted")),
         detail_locked=detail_locked,
@@ -310,7 +311,6 @@ async def _fetch_rows(
         ])
     if not plaza:
         clauses.extend([
-            "NOT EXISTS (SELECT 1 FROM user_browse_history bh WHERE bh.user_id = :viewer_id AND bh.target_user_id = u.id)",
             "NOT EXISTS (SELECT 1 FROM user_swipe_record sw WHERE sw.user_id = :viewer_id AND sw.target_user_id = u.id AND sw.action = 2)",
             "NOT EXISTS (SELECT 1 FROM match_apply ma WHERE ((ma.from_user_id = :viewer_id AND ma.to_user_id = u.id) OR (ma.from_user_id = u.id AND ma.to_user_id = :viewer_id)) AND ma.status IN (0, 1))",
         ])
@@ -580,6 +580,16 @@ async def visitors(db: AsyncSession, viewer_id: int, page: int, page_size: int) 
         if int(row["user_id"]) in targets
     ]
     return VisitorPage(can_view_details=True, count=count, items=items, page=page, page_size=page_size, has_more=page * page_size < count)
+
+
+async def visitor_count(db: AsyncSession, viewer_id: int, target_id: int) -> dict[str, int]:
+    """Return only the deduplicated visitor count for a visible user."""
+    await _ensure_target(db, viewer_id, target_id)
+    result = await db.execute(
+        text("SELECT COUNT(DISTINCT user_id) FROM user_browse_history WHERE target_user_id = :target_id"),
+        {"target_id": target_id},
+    )
+    return {"user_id": target_id, "visitor_count": int(result.scalar() or 0)}
 
 
 async def _ensure_target(db: AsyncSession, viewer_id: int, target_id: int) -> None:

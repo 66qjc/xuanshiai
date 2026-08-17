@@ -78,6 +78,7 @@ class DiscoveryCard(BaseModel):
     match_score: float
     match_reason: str
     is_favorite: bool
+    is_vip: bool = False
     is_pure_free: bool
     is_boosted: bool
     detail_locked: bool = False
@@ -121,6 +122,11 @@ class VisitorPage(BaseModel):
     page: int
     page_size: int
     has_more: bool
+
+
+class VisitorCountResponse(BaseModel):
+    user_id: int
+    visitor_count: int
 
 
 class PublicProfileResponse(BaseModel):

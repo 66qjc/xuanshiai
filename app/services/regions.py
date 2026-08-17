@@ -47,3 +47,30 @@ def list_districts(city_code: str) -> RegionListResponse:
         if city is not None:
             return _response(city.get("children", []))
     raise HTTPException(404, detail="城市编码不存在")
+
+
+def region_name(code: str | None) -> str | None:
+    """Resolve one administrative code to its display name."""
+    if not code:
+        return None
+    wanted = str(code)
+    for province in _REGIONS:
+        if str(province.get("code")) == wanted:
+            return str(province.get("name"))
+        for city in province.get("children", []):
+            if str(city.get("code")) == wanted:
+                return str(city.get("name"))
+            for district in city.get("children", []):
+                if str(district.get("code")) == wanted:
+                    return str(district.get("name"))
+    return None
+
+
+def region_display(province_code: str | None, city_code: str | None, district_code: str | None) -> str | None:
+    """Build a safe province/city/district label without exposing raw codes."""
+    province = str(province_code)[:2] if province_code else None
+    city = str(city_code)[:4] if city_code else None
+    district = str(district_code)[:6] if district_code else None
+    names = [region_name(code) for code in (province, city, district)]
+    names = [name for name in names if name and name not in {"市辖区", "县"}]
+    return " ".join(dict.fromkeys(names)) or None

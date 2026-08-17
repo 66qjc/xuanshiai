@@ -28,6 +28,7 @@ from app.schemas.discovery import (
     SavedFilterResponse,
     SuperLikeResponse,
     SuperLikePage,
+    VisitorCountResponse,
     VisitorPage,
 )
 from app.services.discovery import (
@@ -47,6 +48,7 @@ from app.services.discovery import (
     set_favorite,
     save_filter,
     view_profile,
+    visitor_count,
     visitors,
 )
 
@@ -157,6 +159,11 @@ async def received_superlikes(page: int = Query(1, ge=1, le=1000), page_size: in
 @users_router.get("/{user_id}/profile", response_model=PublicProfileResponse, summary="查看他人主页")
 async def public_profile(user_id: int = Path(..., ge=1), current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> PublicProfileResponse:
     return await view_profile(db, current.id, user_id)
+
+
+@users_router.get("/{user_id}/visitor-count", response_model=VisitorCountResponse, summary="查看他人主页访问人数")
+async def public_visitor_count(user_id: int = Path(..., ge=1), current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> VisitorCountResponse:
+    return VisitorCountResponse(**(await visitor_count(db, current.id, user_id)))
 
 
 @users_router.get("/{user_id}/poster", response_class=Response, summary="生成分享海报")

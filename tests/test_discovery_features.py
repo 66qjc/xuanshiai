@@ -126,11 +126,13 @@ def test_discovery_card_respects_privacy_and_detail_lock() -> None:
     assert card.education_level is None
     assert card.occupation is None
     assert card.distance_km is None
+    assert card.is_vip is False
 
-    locked = _card({**row, "hide_school": 0, "hide_company": 0, "hide_distance": 0}, 50, "资料匹配", detail_locked=True)
+    locked = _card({**row, "hide_school": 0, "hide_company": 0, "hide_distance": 0, "is_vip": 1}, 50, "资料匹配", detail_locked=True)
     assert locked.education_level is None
     assert locked.occupation is None
     assert locked.interest_tags == []
+    assert locked.is_vip is True
 
 
 def test_media_review_status_does_not_hide_an_otherwise_visible_user() -> None:
@@ -143,6 +145,30 @@ def test_media_review_status_does_not_hide_an_otherwise_visible_user() -> None:
         discovery.list_favorites,
     ):
         assert "pending_media" not in inspect.getsource(function)
+
+
+def test_recommendations_can_repeat_viewed_users() -> None:
+    source = inspect.getsource(discovery._fetch_rows)
+    assert "user_browse_history bh" not in source
+    assert "user_swipe_record sw" in source
+
+
+@pytest.mark.asyncio
+async def test_visitor_count_returns_only_a_deduplicated_number(monkeypatch: pytest.MonkeyPatch) -> None:
+    class Result:
+        def scalar(self) -> int:
+            return 3
+
+    class Session:
+        async def execute(self, *_args: object, **_kwargs: object) -> Result:
+            return Result()
+
+    async def visible_target(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(discovery, "_ensure_target", visible_target)
+
+    assert await discovery.visitor_count(Session(), viewer_id=1, target_id=2) == {"user_id": 2, "visitor_count": 3}
 
 
 @pytest.mark.asyncio
