@@ -1558,6 +1558,33 @@ class DatabaseManager:
             """,
 
             # ============================================
+            # AI 助手会话与消息
+            # ============================================
+            'ai_assistant_session': """
+                CREATE TABLE IF NOT EXISTS `ai_assistant_session` (
+                    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+                    `user_id` bigint unsigned NOT NULL,
+                    `title` varchar(80) NOT NULL DEFAULT 'AI助手会话',
+                    `status` tinyint NOT NULL DEFAULT '1',
+                    `created_at` datetime DEFAULT CURRENT_TIMESTAMP,
+                    `updated_at` datetime DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    PRIMARY KEY (`id`),
+                    KEY `idx_ai_session_user` (`user_id`,`status`,`updated_at`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='AI助手会话'
+            """,
+            'ai_assistant_message': """
+                CREATE TABLE IF NOT EXISTS `ai_assistant_message` (
+                    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+                    `session_id` bigint unsigned NOT NULL,
+                    `role` varchar(16) NOT NULL,
+                    `content` text NOT NULL,
+                    `created_at` datetime DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (`id`),
+                    KEY `idx_ai_message_session` (`session_id`,`created_at`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='AI助手消息'
+            """,
+
+            # ============================================
             # 22. 社区动态
             # ============================================
             'community_post': """

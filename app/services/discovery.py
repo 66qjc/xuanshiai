@@ -55,6 +55,10 @@ CARD_SELECT = """
            (p.residence_city_code IS NOT NULL AND p.residence_city_code =
              (SELECT vp2.residence_city_code FROM user_profile vp2 WHERE vp2.user_id = :viewer_id)) AS same_city,
            p.mbti, p.interest_tags, p.personality_tags, p.tags,
+           cp.age_min AS candidate_age_min, cp.age_max AS candidate_age_max,
+           cp.height_min AS candidate_height_min, cp.height_max AS candidate_height_max,
+           cp.education_min AS candidate_education_min, cp.income_min AS candidate_income_min,
+           cp.marriage_status AS candidate_marriage_status,
            CASE WHEN p.online_status = 2 THEN 2
                 WHEN p.last_active_at IS NOT NULL AND p.last_active_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 90 SECOND) THEN 1
                 ELSE 0 END AS online_status,
@@ -84,6 +88,7 @@ CARD_SELECT = """
     LEFT JOIN user_auth ua ON ua.user_id = u.id
     LEFT JOIN user_privacy pr ON pr.user_id = u.id
     LEFT JOIN user_partner_preference vp ON vp.user_id = :viewer_id
+    LEFT JOIN user_partner_preference cp ON cp.user_id = u.id
 """
 
 

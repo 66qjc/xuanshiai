@@ -129,7 +129,16 @@ async def complete_test_payment(db: AsyncSession, user_id: int, body: TestPaymen
         await db.execute(text("UPDATE payment_order SET status=1, transaction_id=:transaction_id, pay_time=UTC_TIMESTAMP() WHERE id=:id"), {"transaction_id": transaction_id, "id": order["id"]})
         order_type = int(order["type"])
         if order_type == 1:
-            package = (await db.execute(text("SELECT code, duration_days FROM config_membership_package WHERE code=:code"), {"code": order["product_type"]})).mappings().first()
+            package_code = order["product_type"]
+            package = (await db.execute(text("SELECT code, duration_days FROM config_membership_package WHERE code=:code"), {"code": package_code})).mappings().first()
+            # Repair orders created before the product_type/product_name fix.
+            # Those rows contain a numeric product_type (legacy product id)
+            # and the display name in product_name.
+            if not package and str(package_code).isdigit():
+                package = (await db.execute(text("SELECT code, duration_days FROM config_membership_package WHERE name=:name AND is_active=1 LIMIT 1"), {"name": order["product_name"]})).mappings().first()
+                if package:
+                    package_code = package["code"]
+                    await db.execute(text("UPDATE payment_order SET product_type=:package_code WHERE id=:id"), {"package_code": package_code, "id": order["id"]})
             if not package:
                 raise HTTPException(422, detail="会员套餐不存在")
             start_at = datetime.now(UTC).replace(tzinfo=None)
