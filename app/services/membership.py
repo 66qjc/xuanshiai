@@ -79,6 +79,8 @@ async def create_order(db: AsyncSession, user_id: int, body: CreateMembershipOrd
     existing = await db.execute(text("SELECT order_no,product_type,product_name,amount,pay_type,status,expire_at FROM payment_order WHERE user_id=:uid AND idempotency_key=:key"), {"uid": user_id, "key": idempotency_key})
     row = existing.mappings().first()
     if row:
+        if str(row["product_type"]) != body.package_code:
+            raise HTTPException(409, detail="Idempotency-Key 已用于其他会员套餐，请更换新的幂等键")
         return MembershipOrderResponse(order_no=row["order_no"], package_code=str(row["product_type"]), product_name=row["product_name"], amount=float(row["amount"]), pay_type=row["pay_type"], status=row["status"], expire_at=row["expire_at"], payment_required=row["status"] == 0)
     package = (await db.execute(text("SELECT id,code,name,price FROM config_membership_package WHERE code=:code AND is_active=1"), {"code": body.package_code})).mappings().first()
     if not package:
