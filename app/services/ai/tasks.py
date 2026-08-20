@@ -272,15 +272,21 @@ async def _find_by_idempotency(
     task_type: str,
     idempotency_key: str,
     *,
-    for_update: bool = False,
+    lock: str = "",
 ) -> AiTaskRecord | None:
-    lock = " FOR UPDATE" if for_update else ""
+    """Look up a task by its unique (owner, type, key).
+
+    ``lock`` selects the current-read mode: ``""`` for a plain snapshot read,
+    ``"FOR UPDATE"`` (X lock) or ``"FOR SHARE"`` (S lock) for a locking read.
+    """
+    if lock not in {"", "FOR UPDATE", "FOR SHARE"}:
+        raise ValueError(f"unsupported lock mode: {lock!r}")
     result = await db.execute(
         text(
             f"SELECT {_SELECT_COLUMNS} FROM ai_task "
             "WHERE owner_user_id = :owner_user_id AND task_type = :task_type "
             "AND idempotency_key = :idempotency_key "
-            f"LIMIT 1{lock}"
+            f"LIMIT 1{(' ' + lock) if lock else ''}"
         ),
         {
             "owner_user_id": owner_user_id,
@@ -478,13 +484,16 @@ async def enqueue_task(
         # The caller may already have established a REPEATABLE READ snapshot
         # while checking visibility. A locking read is a MySQL current read,
         # so it observes the committed winner that caused this duplicate-key
-        # error instead of re-raising the race.
+        # error instead of re-raising the race.  It must be FOR SHARE: the
+        # failed INSERT left an S lock on the duplicate index record, and an
+        # X request here deadlocks against a sibling loser holding the same
+        # S lock (each holds S while waiting for the other's X).
         existing = await _find_by_idempotency(
             db,
             owner_user_id,
             task_type,
             idempotency_key,
-            for_update=True,
+            lock="FOR SHARE",
         )
         if existing is None:
             raise

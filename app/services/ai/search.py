@@ -99,7 +99,20 @@ SEARCH_CLEANUP_TASK_TYPE = "cleanup"
 SEARCH_RESULT_TTL_MINUTES = 10
 SEARCH_PAGE_SIZE_DEFAULT = 20
 SEARCH_MATERIALIZATION_LIMIT = 200
-_MATERIALIZED_CURSOR_VERSION = "ai-search-result-v1"
+# Task8 Step2：cursor 版本升级到 v2，编码 (generation, rank_position, target_user_id)
+# 三元组。旧 v1 cursor 只编码 (snapshot_id, rank_position)，在 generation 切换后失效，
+# 解码时若 generation 不匹配当前 active generation 则抛 InvalidCandidateCursor，
+# 让前端重新拉第一页。
+_MATERIALIZED_CURSOR_VERSION_V1 = "ai-search-result-v1"
+_MATERIALIZED_CURSOR_VERSION = "ai-search-result-v2"
+# Task8 Step2：snapshot 级 active generation 追踪。用 ai_search_snapshot.status
+# 之外的轻量字段记录当前 active generation；为最小加法，在 snapshot 行的
+# ``result_total`` 之外新增一个 generation 列。但为避免再加 DDL，这里采用
+# snapshot 行的 ``degraded`` 字段高位复用——不，那会破坏语义。
+# 最小加法方案：在 ``ai_search_snapshot`` 表不加列，而是在 ``ai_search_result`` 表
+# 用 generation 列 + ``MAX(generation) WHERE stale=0`` 派生 active generation。
+# 这样 snapshot 表无 DDL，generation 完全由 result 行派生。
+_SEARCH_RESULT_DEFAULT_GENERATION = 1
 
 # Task 1 冻结的 10 个 allowlist 字段 → operator/kind 静态映射（逐字，统一方案 §8.1）。
 FIELD_RULES: dict[str, dict[str, Any]] = {
@@ -370,7 +383,7 @@ class CompiledFilters(DiscoveryFilters):
     ``app/schemas/discovery.py`` 的既有 Schema。
     """
 
-    def with_condition(self, condition: SearchCondition) -> "CompiledFilters":
+    def with_condition(self, condition: SearchCondition) -> CompiledFilters:
         field_key = condition.field_key
         operator = _enum_value(condition.operator)
         value = condition.value
@@ -1769,19 +1782,24 @@ async def _upsert_result_row(
     rank_position: int,
     evidence: SearchEvidence,
     result_expires_at: datetime,
+    *,
+    generation: int = _SEARCH_RESULT_DEFAULT_GENERATION,
 ) -> None:
+    # Task8 Step2：upsert 时携带 generation。ON DUPLICATE KEY UPDATE 也更新
+    # generation，保证同一 (snapshot_id, target_user_id) 的行在新 generation 下
+    # 被正确刷新；旧 generation 的行由 materialize 成功后统一清理。
     await db.execute(
         text(
             "INSERT INTO ai_search_result "
             "(snapshot_id, target_user_id, rank_position, matched_condition_count, "
             " matched_conditions, unknown_conditions, reason_codes, profile_revision, "
             " projection_id, source_hash, consent_snapshot_json, source_revision_json, "
-            " result_expires_at, stale, created_at) "
+            " result_expires_at, stale, generation, created_at) "
             "VALUES (:snapshot_id, :target_user_id, :rank_position, "
             " :matched_condition_count, :matched_conditions, :unknown_conditions, "
             " :reason_codes, :profile_revision, :projection_id, :source_hash, "
             " :consent_snapshot_json, :source_revision_json, :result_expires_at, "
-            " 0, UTC_TIMESTAMP()) "
+            " 0, :generation, UTC_TIMESTAMP()) "
             "ON DUPLICATE KEY UPDATE "
             " rank_position = VALUES(rank_position), "
             " matched_condition_count = VALUES(matched_condition_count), "
@@ -1794,7 +1812,8 @@ async def _upsert_result_row(
             " consent_snapshot_json = VALUES(consent_snapshot_json), "
             " source_revision_json = VALUES(source_revision_json), "
             " result_expires_at = VALUES(result_expires_at), "
-            " stale = 0"
+            " stale = 0, "
+            " generation = VALUES(generation)"
         ),
         {
             "snapshot_id": snapshot_id,
@@ -1818,16 +1837,30 @@ async def _upsert_result_row(
                 evidence.source_revision, ensure_ascii=False
             ) if evidence.source_revision is not None else None,
             "result_expires_at": result_expires_at,
+            "generation": generation,
         },
     )
 
 
-def _encode_materialized_cursor(snapshot_id: str, rank_position: int) -> str:
+def _encode_materialized_cursor(
+    snapshot_id: str,
+    rank_position: int,
+    *,
+    generation: int = _SEARCH_RESULT_DEFAULT_GENERATION,
+    target_user_id: int = 0,
+) -> str:
+    """Task8 Step2：cursor 编码 (generation, rank_position, target_user_id) 三元组。
+
+    ``target_user_id`` 作为相同 rank 的稳定 tie-break 锚点，保证多页翻页无重复/漏项。
+    ``generation`` 用于在 active generation 切换后让旧 cursor 失效。
+    """
     payload = json.dumps(
         {
             "version": _MATERIALIZED_CURSOR_VERSION,
             "snapshot_id": snapshot_id,
             "rank_position": int(rank_position),
+            "generation": int(generation),
+            "target_user_id": int(target_user_id),
         },
         separators=(",", ":"),
     ).encode("utf-8")
@@ -1838,7 +1871,21 @@ def _encode_materialized_cursor(snapshot_id: str, rank_position: int) -> str:
     return f"{encoded}.{base64.urlsafe_b64encode(signature).decode('ascii').rstrip('=')}"
 
 
-def _decode_materialized_cursor(snapshot_id: str, token: str) -> int:
+def _decode_materialized_cursor(
+    snapshot_id: str,
+    token: str,
+    *,
+    active_generation: int | None = None,
+) -> tuple[int, int]:
+    """Task8 Step2：解码 cursor，返回 (rank_position, target_user_id)。
+
+    ``active_generation`` 不为 None 时，校验 cursor 内的 generation 必须匹配当前
+    active generation；不匹配抛 ``InvalidCandidateCursor``（让前端重新拉第一页）。
+
+    向后兼容：旧 v1 cursor（只含 snapshot_id + rank_position，无 generation）在
+    ``active_generation is None`` 或 ``active_generation == 1`` 时仍可解码，返回
+    ``(rank_position, 0)``。若 active generation 已切换到 >1，旧 v1 cursor 失效。
+    """
     if not token or len(token) > 512 or "." not in token:
         raise InvalidCandidateCursor("invalid materialized search cursor")
     encoded, signature = token.split(".", 1)
@@ -1856,34 +1903,88 @@ def _decode_materialized_cursor(snapshot_id: str, token: str) -> int:
         )
     except (ValueError, TypeError, UnicodeError, json.JSONDecodeError) as exc:
         raise InvalidCandidateCursor("invalid materialized search cursor") from exc
-    if (
-        payload.get("version") != _MATERIALIZED_CURSOR_VERSION
-        or payload.get("snapshot_id") != snapshot_id
-        or not isinstance(payload.get("rank_position"), int)
-        or payload["rank_position"] < 0
-    ):
+
+    version = payload.get("version")
+    if version not in {_MATERIALIZED_CURSOR_VERSION, _MATERIALIZED_CURSOR_VERSION_V1}:
         raise InvalidCandidateCursor("invalid materialized search cursor")
-    return int(payload["rank_position"])
+    if payload.get("snapshot_id") != snapshot_id:
+        raise InvalidCandidateCursor("invalid materialized search cursor")
+    if not isinstance(payload.get("rank_position"), int) or payload["rank_position"] < 0:
+        raise InvalidCandidateCursor("invalid materialized search cursor")
+
+    rank_position = int(payload["rank_position"])
+
+    # v1 旧 cursor：无 generation/target_user_id 字段
+    if version == _MATERIALIZED_CURSOR_VERSION_V1:
+        # 旧 cursor 在 active generation >1 时失效（generation 已切换）
+        if active_generation is not None and active_generation > _SEARCH_RESULT_DEFAULT_GENERATION:
+            raise InvalidCandidateCursor("stale cursor: generation switched")
+        return rank_position, 0
+
+    # v2 新 cursor：校验 generation
+    cursor_generation = payload.get("generation")
+    if not isinstance(cursor_generation, int) or cursor_generation < 1:
+        raise InvalidCandidateCursor("invalid materialized search cursor")
+    if active_generation is not None and cursor_generation != active_generation:
+        raise InvalidCandidateCursor("stale cursor: generation mismatch")
+    target_user_id = payload.get("target_user_id")
+    if not isinstance(target_user_id, int) or target_user_id < 0:
+        raise InvalidCandidateCursor("invalid materialized search cursor")
+    return rank_position, int(target_user_id)
+
+
+async def _load_active_generation(
+    db: AsyncSession, snapshot_id: str
+) -> int:
+    """Task8 Step2：派生 snapshot 的 active generation。
+
+    最小加法：不加 DDL 到 snapshot 表，而是从 ``ai_search_result`` 表的
+    ``MAX(generation) WHERE stale=0`` 派生 active generation。无结果行时返回默认 1。
+    """
+    result = await db.execute(
+        text(
+            "SELECT MAX(generation) AS active_generation FROM ai_search_result "
+            "WHERE snapshot_id = :snapshot_id AND stale = 0"
+        ),
+        {"snapshot_id": snapshot_id},
+    )
+    row = await _first_row(result)
+    if row is None or row.get("active_generation") is None:
+        return _SEARCH_RESULT_DEFAULT_GENERATION
+    return int(row["active_generation"])
 
 
 async def _load_materialized_result_rows(
-    db: AsyncSession, snapshot_id: str, after_rank: int, limit: int
+    db: AsyncSession,
+    snapshot_id: str,
+    after_rank: int,
+    limit: int,
+    *,
+    active_generation: int | None = None,
 ) -> list[dict[str, Any]]:
+    # Task8 Step2：按 active generation 过滤，并用 target_user_id 做相同 rank 的
+    # 稳定 tie-break。active_generation 为 None 时退化为旧行为（兼容旧调用点）。
+    generation_clause = ""
+    params: dict[str, Any] = {
+        "snapshot_id": snapshot_id,
+        "after_rank": int(after_rank),
+        "limit": int(limit),
+    }
+    if active_generation is not None:
+        generation_clause = "AND generation = :active_generation "
+        params["active_generation"] = int(active_generation)
     result = await db.execute(
         text(
             "SELECT target_user_id, projection_id, source_hash, rank_position, "
             "matched_condition_count, matched_conditions, unknown_conditions, "
             "reason_codes, profile_revision, consent_snapshot_json, "
-            "source_revision_json, result_expires_at, stale "
-            "FROM ai_search_result WHERE snapshot_id = :snapshot_id "
-            "AND stale = 0 AND rank_position > :after_rank "
-            "ORDER BY rank_position ASC LIMIT :limit"
+            "source_revision_json, result_expires_at, stale, generation "
+            f"FROM ai_search_result WHERE snapshot_id = :snapshot_id "
+            f"AND stale = 0 {generation_clause}"
+            "AND rank_position > :after_rank "
+            "ORDER BY rank_position ASC, target_user_id ASC LIMIT :limit"
         ),
-        {
-            "snapshot_id": snapshot_id,
-            "after_rank": int(after_rank),
-            "limit": int(limit),
-        },
+        params,
     )
     return [dict(row) for row in result.mappings().all()]
 
@@ -2094,6 +2195,15 @@ async def materialize_search_snapshot(
     )
     materialized = visible[:SEARCH_MATERIALIZATION_LIMIT]
     result_expires_at = _now_utc() + timedelta(minutes=SEARCH_RESULT_TTL_MINUTES)
+    # Task8 Step2：atomic generation。先读当前 active generation，写新 generation
+    # = active + 1 的行；成功后把旧 generation 的行（不在新结果中的候选）标记
+    # stale 或删除，原子切换 active generation。同一 (snapshot_id, target_user_id)
+    # 的行由 upsert 覆盖为新 generation；旧候选（不再在新结果中）由
+    # ``DELETE WHERE generation < new_generation`` 清理，保证「候选集合变化时
+    # 旧候选为 0」。
+    active_generation = await _load_active_generation(db, snapshot_id)
+    new_generation = active_generation + 1
+    # 先删除旧 generation 中 rank_position > limit 的溢出行
     await db.execute(
         text("DELETE FROM ai_search_result WHERE snapshot_id = :snapshot_id AND rank_position > :limit"),
         {"snapshot_id": snapshot_id, "limit": SEARCH_MATERIALIZATION_LIMIT},
@@ -2106,7 +2216,17 @@ async def materialize_search_snapshot(
             rank_position,
             evidence,
             result_expires_at,
+            generation=new_generation,
         )
+    # 原子切换 active generation：删除旧 generation 的所有行（不在新结果中的候选）
+    # 这保证「同 snapshot 第一次 200 候选、第二次候选集合变化时旧候选为 0」。
+    await db.execute(
+        text(
+            "DELETE FROM ai_search_result "
+            "WHERE snapshot_id = :snapshot_id AND generation < :new_generation"
+        ),
+        {"snapshot_id": snapshot_id, "new_generation": new_generation},
+    )
     total = len(visible)
     degraded = total > SEARCH_MATERIALIZATION_LIMIT
     status_value = "partial" if degraded else ("empty" if total == 0 else "completed")
@@ -2137,13 +2257,27 @@ async def materialize_search_snapshot(
         )
         for _, row, evidence in materialized[:SEARCH_PAGE_SIZE_DEFAULT]
     ]
+    # Task8 Step2：next_cursor 编码当前 new generation 和首页最后一行的
+    # target_user_id 作为稳定 tie-break 锚点。只有当结果数 > 页大小且
+    # materialized 列表足够长时才生成 cursor。
+    first_page_last_uid = (
+        int(materialized[SEARCH_PAGE_SIZE_DEFAULT - 1][1]["user_id"])
+        if len(materialized) > SEARCH_PAGE_SIZE_DEFAULT
+        else 0
+    )
     return SearchResultPageRead(
         snapshot_id=snapshot_id,
         status=status_value,
         items=items,
         next_cursor=(
-            _encode_materialized_cursor(snapshot_id, SEARCH_PAGE_SIZE_DEFAULT)
+            _encode_materialized_cursor(
+                snapshot_id,
+                SEARCH_PAGE_SIZE_DEFAULT,
+                generation=new_generation,
+                target_user_id=first_page_last_uid,
+            )
             if total > SEARCH_PAGE_SIZE_DEFAULT
+            and len(materialized) > SEARCH_PAGE_SIZE_DEFAULT
             else None
         ),
         total=total,
@@ -2165,10 +2299,18 @@ async def read_materialized_search_results(
         raise SearchSnapshotNotFound()
     if snapshot.get("invalidated_at") is not None:
         raise SearchSnapshotNotFound()
+    # Task8 Step2：读 active generation，用于 cursor generation 校验。
+    active_generation = await _load_active_generation(db, snapshot_id)
     # Validate a supplied cursor before returning a stale page.  A malformed or
     # cross-snapshot token is still a client error even when the snapshot is no
-    # longer readable.
-    after_rank = _decode_materialized_cursor(snapshot_id, cursor) if cursor else 0
+    # longer readable.  旧 v1 cursor 在 active generation >1 时失效。
+    after_rank, cursor_target_user_id = (
+        _decode_materialized_cursor(
+            snapshot_id, cursor, active_generation=active_generation
+        )
+        if cursor
+        else (0, 0)
+    )
     if _is_expired(snapshot.get("expires_at")):
         return SearchResultPageRead(snapshot_id=snapshot_id, status="stale")
     owner_source = _maybe_json(snapshot.get("source_revision_json")) or {}
@@ -2179,7 +2321,8 @@ async def read_materialized_search_results(
     if owner_consent and not await _active_consent_matches(db, owner_user_id, owner_consent):
         return SearchResultPageRead(snapshot_id=snapshot_id, status="stale")
     stored_rows = await _load_materialized_result_rows(
-        db, snapshot_id, after_rank, page_size + 1
+        db, snapshot_id, after_rank, page_size + 1,
+        active_generation=active_generation,
     )
     has_more = len(stored_rows) > page_size
     stored_rows = stored_rows[:page_size]
@@ -2216,13 +2359,21 @@ async def read_materialized_search_results(
             )
         )
     status_value = str(snapshot.get("status") or "completed")
+    # Task8 Step2：next_cursor 编码当前 active generation 和最后一行的 target_user_id
+    # 作为稳定 tie-break 锚点。
+    last_row = stored_rows[-1] if stored_rows else None
     return SearchResultPageRead(
         snapshot_id=snapshot_id,
         status=status_value,
         items=items,
         next_cursor=(
-            _encode_materialized_cursor(snapshot_id, int(stored_rows[-1]["rank_position"]))
-            if has_more and stored_rows
+            _encode_materialized_cursor(
+                snapshot_id,
+                int(last_row["rank_position"]),
+                generation=active_generation,
+                target_user_id=int(last_row["target_user_id"]),
+            )
+            if has_more and last_row
             else None
         ),
         total=int(snapshot.get("result_total") or 0),
@@ -2251,11 +2402,14 @@ async def search_execute_handler(
         )
         return None
     try:
+        # G2-C 门禁约束：handler 会话不得写 ai_task 行（stage 更新会在本会话
+        # 持有任务行的 X 锁，使 complete_task 在独立 finalize 会话的 FOR UPDATE
+        # 自锁超时）。因此不传 task_id——物化进度以 ai_search_snapshot.status
+        # 为可观测通道，任务终态由 complete_task 门禁统一写入。
         await materialize_search_snapshot(
             db,
             str(snapshot_id),
             task.owner_user_id,
-            task_id=task.task_id,
         )
     except (SearchSnapshotNotFound, SearchDraftNotConfirmed, SearchInputInvalid):
         await fail_task(

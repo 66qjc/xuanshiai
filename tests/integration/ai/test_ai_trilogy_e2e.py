@@ -18,8 +18,9 @@ from app.schemas.ai_profile import (
     ProfileSubject,
 )
 from app.services.ai.compatibility import (
-    request_compatibility_recompute,
+    CandidateNotVisible,
     read_compatibility_snapshot,
+    request_compatibility_recompute,
 )
 from app.services.ai.consents import grant_consent, list_consents
 from app.services.ai.profile import (
@@ -31,7 +32,6 @@ from app.services.ai.profile import (
 from app.services.ai.search import confirm_search_draft, read_materialized_search_results
 from app.services.ai.tasks import claim_tasks
 from app.workers.ai_worker import _process
-
 
 POLICY_REVISION = "ai-policy-2026-08-07-v1"
 PROFILE_SCOPE = ("profile_text_extract", "profile-text-v1")
@@ -64,9 +64,7 @@ async def _cleanup_pair(db: AsyncSession) -> None:
         "DELETE FROM ai_consent_operation WHERE user_id IN (:a, :b)",
         "DELETE FROM ai_consent_grant WHERE user_id IN (:a, :b)",
         "DELETE FROM derivation_outbox WHERE aggregate_id IN (:a, :b)",
-        "DELETE r FROM derivation_consumer_receipt r "
-        "JOIN derivation_outbox o ON o.event_id = r.event_id "
-        "WHERE o.aggregate_id IN (:a, :b)",
+        "DELETE r FROM derivation_consumer_receipt r JOIN derivation_outbox o ON o.event_id = r.event_id WHERE o.aggregate_id IN (:a, :b)",
         "DELETE FROM user_block WHERE user_id IN (:a, :b) OR target_user_id IN (:a, :b)",
         "DELETE FROM user_revision_state WHERE user_id IN (:a, :b)",
         "DELETE FROM user_profile_completion WHERE user_id IN (:a, :b)",
@@ -315,7 +313,7 @@ async def test_ai_trilogy_e2e_real_db_closes_profile_search_compatibility_loop(
     real_db_session: AsyncSession,
     real_db_engine: AsyncEngine,
 ) -> None:
-    factory, consent_a, consent_b = await _prepare_ready_pair(
+    factory, consent_a, _ = await _prepare_ready_pair(
         real_db_session, real_db_engine
     )
 
@@ -435,7 +433,7 @@ async def test_ai_trilogy_e2e_real_db_closes_profile_search_compatibility_loop(
     assert compat_read.compatibility_index is not None
     assert compat_read.coverage >= 0.5
     assert compat_read.reason_codes
-    assert compat_read.direction
+    assert compat_read.directions is not None
     compat_row = (
         await real_db_session.execute(
             text(
@@ -466,8 +464,11 @@ async def test_ai_trilogy_e2e_real_db_closes_profile_search_compatibility_loop(
         20,
     )
     assert hidden_page.items == []
-    hidden_compat = await read_compatibility_snapshot(real_db_session, USER_A, USER_B)
-    assert hidden_compat.status.value == "blocked"
+    # 目标隐藏后硬门禁先于一切：读取 404 CANDIDATE_NOT_VISIBLE，不泄露归属
+    #（docs/api/AI匹配度.md 硬门禁契约），而不是返回 blocked 快照。
+    with pytest.raises(CandidateNotVisible) as hidden_exc:
+        await read_compatibility_snapshot(real_db_session, USER_A, USER_B)
+    assert hidden_exc.value.code == "CANDIDATE_NOT_VISIBLE"
 
     await _cleanup_pair(real_db_session)
 
@@ -504,6 +505,10 @@ async def test_compatibility_recompute_is_idempotent_under_20_requests_and_two_w
         _run_worker_round(factory, "worker-b", limit=1),
     )
     assert sorted((len(claimed_a), len(claimed_b))) == [0, 1]
+
+    # real_db_session 的 REPEATABLE READ 快照早于并发请求与 worker 提交；先
+    # 结束旧事务，让下方计数读以新快照观察提交后的 ai_task/快照行。
+    await real_db_session.commit()
 
     task_count = await real_db_session.scalar(
         text(

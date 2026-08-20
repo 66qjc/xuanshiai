@@ -8,7 +8,8 @@ can be exercised without a real model.
 
 from __future__ import annotations
 
-from typing import Any, Callable, Iterable
+from collections.abc import Callable, Iterable
+from typing import Any
 
 from app.schemas.ai_profile import ProfileSubject
 from app.services.ai.base import (

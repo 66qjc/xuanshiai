@@ -22,9 +22,11 @@ async def vip_members(page: int = Query(1, ge=1, le=1000), page_size: int = Quer
     where = ["m.status = 1", "(m.end_at IS NULL OR m.end_at > UTC_TIMESTAMP())"]
     params: dict = {"limit": page_size, "offset": (page - 1) * page_size}
     if expiring_within_days is not None:
-        where.append("m.end_at IS NOT NULL AND m.end_at <= DATE_ADD(UTC_TIMESTAMP(), INTERVAL :days DAY)"); params["days"] = expiring_within_days
+        where.append("m.end_at IS NOT NULL AND m.end_at <= DATE_ADD(UTC_TIMESTAMP(), INTERVAL :days DAY)")
+        params["days"] = expiring_within_days
     if search:
-        where.append("(u.nickname LIKE CONCAT('%', :search, '%') OR u.phone LIKE CONCAT('%', :search, '%'))"); params["search"] = search
+        where.append("(u.nickname LIKE CONCAT('%', :search, '%') OR u.phone LIKE CONCAT('%', :search, '%'))")
+        params["search"] = search
     clause = " AND ".join(where)
     base = "FROM user_membership m JOIN users u ON u.id = m.user_id"
     rows = await db.execute(text(f"SELECT m.id membership_id, m.user_id, u.nickname, u.phone, m.package_type, m.amount, m.order_no, m.start_at, m.end_at, m.status {base} WHERE {clause} ORDER BY m.end_at IS NULL, m.end_at ASC, m.id DESC LIMIT :limit OFFSET :offset"), params)

@@ -57,13 +57,17 @@ async def list_leads(db: AsyncSession, page: int, page_size: int, status: str | 
     where = ["1=1"]
     params: dict[str, Any] = {"limit": page_size, "offset": (page - 1) * page_size}
     if status:
-        where.append("status = :status"); params["status"] = status
+        where.append("status = :status")
+        params["status"] = status
     if source:
-        where.append("source = :source"); params["source"] = source
+        where.append("source = :source")
+        params["source"] = source
     if matchmaker_id is not None:
-        where.append("matchmaker_id = :matchmaker_id"); params["matchmaker_id"] = matchmaker_id
+        where.append("matchmaker_id = :matchmaker_id")
+        params["matchmaker_id"] = matchmaker_id
     if search:
-        where.append("(name LIKE CONCAT('%', :search, '%') OR phone LIKE CONCAT('%', :search, '%') OR wechat LIKE CONCAT('%', :search, '%'))"); params["search"] = search
+        where.append("(name LIKE CONCAT('%', :search, '%') OR phone LIKE CONCAT('%', :search, '%') OR wechat LIKE CONCAT('%', :search, '%'))")
+        params["search"] = search
     clause = " AND ".join(where)
     rows = await db.execute(text(f"{LEAD_SELECT} WHERE {clause} ORDER BY id DESC LIMIT :limit OFFSET :offset"), params)
     count = await db.execute(text(f"SELECT COUNT(*) FROM customer_lead WHERE {clause}"), {k: v for k, v in params.items() if k not in ("limit", "offset")})

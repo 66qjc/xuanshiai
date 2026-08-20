@@ -31,6 +31,15 @@ async def test_real_redis_is_visible_across_independent_connections(
         await other.aclose()
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason=(
+        "Windows 下 spawn 独立 worker 子进程继承事件循环句柄失败"
+        "（WinError 6/50）；跨进程 claim 验证改在 Linux 容器内执行："
+        "docker compose -f compose.ai-test.yml run --rm worker-a "
+        "python -m pytest tests/integration/ai/test_ai_worker_real_db.py -q"
+    ),
+)
 @pytest.mark.asyncio
 async def test_two_independent_worker_processes_claim_one_real_task(
     ai_test_environment: dict[str, str],
@@ -80,7 +89,7 @@ async def test_two_independent_worker_processes_claim_one_real_task(
             "1",
         ]
         processes = [
-            subprocess.Popen(
+            subprocess.Popen(  # noqa: ASYNC220 - 必须用真实 OS 进程验证跨进程 claim
                 command,
                 cwd=REPO_ROOT,
                 env=worker_env,

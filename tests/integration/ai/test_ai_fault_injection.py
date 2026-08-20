@@ -7,7 +7,6 @@ be a production outage drill.
 
 from __future__ import annotations
 
-import asyncio
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -21,7 +20,6 @@ from app.services.ai.providers import MockAIProvider
 from app.services.ai.search import _consume_parse_quota
 from app.services.ai.tasks import claim_tasks, enqueue_task, reap_expired_leases
 from app.workers.ai_worker import _process
-
 
 USER_ID = 9_876_544_210
 

@@ -9,7 +9,6 @@ from app.main import app
 from app.schemas.social import ChatMessageCreate
 from app.services import social as social_service
 
-
 client = TestClient(app)
 
 
@@ -35,11 +34,21 @@ class RecordingResult:
 
 
 def route_dependencies(path: str, method: str) -> set[object]:
+    contexts: list[object] = []
+    for included in app.routes:
+        if hasattr(included, "effective_route_contexts"):
+            # Starlette 0.49/0.50 的挂载上下文接口。
+            contexts.extend(included.effective_route_contexts())
+        elif (
+            getattr(included, "path", None) == path
+            and method in (getattr(included, "methods", None) or ())
+        ):
+            # Starlette 1.0 移除了 effective_route_contexts；FastAPI 展平后的
+            # 路由对象自带完整前缀 path/methods，直接匹配即可。
+            contexts.append(included)
     route = next(
         context
-        for included in app.routes
-        if hasattr(included, "effective_route_contexts")
-        for context in included.effective_route_contexts()
+        for context in contexts
         if context.path == path and method in context.methods
     )
     return {dependency.call for dependency in route.dependant.dependencies}

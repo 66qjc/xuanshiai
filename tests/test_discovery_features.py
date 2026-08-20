@@ -2,7 +2,6 @@ import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
-import app.services.discovery as discovery
 from app.main import app
 from app.schemas.discovery import (
     ApplicationCreateRequest,
@@ -10,16 +9,16 @@ from app.schemas.discovery import (
     DiscoveryFilters,
     DiscoverySearch,
 )
-from app.services.candidate_visibility import CandidateVisibilityService, ViewerContext
+from app.services import discovery
 from app.services.candidate_query import (
+    SORT_VERSION,
     CandidateCursor,
     CandidatePage,
     CandidateQueryService,
     InvalidCandidateCursor,
-    SORT_VERSION,
 )
+from app.services.candidate_visibility import CandidateVisibilityService, ViewerContext
 from app.services.discovery import _card
-
 
 client = TestClient(app)
 

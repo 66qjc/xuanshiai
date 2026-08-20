@@ -9,7 +9,6 @@ from enum import Enum
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-
 POLICY_REVISION = "ai-policy-2026-08-07-v1"
 _SQL_ALIAS = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 

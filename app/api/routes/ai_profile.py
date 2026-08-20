@@ -68,8 +68,8 @@ from app.services.ai.profile import (
     pause_profile_session,
     progress_value,
     publish_profile_draft,
-    resume_profile_session,
     restore_profile_revision,
+    resume_profile_session,
     submit_profile_turn,
 )
 from app.services.ai.tasks import TaskError
@@ -121,6 +121,16 @@ def _check_idempotency_key(idempotency_key: str | None) -> None:
 
 
 def _to_session_read(session: ProfileSession) -> ProfileSessionRead:
+    # Task6 Step2：current_question 透传稳定 field_key（加法，保留 id/text）；
+    # draft_id 透传活动草稿 ID（无活动草稿为 None）。两者均为加法字段，旧客户端
+    # 忽略新字段不受影响。
+    current_question: dict[str, str] | None = None
+    if session.current_question is not None:
+        current_question = {
+            "id": session.current_question.id,
+            "text": session.current_question.text,
+            "field_key": session.current_question.field_key,
+        }
     return ProfileSessionRead(
         session_id=session.session_id,
         subject=session.subject,
@@ -130,9 +140,8 @@ def _to_session_read(session: ProfileSession) -> ProfileSessionRead:
             basis="confirmed_field_coverage",
             value=progress_value(session.confirmed_keys),
         ),
-        current_question=(
-            session.current_question.model_dump() if session.current_question else None
-        ),
+        current_question=current_question,
+        draft_id=session.draft_id,
         profile_revision=session.profile_revision,
         preference_revision=session.preference_revision,
         expires_at=session.expires_at,
@@ -439,6 +448,26 @@ async def patch_profile_draft_route(
     response_model=ProfilePublishAccepted,
     status_code=status.HTTP_202_ACCEPTED,
     summary="发布已确认字段并创建投影任务",
+    openapi_extra={
+        # Task6 Step3：明确 expected_revision 是 query 参数（非 body），
+        # Idempotency-Key 是 required header。两者均在 OpenAPI 中显式声明。
+        "parameters": [
+            {
+                "name": "expected_revision",
+                "in": "query",
+                "required": True,
+                "schema": {"type": "integer", "minimum": 0},
+                "description": "草稿乐观锁版本；必须等于当前 draft 的 expected_revision",
+            },
+            {
+                "name": "Idempotency-Key",
+                "in": "header",
+                "required": True,
+                "schema": {"type": "string", "pattern": "^[A-Za-z0-9._:-]{8,128}$"},
+                "description": "幂等键；同 key 同 payload 回放同一任务",
+            },
+        ],
+    },
 )
 async def publish_profile_draft_route(
     draft_id: str = Path(..., min_length=1, max_length=64, pattern=r"^[a-z0-9_]+$"),
@@ -447,7 +476,12 @@ async def publish_profile_draft_route(
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     expected_revision: int | None = Query(default=None, ge=0, alias="expected_revision"),
 ) -> ProfilePublishAccepted:
-    """Publish only confirmed fields into an immutable revision + projection task."""
+    """Publish only confirmed fields into an immutable revision + projection task.
+
+    Task6 Step3：``expected_revision`` 作为 **query 参数** 传递（非 body），
+    与 draft PATCH body 内的 ``expected_revision``（逐项乐观锁）语义分离、互不冲突。
+    缺失 query 参数返回 ``400 AI_INPUT_INVALID``。
+    """
     _require_profile_feature()
     _check_idempotency_key(idempotency_key)
     if expected_revision is None:

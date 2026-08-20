@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -31,6 +31,10 @@ AI_FIELD_ALLOWLIST = frozenset(
 # consent scope 三个（Task 1 冻结）。
 CONSENT_SCOPES = frozenset({"profile_text_extract", "search_parse", "compatibility_shadow"})
 
+# 用于 OpenAPI path 参数，使 scope 在契约中呈现为枚举，与服务端注册表
+# ``CONSENT_SCOPES``（app/services/ai/consents.py 的 ``CONSENT_VERSIONS``）保持一致。
+AiConsentScope = Literal["profile_text_extract", "search_parse", "compatibility_shadow"]
+
 
 class AiTaskStatus(str, Enum):
     """Generic AI task state machine (统一方案 §6.4)."""
@@ -50,6 +54,8 @@ class AiErrorCode(str, Enum):
 
     AI_FEATURE_DISABLED = "AI_FEATURE_DISABLED"
     AI_CONSENT_REQUIRED = "AI_CONSENT_REQUIRED"
+    AI_CONSENT_VERSION_CONFLICT = "AI_CONSENT_VERSION_CONFLICT"
+    AI_CONSENT_IDEMPOTENCY_CONFLICT = "AI_CONSENT_IDEMPOTENCY_CONFLICT"
     AI_INPUT_INVALID = "AI_INPUT_INVALID"
     AI_POLICY_DENIED = "AI_POLICY_DENIED"
     AI_TEMPORARILY_UNAVAILABLE = "AI_TEMPORARILY_UNAVAILABLE"

@@ -11,25 +11,25 @@ through the TestClient.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
-import asyncio
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-import app.services.ai.profile as profile_mod
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 from sqlalchemy.exc import IntegrityError
 
+import app.services.ai.profile as profile_mod
 from app.api.dependencies import CurrentUser, get_current_user
 from app.core.config import settings
 from app.db.session import get_db
 from app.main import app
 from app.schemas.ai_profile import (
-    ProfileDraftRead,
     ProfileDraftFieldRead,
+    ProfileDraftRead,
     ProfileSubject,
 )
 from app.services.ai.base import (
@@ -38,12 +38,14 @@ from app.services.ai.base import (
     StructuredExtractResult,
 )
 from app.services.ai.gateway import InvokeOutcome
-from app.services.ai.providers import MockAIProvider
-from app.services.ai.tasks import AiTaskRecord, TaskError
 from app.services.ai.profile import (
+    _PROFILE_QUESTION_BANK,
+    AI_FIELD_ALLOWLIST,
     AIInputError,
+    ProfileSession,
     ProfileSessionNotFound,
     ProfileSessionStale,
+    ProfileSessionStatus,
     create_profile_session,
     extract_profile_turn,
     next_profile_question,
@@ -51,11 +53,8 @@ from app.services.ai.profile import (
     progress_value,
     submit_profile_turn,
 )
-from app.services.ai.profile import (
-    AI_FIELD_ALLOWLIST,
-    ProfileSession,
-    ProfileSessionStatus,
-)
+from app.services.ai.providers import MockAIProvider
+from app.services.ai.tasks import AiTaskRecord, TaskError
 from app.workers import ai_worker as worker_mod
 
 client = TestClient(app)
@@ -84,7 +83,7 @@ class _MappingResult:
     def __init__(self, rows: list[dict[str, Any]]) -> None:
         self._rows = rows
 
-    def mappings(self) -> "_MappingResult":
+    def mappings(self) -> _MappingResult:
         return self
 
     def first(self) -> dict[str, Any] | None:
@@ -275,7 +274,7 @@ class FakeProfileSession:
     有产生副作用，还原基线反而会误删赢家的数据。
     """
 
-    def __init__(self, store: "ProfileStore") -> None:
+    def __init__(self, store: ProfileStore) -> None:
         self._store = store
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.commits = 0
@@ -424,6 +423,17 @@ class FakeProfileSession:
         if "FROM ai_profile_session" in sql:
             row = self._store.sessions.get(str(values["session_id"]))
             return _MappingResult([row] if row else [])
+        if "FROM ai_profile_draft " in sql or "FROM ai_profile_draft\n" in sql:
+            session_id = str(values["session_id"])
+            editable = {"draft", "extracting", "awaiting_confirmation", "paused"}
+            candidates = [
+                d for d in self._store.drafts
+                if d["session_id"] == session_id and d["status"] in editable
+            ]
+            if candidates:
+                candidates.sort(key=lambda d: d["updated_at"], reverse=True)
+                return _MappingResult([{"draft_id": candidates[0]["draft_id"]}])
+            return _MappingResult([])
         if "FROM ai_profile_draft_field" in sql:
             return _MappingResult(self._store.field_keys(str(values["session_id"])))
         raise AssertionError(f"unhandled sql: {sql}")
@@ -1262,6 +1272,8 @@ async def test_next_question_is_computed_from_missing_fields(profile_store) -> N
     assert session.current_question is not None
     assert session.current_question.id == "interest_lifestyle_v1"
     assert session.current_question.text == "最近让你投入的事情是什么？"
+    # Task6 Step2：问题必须带稳定 field_key
+    assert session.current_question.field_key == "interest_tags"
 
 
 def test_next_question_never_repeats_confirmed_fields() -> None:
@@ -1287,6 +1299,84 @@ def test_next_question_never_repeats_confirmed_fields() -> None:
     question = next_profile_question(session)
     assert question is not None
     assert question.id not in {"interest_lifestyle_v1", "city_residence_v1"}
+    # Task6 Step2：跳过已确认字段后，返回的问题 field_key 也不应重复
+    assert question.field_key not in {"interest_tags", "city_code"}
+
+
+def test_question_bank_field_keys_cover_allowlist_subset() -> None:
+    """Task6 Step2：question bank 的每个 field_key 都对应一个 allowlist 字段。"""
+    from app.schemas.ai_common import AI_FIELD_ALLOWLIST
+
+    for field_key, question in _PROFILE_QUESTION_BANK.items():
+        assert question.field_key == field_key
+        assert field_key in AI_FIELD_ALLOWLIST
+
+
+def test_profile_session_carries_nullable_draft_id_default() -> None:
+    """Task6 Step2：ProfileSession 默认 draft_id=None（加法字段，无活动草稿）。"""
+    session = ProfileSession(
+        session_id="ps_x",
+        owner_user_id=10,
+        subject=ProfileSubject.PERSONAL,
+        status=ProfileSessionStatus.DRAFT,
+        input_mode="text",
+        consent_version="profile-text-v1",
+        policy_revision="ai-policy-2026-08-07-v1",
+        current_question=None,
+        revision_vector=None,  # type: ignore[arg-type]
+        consent_snapshot={},
+        field_keys=frozenset(),
+        confirmed_keys=frozenset(),
+        profile_revision=0,
+        preference_revision=0,
+        expires_at=None,
+        created_at=None,
+        updated_at=None,
+    )
+    assert session.draft_id is None
+
+
+@pytest.mark.asyncio
+async def test_create_session_returns_none_draft_id_before_extraction(
+    profile_store,
+) -> None:
+    """Task6 Step2：新建会话尚未抽取时，session.draft_id 为 None。"""
+    session = await create_profile_session(
+        profile_store.db, 10, ProfileSubject.PERSONAL, "profile-text-v1", "key-draft-none-001"
+    )
+    assert session.draft_id is None
+
+
+def test_profile_session_read_serializes_draft_id() -> None:
+    """Task6 Step2：ProfileSessionRead schema 序列化 draft_id（None 和非 None）。"""
+    from datetime import datetime as _dt
+
+    from app.schemas.ai_profile import (
+        ProfileProgress,
+    )
+    from app.schemas.ai_profile import (
+        ProfileSessionRead as SchemaSessionRead,
+    )
+
+    read_none = SchemaSessionRead(
+        session_id="ps_1",
+        subject=ProfileSubject.PERSONAL,
+        status=ProfileSessionStatus.DRAFT,
+        input_mode="text",
+        progress=ProfileProgress(basis="confirmed_field_coverage", value=0.0),
+        current_question=None,
+        draft_id=None,
+        profile_revision=0,
+        preference_revision=0,
+        expires_at=None,
+        created_at=_dt(2026, 8, 15, 0, 0, 0),
+    )
+    dumped_none = read_none.model_dump()
+    assert dumped_none["draft_id"] is None
+
+    read_with_draft = read_none.model_copy(update={"draft_id": "dr_abc"})
+    dumped = read_with_draft.model_dump()
+    assert dumped["draft_id"] == "dr_abc"
 
 
 def test_progress_value_is_real_confirmed_field_coverage() -> None:
@@ -1433,6 +1523,10 @@ def test_create_session_api_returns_201(monkeypatch, profile_store) -> None:
     assert body["progress"]["value"] == 0.0
     assert body["current_question"]["id"] == "interest_lifestyle_v1"
     assert body["current_question"]["text"] == "最近让你投入的事情是什么？"
+    # Task6 Step2：API 响应的 current_question 含稳定 field_key（加法字段）
+    assert body["current_question"]["field_key"] == "interest_tags"
+    # Task6 Step2：新建会话尚未抽取，draft_id 为 None（加法字段）
+    assert body["draft_id"] is None
 
 
 def test_create_session_api_requires_idempotency_key(monkeypatch, profile_store) -> None:

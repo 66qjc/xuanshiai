@@ -164,6 +164,38 @@ def projection_is_current(stored: RevisionVector, current: RevisionVector) -> bo
     return stored == current
 
 
+_REVISION_VECTOR_DIMENSIONS = (
+    "profile",
+    "preference",
+    "privacy",
+    "relationship",
+    "policy",
+)
+
+
+def _revision_record_matches(
+    recorded: dict[str, Any],
+    current: dict[str, Any],
+    *,
+    pinned: bool,
+) -> bool:
+    """Check a published revision's recorded vector against the build vector.
+
+    A pinned call claims one exact enqueue-time vector, so the revision must
+    have been published under exactly that vector.  An unpinned call stores the
+    current vector and may legitimately project content from a revision that
+    predates later bumps of unrelated dimensions — it is rejected only when the
+    recorded vector is ahead of the current one in any dimension, which a real
+    immutable revision can never be.
+    """
+    if pinned:
+        return recorded == current
+    return all(
+        int(recorded.get(key, 0) or 0) <= int(current.get(key, 0) or 0)
+        for key in _REVISION_VECTOR_DIMENSIONS
+    )
+
+
 def projection_source_hash(
     projection_kind: ProjectionKind,
     subject: str,
@@ -432,7 +464,11 @@ async def build_feature_projection(
     latest_source_revision = _maybe_json(latest.get("source_revision_json"))
     if not isinstance(latest_source_revision, dict):
         raise ProjectionBuildError("published revision has no source revision")
-    if latest_source_revision != revision.as_dict():
+    if not _revision_record_matches(
+        latest_source_revision,
+        revision.as_dict(),
+        pinned=revision_vector is not None,
+    ):
         raise ProjectionBuildError("published revision vector is stale")
     if consent_snapshot.get("policy_revision") and str(
         latest.get("policy_revision") or ""

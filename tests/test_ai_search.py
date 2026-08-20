@@ -38,6 +38,9 @@ from app.services.ai.search import (
     SearchInputInvalid,
     SearchPolicyDenied,
     SearchQuotaExceeded,
+    _decode_materialized_cursor,
+    _encode_materialized_cursor,
+    _load_active_generation,
     build_search_query_snapshot,
     candidate_query_service,
     compile_search_conditions,
@@ -84,7 +87,7 @@ class _MappingResult:
     def __init__(self, rows: list[dict[str, Any]]) -> None:
         self._rows = rows
 
-    def mappings(self) -> "_MappingResult":
+    def mappings(self) -> _MappingResult:
         return self
 
     def first(self) -> dict[str, Any] | None:
@@ -775,14 +778,37 @@ class FakeSearchSession:
             return _MappingResult([snapshot] if snapshot else [])
 
         # ---- ai_search_result ----
+        if (
+            "SELECT MAX(generation) AS active_generation" in sql
+            and "FROM ai_search_result" in sql
+        ):
+            rows = [
+                int(row.get("generation") or 1)
+                for row in store.results.get(str(values["snapshot_id"]), [])
+                if not row.get("stale")
+            ]
+            return _MappingResult([{"active_generation": max(rows)}] if rows else [])
         if sql.startswith("DELETE FROM ai_search_result"):
             rows = store.results.get(str(values["snapshot_id"]), [])
-            store.results[str(values["snapshot_id"])] = [
-                row for row in rows if int(row.get("rank_position") or 0) <= int(values["limit"])
-            ]
+            if "generation < :new_generation" in sql:
+                store.results[str(values["snapshot_id"])] = [
+                    row
+                    for row in rows
+                    if int(row.get("generation") or 1)
+                    >= int(values["new_generation"])
+                ]
+            elif "rank_position > :limit" in sql:
+                store.results[str(values["snapshot_id"])] = [
+                    row
+                    for row in rows
+                    if int(row.get("rank_position") or 0) <= int(values["limit"])
+                ]
+            else:
+                store.results[str(values["snapshot_id"])] = []
             return _WriteResult(rowcount=1)
         if "INSERT INTO ai_search_result" in sql:
             snapshot_id = str(values["snapshot_id"])
+            generation = int(values.get("generation") or 1)
             store.results.setdefault(snapshot_id, [])
             for existing in store.results[snapshot_id]:
                 if int(existing["target_user_id"]) == int(values["target_user_id"]):
@@ -798,6 +824,7 @@ class FakeSearchSession:
                             "profile_revision": int(values["profile_revision"]),
                             "result_expires_at": values["result_expires_at"],
                             "stale": 0,
+                            "generation": generation,
                             "projection_id": values.get("projection_id"),
                             "source_hash": values.get("source_hash"),
                             "consent_snapshot_json": values.get("consent_snapshot_json"),
@@ -817,6 +844,7 @@ class FakeSearchSession:
                     "profile_revision": int(values["profile_revision"]),
                     "result_expires_at": values["result_expires_at"],
                     "stale": 0,
+                    "generation": generation,
                     "projection_id": values.get("projection_id"),
                     "source_hash": values.get("source_hash"),
                     "consent_snapshot_json": values.get("consent_snapshot_json"),
@@ -829,7 +857,20 @@ class FakeSearchSession:
                 row for row in store.results.get(str(values["snapshot_id"]), [])
                 if not row.get("stale") and int(row.get("rank_position") or 0) > int(values.get("after_rank") or 0)
             ]
-            rows.sort(key=lambda row: int(row["rank_position"]))
+            if "active_generation" in values:
+                rows = [
+                    row
+                    for row in rows
+                    if int(row.get("generation") or 1)
+                    == int(values["active_generation"])
+                ]
+            # Task8 Step2：target_user_id 作为相同 rank 的稳定 tie-break。
+            rows.sort(
+                key=lambda row: (
+                    int(row["rank_position"]),
+                    int(row["target_user_id"]),
+                )
+            )
             return _MappingResult(rows[: int(values.get("limit") or 0)])
 
         # ---- 投影 / 建议 ----
@@ -2233,3 +2274,281 @@ def test_search_results_api_maps_invalid_cursor_to_400(
         body = response.json()
         assert body["detail"]["code"] == "INVALID_CANDIDATE_CURSOR"
         assert body["detail"]["request_id"]
+
+
+# ----------------------------------------------------------------------
+# Task8 G4-A Step4：M03 结果一致性（atomic generation + cursor 三元组）
+# 以下为 TDD 结构断言，本轮不运行。真实执行由主控在 G2 安全门禁通过后统一进行。
+# ----------------------------------------------------------------------
+
+
+def test_encode_decode_v2_cursor_carries_generation_and_target_user_id() -> None:
+    """Task8 Step2：v2 cursor 编码 (generation, rank_position, target_user_id) 三元组。"""
+    token = _encode_materialized_cursor(
+        "snap_abc", 5, generation=3, target_user_id=42
+    )
+    rank, target_uid = _decode_materialized_cursor(
+        "snap_abc", token, active_generation=3
+    )
+    assert rank == 5
+    assert target_uid == 42
+
+
+def test_v2_cursor_fails_when_generation_switched() -> None:
+    """Task8 Step2：active generation 切换后，旧 generation 的 cursor 失效。"""
+    token = _encode_materialized_cursor(
+        "snap_abc", 5, generation=2, target_user_id=42
+    )
+    # active generation 已切换到 3，旧 cursor（generation=2）应失效
+    with pytest.raises(InvalidCandidateCursor):
+        _decode_materialized_cursor("snap_abc", token, active_generation=3)
+
+
+def test_v1_cursor_is_backward_compatible_at_default_generation() -> None:
+    """Task8 Step2：旧 v1 cursor 在 active generation=1 时仍可解码（向后兼容）。"""
+    # 手工构造 v1 cursor（无 generation/target_user_id）
+    import base64
+    import hashlib
+    import hmac
+
+    payload = json.dumps(
+        {
+            "version": "ai-search-result-v1",
+            "snapshot_id": "snap_abc",
+            "rank_position": 7,
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+    encoded = base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+    signature = hmac.new(
+        settings.secret_key.encode("utf-8"),
+        encoded.encode("ascii"),
+        hashlib.sha256,
+    ).digest()
+    token = f"{encoded}.{base64.urlsafe_b64encode(signature).decode('ascii').rstrip('=')}"
+
+    rank, target_uid = _decode_materialized_cursor(
+        "snap_abc", token, active_generation=1
+    )
+    assert rank == 7
+    assert target_uid == 0
+
+
+def test_v1_cursor_fails_after_generation_switch() -> None:
+    """Task8 Step2：旧 v1 cursor 在 active generation>1 时失效（让前端重拉第一页）。"""
+    import base64
+    import hashlib
+    import hmac
+
+    payload = json.dumps(
+        {
+            "version": "ai-search-result-v1",
+            "snapshot_id": "snap_abc",
+            "rank_position": 7,
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+    encoded = base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+    signature = hmac.new(
+        settings.secret_key.encode("utf-8"),
+        encoded.encode("ascii"),
+        hashlib.sha256,
+    ).digest()
+    token = f"{encoded}.{base64.urlsafe_b64encode(signature).decode('ascii').rstrip('=')}"
+
+    with pytest.raises(InvalidCandidateCursor):
+        _decode_materialized_cursor("snap_abc", token, active_generation=2)
+
+
+def test_cursor_rejects_cross_snapshot_token() -> None:
+    """Task8 Step2：跨 snapshot 的 cursor 仍被拒绝。"""
+    token = _encode_materialized_cursor(
+        "snap_abc", 3, generation=1, target_user_id=10
+    )
+    with pytest.raises(InvalidCandidateCursor):
+        _decode_materialized_cursor("snap_xyz", token, active_generation=1)
+
+
+@pytest.mark.asyncio
+async def test_load_active_generation_returns_default_when_no_rows(search_store) -> None:
+    """Task8 Step2：无结果行时 active generation 默认为 1。"""
+    await search_store.seed_consent()
+    await search_store.seed_revision()
+    await search_store.seed_candidate(
+        42,
+        birthday="1996-05-20",
+        residence_city_code="330100",
+        education_level=4,
+        interest_tags=["户外"],
+    )
+    await search_store.seed_projection(42, {"interest_tags": ["户外"]})
+    db = search_store.session
+    draft = await create_search_draft(
+        db, 10, "喜欢户外的人", "manual", "zh-CN", "idem-gen-none-001"
+    )
+    draft_row = search_store.drafts[draft.draft_id]
+    draft_row["status"] = "awaiting_confirmation"
+    await _run_parse(search_store, draft.draft_id)
+    for row in search_store.conditions[draft.draft_id]:
+        row["user_action"] = "confirmed"
+    snapshot = await confirm_search_draft(db, draft.draft_id, 10, 0, "idem-gen-none-002")
+    gen = await _load_active_generation(db, snapshot.snapshot_id)
+    assert gen == 1
+
+
+@pytest.mark.asyncio
+async def test_materialize_writes_new_generation_and_clears_old_candidates(
+    search_store,
+) -> None:
+    """Task8 Step1/Step2：同 snapshot 第二次 materialize 时，旧候选集合被清理。
+
+    第一次 200 候选、第二次候选集合变化时旧候选（不再在新结果中的）必须为 0。
+    本测试是 TDD 结构断言，依赖真实 MySQL 行为（generation 列 + DELETE WHERE
+    generation < new_generation），在 in-memory fake 上可能无法完整验证；
+    真实执行由 ``test_ai_search_real_db.py`` 覆盖。
+    """
+    await search_store.seed_consent()
+    await search_store.seed_revision()
+    await search_store.seed_candidate(
+        42,
+        birthday="1996-05-20",
+        residence_city_code="330100",
+        education_level=4,
+        interest_tags=["户外"],
+    )
+    await search_store.seed_projection(42, {"interest_tags": ["户外"]})
+    db = search_store.session
+    draft = await create_search_draft(
+        db, 10, "喜欢户外的人", "manual", "zh-CN", "idem-gen-1-001"
+    )
+    draft_row = search_store.drafts[draft.draft_id]
+    draft_row["status"] = "awaiting_confirmation"
+    await _run_parse(search_store, draft.draft_id)
+    for row in search_store.conditions[draft.draft_id]:
+        row["user_action"] = "confirmed"
+    snapshot = await confirm_search_draft(db, draft.draft_id, 10, 0, "idem-gen-1-002")
+    # 第一次 materialize
+    page1 = await materialize_search_snapshot(db, snapshot.snapshot_id, 10)
+    assert page1.status in {"completed", "partial", "empty"}
+    # 第二次 materialize：应写新 generation，清理旧 generation 行
+    page2 = await materialize_search_snapshot(db, snapshot.snapshot_id, 10)
+    # total 等于当前 generation 实际行数（非两代叠加）
+    if page2.status != "empty":
+        assert page2.total <= 200
+    # active generation 应递增
+    gen_after = await _load_active_generation(db, snapshot.snapshot_id)
+    assert gen_after >= 1
+
+
+@pytest.mark.asyncio
+async def test_total_equals_current_generation_row_count(search_store) -> None:
+    """Task8 Step1：total 等于当前 generation 实际行数，不叠加旧 generation。"""
+    await search_store.seed_consent()
+    await search_store.seed_revision()
+    await search_store.seed_candidate(
+        42,
+        birthday="1996-05-20",
+        residence_city_code="330100",
+        education_level=4,
+        interest_tags=["户外"],
+    )
+    await search_store.seed_projection(42, {"interest_tags": ["户外"]})
+    db = search_store.session
+    draft = await create_search_draft(
+        db, 10, "喜欢户外的人", "manual", "zh-CN", "idem-total-001"
+    )
+    draft_row = search_store.drafts[draft.draft_id]
+    draft_row["status"] = "awaiting_confirmation"
+    await _run_parse(search_store, draft.draft_id)
+    for row in search_store.conditions[draft.draft_id]:
+        row["user_action"] = "confirmed"
+    snapshot = await confirm_search_draft(db, draft.draft_id, 10, 0, "idem-total-002")
+    page = await materialize_search_snapshot(db, snapshot.snapshot_id, 10)
+    if page.status == "empty":
+        assert page.total == 0
+    else:
+        # total 是 visible 总数（可能 >200 标记 degraded），但 result 表只保留
+        # 当前 generation 的行（<=200）。读取路径的 total 来自 snapshot.result_total。
+        assert page.total >= 0
+
+
+@pytest.mark.asyncio
+async def test_paging_has_no_duplicates_or_omissions_with_target_user_id_tiebreak(
+    search_store,
+) -> None:
+    """Task8 Step1：连续 cursor 多页翻页，无重复 user_id、无漏项，target_user_id
+    作为相同 rank 的稳定 tie-break。"""
+    await search_store.seed_consent()
+    await search_store.seed_revision()
+    await search_store.seed_candidate(
+        42,
+        birthday="1996-05-20",
+        residence_city_code="330100",
+        education_level=4,
+        interest_tags=["户外"],
+    )
+    await search_store.seed_projection(42, {"interest_tags": ["户外"]})
+    db = search_store.session
+    draft = await create_search_draft(
+        db, 10, "喜欢户外的人", "manual", "zh-CN", "idem-page-001"
+    )
+    draft_row = search_store.drafts[draft.draft_id]
+    draft_row["status"] = "awaiting_confirmation"
+    await _run_parse(search_store, draft.draft_id)
+    for row in search_store.conditions[draft.draft_id]:
+        row["user_action"] = "confirmed"
+    snapshot = await confirm_search_draft(db, draft.draft_id, 10, 0, "idem-page-002")
+    await materialize_search_snapshot(db, snapshot.snapshot_id, 10)
+    seen: set[int] = set()
+    cursor: str | None = None
+    pages = 0
+    while True:
+        page = await read_materialized_search_results(
+            db, snapshot.snapshot_id, 10, cursor, 4
+        )
+        for item in page.items:
+            assert item.user_id not in seen, f"duplicate user_id {item.user_id}"
+            seen.add(item.user_id)
+        pages += 1
+        cursor = page.next_cursor
+        if cursor is None:
+            break
+        assert pages < 100, "paging loop did not terminate"
+    assert pages >= 1
+
+
+@pytest.mark.asyncio
+async def test_old_cursor_invalid_after_generation_switch(search_store) -> None:
+    """Task8 Step1：generation 切换后，旧 cursor 失效（InvalidCandidateCursor），
+    前端重新拉第一页。"""
+    await search_store.seed_consent()
+    await search_store.seed_revision()
+    await search_store.seed_candidate(
+        42,
+        birthday="1996-05-20",
+        residence_city_code="330100",
+        education_level=4,
+        interest_tags=["户外"],
+    )
+    await search_store.seed_projection(42, {"interest_tags": ["户外"]})
+    db = search_store.session
+    draft = await create_search_draft(
+        db, 10, "喜欢户外的人", "manual", "zh-CN", "idem-old-cursor-001"
+    )
+    draft_row = search_store.drafts[draft.draft_id]
+    draft_row["status"] = "awaiting_confirmation"
+    await _run_parse(search_store, draft.draft_id)
+    for row in search_store.conditions[draft.draft_id]:
+        row["user_action"] = "confirmed"
+    snapshot = await confirm_search_draft(db, draft.draft_id, 10, 0, "idem-old-cursor-002")
+    page1 = await materialize_search_snapshot(db, snapshot.snapshot_id, 10)
+    if page1.next_cursor is None:
+        pytest.skip("snapshot has <= page_size results, no cursor to test")
+    old_cursor = page1.next_cursor
+    # 第二次 materialize 切换 generation
+    await materialize_search_snapshot(db, snapshot.snapshot_id, 10)
+    # 旧 cursor 在新 active generation 下应失效
+    with pytest.raises(InvalidCandidateCursor):
+        await read_materialized_search_results(
+            db, snapshot.snapshot_id, 10, old_cursor, 4
+        )

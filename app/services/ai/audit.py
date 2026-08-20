@@ -33,9 +33,10 @@ import asyncio
 import json
 import logging
 from collections import defaultdict, deque
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Mapping
+from typing import Any
 
 from app.core.config import settings
 
@@ -216,7 +217,7 @@ def _persist_audit_row_sync(event: GenerationAuditEvent) -> None:
             with conn.cursor() as cur:
                 cur.execute(statement, values)
             conn.commit()
-    except Exception:  # noqa: BLE001 - audit must never block business
+    except Exception:
         logger.warning(
             "ai_audit_write_failed request_id=%s error_code=%s",
             event.request_id,
@@ -257,7 +258,7 @@ async def record_generation_audit(event: GenerationAuditEvent) -> None:
     )
     try:
         await asyncio.to_thread(_persist_audit_row_sync, event)
-    except Exception:  # noqa: BLE001 - belt and braces around the sink
+    except Exception:
         logger.warning(
             "ai_audit_persist_unhandled request_id=%s",
             event.request_id,
@@ -334,5 +335,5 @@ def emit_ai_metric(name: str, value: float, tags: Mapping[str, str] | None = Non
             value,
             json.dumps(tag_map, ensure_ascii=False, sort_keys=True),
         )
-    except Exception:  # noqa: BLE001 - metrics must never block business
+    except Exception:
         logger.warning("ai_metric_emit_failed name=%s", name, exc_info=True)

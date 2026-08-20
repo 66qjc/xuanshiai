@@ -1,8 +1,8 @@
 import pytest
 
 from app.services.candidate_visibility import (
-    CandidateVisibilityService,
     CandidateContext,
+    CandidateVisibilityService,
     ViewerContext,
     VisibilityScene,
     evaluate_visibility,

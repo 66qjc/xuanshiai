@@ -511,12 +511,11 @@ async def _mark_stale_best_effort(
     *,
     table: str,
 ) -> None:
-    from sqlalchemy.exc import OperationalError, ProgrammingError
-    from sqlalchemy.exc import NoSuchTableError
+    from sqlalchemy.exc import NoSuchTableError, OperationalError, ProgrammingError
 
     try:
         await db.execute(text(statement), params)
-    except (NoSuchTableError,) as exc:
+    except NoSuchTableError:
         logger.debug("%s not present, skip stale marking", table, exc_info=True)
     except (OperationalError, ProgrammingError) as exc:
         if _is_missing_table_error(exc):
@@ -525,7 +524,7 @@ async def _mark_stale_best_effort(
             logger.warning(
                 "%s stale marking failed user_id=%s; needs retry", table, params.get("user_id"), exc_info=True
             )
-    except Exception as exc:  # noqa: BLE001 - unknown driver error, surface as warning
+    except Exception:
         logger.warning(
             "%s stale marking failed user_id=%s; needs retry", table, params.get("user_id"), exc_info=True
         )
@@ -545,6 +544,13 @@ async def purge_ai_resources(
     The operation is intentionally idempotent and deletes children before
     parents.  Profile revision headers remain as audit metadata while their
     field values and source evidence are scrubbed.
+
+    Destructive deletes are fenced to the generation the deletion happened in
+    (Plan Task 5 Step 4): the synchronous half marks the affected rows
+    (drafts ``deleted``, sessions ``active_status=0``, results ``stale=1``,
+    snapshots ``invalidated``, compat ``blocked``) and every DELETE below only
+    removes rows carrying that marker.  Resources rebuilt after the delete
+    carry no marker and are spared even if the cleanup task runs late.
     """
     scope = str(scope)
     if scope == "field":
@@ -556,11 +562,13 @@ async def purge_ai_resources(
             text(
                 "UPDATE ai_profile_revision_field f "
                 "JOIN ai_profile_revision r ON r.id = f.revision_id "
+                "LEFT JOIN ai_profile_draft d ON d.draft_id = r.draft_id "
                 "SET f.value_json = NULL, f.display_value = NULL, "
                 "f.confidence = NULL, f.source_type = NULL, "
                 "f.source_turn_ids = NULL, f.source_span = NULL "
                 "WHERE r.user_id = :user_id AND r.subject = :subject "
-                "AND f.field_key = :field_key"
+                "AND f.field_key = :field_key "
+                "AND (d.draft_id IS NULL OR d.status = 'deleted')"
             ),
             params,
         )
@@ -573,14 +581,17 @@ async def purge_ai_resources(
                 "f.source_span = NULL, f.confidence = 0, "
                 "f.content_hash = NULL, f.confirmation_status = 'deleted' "
                 "WHERE d.user_id = :user_id AND d.subject = :subject "
-                "AND f.field_key = :field_key"
+                "AND f.field_key = :field_key "
+                "AND f.confirmation_status = 'deleted'"
             ),
             params,
         )
         await db.execute(
             text(
-                "DELETE FROM ai_profile_summary "
-                "WHERE user_id = :user_id AND subject = :subject"
+                "DELETE s FROM ai_profile_summary s "
+                "LEFT JOIN ai_profile_draft d ON d.draft_id = s.draft_id "
+                "WHERE s.user_id = :user_id AND s.subject = :subject "
+                "AND (d.draft_id IS NULL OR d.status = 'deleted')"
             ),
             params,
         )
@@ -610,6 +621,7 @@ async def purge_ai_resources(
                 "DELETE t FROM ai_profile_turn t "
                 "JOIN ai_profile_session s ON s.session_id = t.session_id "
                 f"WHERE {' AND '.join(profile_filters)}"
+                " AND s.active_status = 0"
             ),
             profile_params,
         )
@@ -617,6 +629,7 @@ async def purge_ai_resources(
             text(
                 "DELETE FROM ai_profile_session WHERE user_id = :user_id"
                 + (" AND subject = :subject" if subject else "")
+                + " AND active_status = 0"
             ),
             profile_params,
         )
@@ -626,13 +639,17 @@ async def purge_ai_resources(
                 "JOIN ai_profile_draft d ON d.draft_id = f.draft_id "
                 "WHERE d.user_id = :user_id"
                 + (" AND d.subject = :subject" if subject else "")
+                + " AND d.status = 'deleted'"
             ),
             profile_params,
         )
         await db.execute(
             text(
-                "DELETE FROM ai_profile_summary WHERE user_id = :user_id"
-                + (" AND subject = :subject" if subject else "")
+                "DELETE s FROM ai_profile_summary s "
+                "LEFT JOIN ai_profile_draft d ON d.draft_id = s.draft_id "
+                "WHERE s.user_id = :user_id"
+                + (" AND s.subject = :subject" if subject else "")
+                + " AND (d.draft_id IS NULL OR d.status = 'deleted')"
             ),
             profile_params,
         )
@@ -640,6 +657,7 @@ async def purge_ai_resources(
             text(
                 "DELETE FROM ai_profile_draft WHERE user_id = :user_id"
                 + (" AND subject = :subject" if subject else "")
+                + " AND status = 'deleted'"
             ),
             profile_params,
         )
@@ -647,11 +665,13 @@ async def purge_ai_resources(
             text(
                 "UPDATE ai_profile_revision_field f "
                 "JOIN ai_profile_revision r ON r.id = f.revision_id "
+                "LEFT JOIN ai_profile_draft d ON d.draft_id = r.draft_id "
                 "SET f.value_json = NULL, f.display_value = NULL, "
                 "f.confidence = NULL, f.source_type = NULL, "
                 "f.source_turn_ids = NULL, f.source_span = NULL "
                 "WHERE "
                 + " AND ".join(revision_field_filters)
+                + " AND (d.draft_id IS NULL OR d.status = 'deleted')"
             ),
             profile_params,
         )
@@ -698,11 +718,17 @@ async def purge_ai_resources(
             if draft_id:
                 draft_filter = "d.draft_id = :draft_id"
                 draft_params = {"draft_id": draft_id}
+        else:
+            # 代际 fence：用户级清理只删同步半部已标记的旧代搜索草稿
+            # （consent 撤回标 expired、画像删除标 invalidated）；重建的新草稿
+            # 状态为 parsing/awaiting_confirmation/confirmed，不受旧任务影响。
+            draft_filter += " AND d.status IN ('invalidated', 'expired')"
         await db.execute(
             text(
                 "DELETE r FROM ai_search_result r "
                 "JOIN ai_search_snapshot s ON s.snapshot_id = r.snapshot_id "
                 "WHERE s.user_id = :user_id" + snapshot_filter
+                + " AND (r.stale = 1 OR s.invalidated_at IS NOT NULL)"
             ),
             params,
         )
@@ -718,13 +744,21 @@ async def purge_ai_resources(
             text(
                 "DELETE FROM ai_search_snapshot WHERE user_id = :user_id"
                 + (" AND snapshot_id = :resource_id" if resource_id else "")
+                + " AND (invalidated_at IS NOT NULL OR status = 'invalidated')"
             ),
             params,
         )
         await db.execute(
             text(
                 "DELETE FROM ai_search_draft WHERE user_id = :user_id"
-                + ("" if not resource_id else " AND draft_id = :draft_id")
+                + (
+                    "" if not resource_id else " AND draft_id = :draft_id"
+                )
+                + (
+                    ""
+                    if resource_id
+                    else " AND status IN ('invalidated', 'expired')"
+                )
             ),
             (
                 {"user_id": user_id}
@@ -743,7 +777,8 @@ async def purge_ai_resources(
         await db.execute(
             text(
                 "DELETE FROM ai_compatibility_snapshot "
-                "WHERE viewer_user_id = :user_id OR target_user_id = :user_id"
+                "WHERE (viewer_user_id = :user_id OR target_user_id = :user_id) "
+                "AND status = 'blocked'"
             ),
             {"user_id": user_id},
         )
@@ -930,7 +965,20 @@ async def run_cleanup_consumer_round(
     failure on one event cannot roll back the whole batch — one event failing
     leaves the others already-committed.  ``consume_outbox_event`` never commits
     by itself; the per-event session owns the commit/rollback for that event.
+
+    Contract: ``db`` MUST be a fresh session with no other pending writes.
+    This function commits ``db`` to publish the claim lease; any unrelated
+    uncommitted work on the same session would be flushed together with the
+    lease, so callers must open a dedicated session (see ``ai_worker``'s
+    ``async with session_factory() as db``) rather than reusing a request
+    session.
     """
+    in_transaction = getattr(db, "in_transaction", None)
+    if callable(in_transaction) and in_transaction():
+        raise RuntimeError(
+            "run_cleanup_consumer_round requires a fresh session without an "
+            "already-begun transaction; caller must open a dedicated session"
+        )
     stats = {
         "claimed": 0,
         "applied": 0,
@@ -943,13 +991,19 @@ async def run_cleanup_consumer_round(
         db, _CLEANUP_CONSUMER, worker_id, now, limit
     )
     stats["claimed"] = len(events)
-    # The claim writes belong to the caller's transaction; they are not committed
-    # here.  Each event is consumed in a fresh, independent session so that a
+    # Commit the claim lease *before* consuming any event.  Without this commit,
+    # the FOR UPDATE locks in the caller's session are still held when
+    # _consume_one_independent opens a fresh session to UPDATE the same rows,
+    # causing a self-lock wait (AI-P0-06).  After commit, the lease is visible
+    # to other sessions and the independent consume transactions can proceed.
+    if events:
+        await db.commit()
+    # Each event is consumed in a fresh, independent session so that a
     # failure on one event rolls back only that event's work, not the batch.
     for event in events:
         try:
             await _consume_one_independent(event, _CLEANUP_CONSUMER, stats)
-        except Exception:  # noqa: BLE001 - isolate per-event failures
+        except Exception:
             logger.warning(
                 "outbox_consume_failed event_id=%s event_type=%s",
                 event.event_id,

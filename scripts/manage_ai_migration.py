@@ -30,7 +30,12 @@ class MigrationError(RuntimeError):
 
 
 def _checksum(path: Path, expected: str) -> None:
-    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    # Normalise CRLF → LF before hashing so that Windows checkouts (where git
+    # may convert LF to CRLF) produce the same SHA-256 as Unix checkouts.
+    # Only line endings are normalised; any other byte change is still detected.
+    raw = path.read_bytes()
+    normalised = raw.replace(b"\r\n", b"\n")
+    digest = hashlib.sha256(normalised).hexdigest()
     if expected and expected != digest:
         raise MigrationError(f"migration checksum mismatch: {path.name}")
 
@@ -350,8 +355,16 @@ def _active_task_count(cursor: Any) -> int:
 def _run(command: str, target: str, expect: str = "current") -> int:
     if target not in {"test", "development"}:
         raise MigrationError("AI migration target must be test or development")
-    if command == "down" and os.getenv("AI_MASTER_ENABLED", "false").lower() == "true":
-        raise MigrationError("refusing down while AI_MASTER_ENABLED=true")
+    # 仅对非 test 目标拒绝 down：test 库是可丢弃的，且 down 内部仍有
+    # `_active_task_count` 守卫，会在存在活动 AI 任务时拒绝回滚。
+    if (
+        command == "down"
+        and target != "test"
+        and os.getenv("AI_MASTER_ENABLED", "false").lower() == "true"
+    ):
+        raise MigrationError(
+            "refusing down while AI_MASTER_ENABLED=true (non-test target)"
+        )
     manifest = _manifest()
     versions = manifest["versions"]
     connection, _ = _connect()

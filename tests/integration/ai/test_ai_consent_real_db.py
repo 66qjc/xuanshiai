@@ -14,7 +14,6 @@ from app.services.ai.consents import (
     revoke_consent,
 )
 
-
 USER_ID = 9_876_543_210
 
 

@@ -7,10 +7,11 @@ Enums and field names follow the unified plan §7.  ``ProfileSubject`` isolates
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import datetime
 from enum import Enum
 from types import MappingProxyType
-from typing import Any, Literal, Mapping
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, StrictInt, StrictStr, TypeAdapter, model_validator
 
@@ -31,7 +32,7 @@ class NumericPreferenceRange(BaseModel):
     max: StrictInt | None = None
 
     @model_validator(mode="after")
-    def validate_bounds(self) -> "NumericPreferenceRange":
+    def validate_bounds(self) -> NumericPreferenceRange:
         if self.min is None and self.max is None:
             raise ValueError("a preference range needs min or max")
         if self.min is not None and self.max is not None and self.min > self.max:
@@ -194,10 +195,16 @@ class ProfileProgress(BaseModel):
 
 
 class ProfileQuestion(BaseModel):
-    """One interview question whose id/text are frozen by the question bank."""
+    """One interview question whose id/text/field_key are frozen by the question bank.
+
+    ``field_key`` 是该问题对应的目标抽取字段（属于 ``AI_FIELD_ALLOWLIST``），
+    前端据此稳定映射到 typed field 编辑器，不依赖问题文案或顺序。加法字段，
+    保留原有 ``id``/``text``，不做破坏性重命名。
+    """
 
     id: str
     text: str
+    field_key: str
 
 
 class ProfileSessionCreateRequest(BaseModel):
@@ -218,6 +225,9 @@ class ProfileSessionRead(BaseModel):
     input_mode: str = "text"
     progress: ProfileProgress
     current_question: dict[str, str] | None = None
+    # 加法字段（Task6 Step2）：当前会话的活动草稿 ID，供前端直接跳转草稿编辑器；
+    # 无活动草稿（如新建会话尚未抽取）为 ``None``。保留现有字段，不破坏旧契约。
+    draft_id: str | None = None
     profile_revision: int = 0
     preference_revision: int = 0
     expires_at: datetime | None = None

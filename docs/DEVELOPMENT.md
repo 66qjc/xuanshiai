@@ -386,3 +386,54 @@ uv run uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
 生产 `AUTO_INIT_DB` 必须为 `false`；未批准条件保持 `AI_FEATURE_DISABLED`。回滚：先关闭 `AI_MASTER_ENABLED` 和各模块开关，停止 Worker/消费者，旧 `/discovery/*` 接口与 `legacy-rule-v1` 字段保持可用。
+
+## 11. G5 证据链脚手架（Task 10，2026-08-17 证据治理分支）
+
+> 本节登记 `codex/ai-g5-g7-20260817` 分支的证据链脚手架状态。本轮硬约束：禁止运行 pytest/ruff/python 脚本来验证，禁止构建/容器/微信/稳定性观察。所有"已完成"仅指结构/代码已写，运行验证 NOT_RUN。
+
+### 11.1 证据 schema 与 builder
+
+- `artifacts/schemas/ai-evidence-v1.schema.json`：G0-G7 gates、commandEvidence、hashMap、reviewer、result enum 完整。
+- `scripts/build_ai_evidence.py`：command allowlist、git state、redact、load_command_evidence、validate_evidence_shape、build_evidence、CLI 完整。
+- `tests/test_build_ai_evidence.py`（Task10 Step1）：TDD 失败测试，覆盖 required fields、反例（空 JSON/旧 SHA/未知命令/非零 exit/result≠PASS）、validate_evidence_shape、redact、production+mock blocker、PENDING review blocker。写但不跑。
+
+### 11.2 发布验证 verifier 改造（Task10 Step3）
+
+```powershell
+uv run python scripts/verify_ai_release.py --target internal --report artifacts/ai-internal-readiness.json
+```
+
+- `--target internal|production`（required）；`--environment` 保留为 deprecated 兼容期，`--target` 优先。
+- `target=production` 强制 `environment=production` + provider≠mock + review_status=REVIEWED + result=PASS。
+- `target=internal` 时 environment=development/testing，禁止 production。
+- 新增 evidence bundle 聚合：读取 `artifacts/ai-evidence-bundle.json`（build_ai_evidence 产物），校验 schema、SHA、hash、时效（72h）、所有 Gate（G0-G7）、production approvals。
+- 任何证据缺失 → exit 2 + `disabled-until-approved`，绝不误报 GO。
+- `--environment` 旧用法保留兼容期：`--target production --environment testing` 会强制 production；`--target internal --environment production` 会降级到 testing。
+
+### 11.3 质量集扩充（Task10 Step4）
+
+- `artifacts/ai-profile-quality.json`、`ai-search-quality.json`、`ai-compatibility-shadow-quality.json` 替换为带 `provenance`、`use_limitation`、`reviewed`、`allow_expansion` 的版本化结构。
+- compatibility 保持 `allow_expansion=false`（未过 expansion 阈值）。
+- metrics 全部 null（NOT_RUN），结构占位，不填真实评测数据。
+
+### 11.4 Ruff 修复状态（Task10 Step5）
+
+- 2026-08-19 G5 清零：pyproject 显式钉住经典默认规则集 `select = ["E4", "E7", "E9", "F"]`（ruff 0.16 扩大了默认规则集，全仓出现 818 项新规则告警，其中 655 项 B008 是 FastAPI `Depends` 惯用法；历史契约是经典默认集，钉住以避免随 ruff 版本漂移，不采用 blanket ignore）。钉住集内修复：`profile.py` F402×3（`dataclasses.field` 别名 `dc_field`）、TRY004×2（类型校验改抛 `TypeError`）、E701/E702×22（admin 路由单行多语句拆分）、`test_ai_search_real_db.py` F841×1。
+- `ruff check app tests scripts` → All checks passed。
+
+### 11.5 migration rollback 演练（Task10 Step6 / Task11 Step7）
+
+- `docs/ai/AI_MIGRATION_ROLLBACK.md`：快照/备份引用、每 DDL step 记录、迁移矩阵、中途失败补偿、down 丢列前数据损失范围说明。
+- 2026-08-19 在 disposable DB `xuanshiai_ai_drill`（mysql 127.0.0.1:3307）执行真实演练：fresh up → verify current → repeated up（幂等）→ 注入数据依赖 DDL 故障（重复 `(snapshot_id, rank_position)` 行触发 1062 on `uk_ai_search_result_rank`，历史记 `rollback_failed`）→ 删除重复行恢复 down → verify previous（probe 数据可读）→ restore up → verify current（turn_id 回填 legacy-turn-<id>、generation 复位 1，与 down SQL 注释的损失范围一致）。
+- 快照引用 `/tmp/ai-drill-snapshot-6f8f09c.sql`（sha256 `a5f69feb...`）与全步骤记录在 `artifacts/ai-rollback-drill.json`（result=PASS、blockers=[]、6 步全 PASS）。
+
+### 11.6 G7 稳定性/回滚占位（Task 13）
+
+- `artifacts/ai-stability-report.json`：NOT_RUN 占位，`result: NOT_RUN`，blockers 列出"3-5天观察未开始"等。
+- `artifacts/ai-rollback-drill.json`：2026-08-19 已由真实演练填充（见 §11.5），不再是占位。
+- 3-5 天稳定性观察未开始。production 恒 NO-GO。
+
+### 11.7 Graphify 更新
+
+- 本轮代码/文档变更后需从工作区根 `graphify update .`；本轮硬约束不执行。
+- 登记在 `docs/待完成事项.md` §六。

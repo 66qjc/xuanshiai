@@ -23,7 +23,6 @@ AI_TABLES = {
         CREATE TABLE IF NOT EXISTS `ai_consent_grant` (
             `id` bigint unsigned NOT NULL AUTO_INCREMENT,
             `user_id` bigint unsigned DEFAULT NULL,
-            `user_id_coalesce` bigint unsigned GENERATED ALWAYS AS (COALESCE(`user_id`, 0)) STORED,
             `user_tombstone` char(64) DEFAULT NULL,
             `scope` varchar(64) NOT NULL COMMENT 'profile_text_extract/search_parse/compatibility_shadow',
             `version` varchar(32) NOT NULL COMMENT '授权文案版本',
@@ -33,7 +32,7 @@ AI_TABLES = {
             `revoke_reason` varchar(255) DEFAULT NULL,
             `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
             PRIMARY KEY (`id`),
-            UNIQUE KEY `uk_ai_consent_user_scope_version` (`user_id_coalesce`, `scope`, `version`, `granted_at`),
+            UNIQUE KEY `uk_ai_consent_user_scope_version` (`user_id`, `scope`, `version`, `granted_at`),
             KEY `idx_ai_consent_user_scope_revoked` (`user_id`, `scope`, `revoked_at`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='AI 授权授予与撤回记录'
     """,
@@ -333,12 +332,14 @@ AI_TABLES = {
             `source_revision_json` json DEFAULT NULL,
             `result_expires_at` datetime DEFAULT NULL,
             `stale` tinyint NOT NULL DEFAULT '0',
+            `generation` int unsigned NOT NULL DEFAULT '1' COMMENT 'Task8 Step2：原子 generation，每次 execute 写新 generation，成功后原子切换 active generation',
             `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
             `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
             PRIMARY KEY (`id`),
             UNIQUE KEY `uk_ai_search_result_snapshot_target` (`snapshot_id`, `target_user_id`),
             KEY `idx_ai_search_result_snapshot_rank` (`snapshot_id`, `rank_position`),
-            KEY `idx_ai_search_result_target_expires` (`target_user_id`, `result_expires_at`)
+            KEY `idx_ai_search_result_target_expires` (`target_user_id`, `result_expires_at`),
+            KEY `idx_ai_search_result_snapshot_generation` (`snapshot_id`, `generation`, `stale`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='AI 搜索结果卡片引用、满足数与证据'
     """,
     "ai_feature_projection": """
@@ -501,6 +502,9 @@ AI_LEGACY_REQUIRED_COLUMNS: dict[str, dict[str, str]] = {
         "consent_snapshot_json": "`consent_snapshot_json` json DEFAULT NULL",
         "source_revision_json": "`source_revision_json` json DEFAULT NULL",
         "updated_at": "`updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP",
+        # Task8 Step2：原子 generation 列（加法，默认 1）。每次 execute 写新
+        # generation 行，成功后原子切换 active generation，再清理旧 generation。
+        "generation": "`generation` int unsigned NOT NULL DEFAULT '1' COMMENT 'Task8 Step2：原子 generation'",
     },
     "ai_search_snapshot": {
         "result_total": "`result_total` int unsigned NOT NULL DEFAULT '0'",
@@ -568,15 +572,16 @@ def ensure_ai_legacy_columns(cursor: Any) -> None:
             cursor.execute(
                 "ALTER TABLE `ai_consent_grant` MODIFY COLUMN `user_id` bigint unsigned DEFAULT NULL"
             )
-            # Defect 47: once user_id is nullable (Task 10), tombstone rows
-            # with user_id=NULL escape the (user_id, scope, version,
-            # granted_at) unique key because SQL NULLs never compare
-            # equal. Add a stored generated column user_id_coalesce =
-            # COALESCE(user_id, 0) and rebuild the unique key on it so
-            # multiple tombstone rows for the same scope/version are
-            # rejected. This is idempotent: it checks information_schema
-            # before adding the column and swaps the key only once.
-            ensure_ai_consent_user_coalesce(cursor)
+            # Defect 62: once user_id is nullable (Task 10), tombstone rows
+            # with user_id=NULL leave the unique key (SQL NULLs never compare
+            # equal). The original Defect 47 response — a stored
+            # user_id_coalesce = COALESCE(user_id, 0) key column — collapses
+            # every scrubbed row to 0 and collides with 1062 when two grants
+            # share the same DATETIME second (fsp=0). Revert to keying the
+            # unique constraint on the raw user_id; scrubbed rows are exempt
+            # from dedup, which is safe because a tombstone can only come from
+            # a row that was unique while live. Idempotent in both directions.
+            ensure_ai_consent_unique_key(cursor)
 
     try:
         cursor.execute("SHOW COLUMNS FROM `ai_profile_turn`")
@@ -601,23 +606,25 @@ def ensure_ai_legacy_columns(cursor: Any) -> None:
         return
 
 
-def ensure_ai_consent_user_coalesce(cursor: Any) -> None:
-    """Idempotently add the ``user_id_coalesce`` generated column and rebuild
-    the consent unique key on it (Defect 47).
+def ensure_ai_consent_unique_key(cursor: Any) -> None:
+    """Idempotently revert the Defect 47 ``user_id_coalesce`` dedup and rebuild
+    the consent unique key on the raw ``user_id`` (Defect 62).
 
     After Task 10 makes ``ai_consent_grant.user_id`` nullable, tombstone rows
-    (``user_id IS NULL``) are no longer deduplicated by the original
-    ``uk_ai_consent_user_scope_version (user_id, scope, version, granted_at)``
-    key, because SQL ``NULL`` values never compare equal and therefore never
-    violate a UNIQUE constraint. This helper adds a STORED generated column
-    ``user_id_coalesce = COALESCE(user_id, 0)`` and rebuilds the unique key on
-    that column so multiple tombstone rows for the same scope/version are
-    rejected just like real-user rows.
+    (``user_id IS NULL``) are exempt from ``uk_ai_consent_user_scope_version
+    (user_id, scope, version, granted_at)`` because SQL ``NULL`` values never
+    compare equal.  Defect 47's stored ``user_id_coalesce = COALESCE(user_id,
+    0)`` key was meant to dedup tombstones too, but it collapses every
+    scrubbed row to ``0``: two grants of the same scope/version recorded in
+    the same DATETIME second (fsp=0) collide with ``1062`` when the second one
+    is scrubbed — and a re-grant after deletion collides with the tombstone on
+    INSERT.  A tombstone can only ever be produced by scrubbing a row that was
+    unique while live, so duplicate tombstones cannot arise and the dedup is
+    unnecessary; keying on ``user_id`` (NULL exempt) restores both paths.
 
-    The operation is idempotent: it inspects ``information_schema`` and only
-    adds the column / swaps the key when they are missing or still reference
-    the raw ``user_id``. It is safe to call from ``ensure_ai_legacy_columns``
-    after the ``user_id`` nullability change.
+    Idempotent in both directions: it drops the generated column and the key
+    when they reference ``user_id_coalesce``, and rebuilds the key on
+    ``user_id`` when it is missing.
     """
     try:
         cursor.execute(
@@ -630,16 +637,6 @@ def ensure_ai_consent_user_coalesce(cursor: Any) -> None:
     if "user_id" not in consent_columns:
         return
 
-    if "user_id_coalesce" not in consent_columns:
-        cursor.execute(
-            "ALTER TABLE `ai_consent_grant` "
-            "ADD COLUMN `user_id_coalesce` bigint unsigned "
-            "GENERATED ALWAYS AS (COALESCE(`user_id`, 0)) STORED "
-            "AFTER `user_id`"
-        )
-
-    # Rebuild the unique key on user_id_coalesce if it still references the
-    # raw user_id column (or does not exist yet).
     try:
         cursor.execute(
             "SELECT index_name AS index_name, column_name AS column_name, seq_in_index AS seq_in_index "
@@ -654,14 +651,20 @@ def ensure_ai_consent_user_coalesce(cursor: Any) -> None:
     except Exception:  # noqa: BLE001 - legacy bootstrap is best effort
         return
 
-    needs_rebuild = not key_columns or key_columns[0] != "user_id_coalesce"
-    if needs_rebuild:
-        if key_columns:
-            cursor.execute(
-                "ALTER TABLE `ai_consent_grant` DROP INDEX `uk_ai_consent_user_scope_version`"
-            )
+    if key_columns and key_columns[0] == "user_id_coalesce":
+        cursor.execute(
+            "ALTER TABLE `ai_consent_grant` DROP INDEX `uk_ai_consent_user_scope_version`"
+        )
+        key_columns = []
+
+    if "user_id_coalesce" in consent_columns:
+        cursor.execute(
+            "ALTER TABLE `ai_consent_grant` DROP COLUMN `user_id_coalesce`"
+        )
+
+    if not key_columns:
         cursor.execute(
             "ALTER TABLE `ai_consent_grant` "
             "ADD UNIQUE KEY `uk_ai_consent_user_scope_version` "
-            "(`user_id_coalesce`, `scope`, `version`, `granted_at`)"
+            "(`user_id`, `scope`, `version`, `granted_at`)"
         )

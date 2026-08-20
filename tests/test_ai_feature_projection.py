@@ -49,7 +49,7 @@ class _MappingResult:
     def __init__(self, rows: list[dict[str, Any]]) -> None:
         self._rows = rows
 
-    def mappings(self) -> "_MappingResult":
+    def mappings(self) -> _MappingResult:
         return self
 
     def first(self) -> dict[str, Any] | None:
@@ -465,7 +465,7 @@ class ProjectionFakeSession:
         # 独立事务消费失败时回滚：fake session 直改 store，无挂起写入需撤销。
         pass
 
-    async def __aenter__(self) -> "ProjectionFakeSession":
+    async def __aenter__(self) -> ProjectionFakeSession:
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:

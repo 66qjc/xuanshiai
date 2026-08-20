@@ -89,6 +89,7 @@ Content-Type: application/json
 | `input_mode` | string | 是 | — | 固定 `text` | 输入模式 | `text` |
 | `progress` | object | 是 | — | — | 画像构建进度（详见下方展开） | 见下 |
 | `current_question` | object | 否 | `null` 表示当前无待追问问题 | — | 由缺失字段字典计算出的下一问 | 见下 |
+| `draft_id` | string | 否 | `null` 表示当前会话无活动草稿（如新建尚未抽取） | — | 当前会话的活动草稿 ID（加法字段，Task6 Step2）；前端可直接据此跳转草稿编辑器，无需额外查询 | `dr_1a2b3c4d` |
 | `profile_revision` | integer | 是 | — | `>=0` | 创建时快照的本人资料 revision | `1` |
 | `preference_revision` | integer | 是 | — | `>=0` | 创建时快照的本人偏好 revision | `0` |
 | `expires_at` | string(datetime) | 否 | `null` 表示未设置 | — | 会话过期时间，UTC ISO-8601 | `2026-08-14T08:00:00Z` |
@@ -107,6 +108,7 @@ Content-Type: application/json
 | --- | --- | --- | --- | --- |
 | `id` | string | 是 | 问题 ID，来自服务端问题字典 | `interest_lifestyle_v1` |
 | `text` | string | 是 | 问题文案（不诱导敏感信息） | `最近让你投入的事情是什么？` |
+| `field_key` | string | 是 | 该问题对应的目标抽取字段（属于 allowlist，加法字段，Task6 Step2）；前端据此稳定映射到 typed field 编辑器，不依赖问题文案或顺序 | `interest_tags` |
 
 ### 返回示例
 
@@ -119,7 +121,8 @@ Content-Type: application/json
   "status": "draft",
   "input_mode": "text",
   "progress": {"basis": "confirmed_field_coverage", "value": 0.0},
-  "current_question": {"id": "interest_lifestyle_v1", "text": "最近让你投入的事情是什么？"},
+  "current_question": {"id": "interest_lifestyle_v1", "text": "最近让你投入的事情是什么？", "field_key": "interest_tags"},
+  "draft_id": null,
   "profile_revision": 1,
   "preference_revision": 0,
   "expires_at": "2026-08-14T08:00:00Z",
@@ -193,7 +196,8 @@ Authorization: Bearer <access_token>
   "status": "awaiting_confirmation",
   "input_mode": "text",
   "progress": {"basis": "confirmed_field_coverage", "value": 0.1},
-  "current_question": {"id": "city_residence_v1", "text": "你现在生活在哪座城市？"},
+  "current_question": {"id": "city_residence_v1", "text": "你现在生活在哪座城市？", "field_key": "city_code"},
+  "draft_id": "dr_1a2b3c4d5e6f7a8b9c0d",
   "profile_revision": 1,
   "preference_revision": 0,
   "expires_at": "2026-08-14T08:00:00Z",
@@ -448,7 +452,8 @@ Idempotency-Key: profile-resume-20260807-01
   "status": "awaiting_confirmation",
   "input_mode": "text",
   "progress": {"basis": "confirmed_field_coverage", "value": 0.1},
-  "current_question": {"id": "city_residence_v1", "text": "你现在生活在哪座城市？"},
+  "current_question": {"id": "city_residence_v1", "text": "你现在生活在哪座城市？", "field_key": "city_code"},
+  "draft_id": "dr_1a2b3c4d5e6f7a8b9c0d",
   "profile_revision": 1,
   "preference_revision": 0,
   "expires_at": "2026-08-14T08:00:00Z",

@@ -37,8 +37,9 @@ from typing import Any
 
 from app.core.config import settings
 from app.db.session import session_factory
-from app.services.ai.profile import extract_profile_turn
+from app.schemas.ai_common import AiTaskStatus
 from app.services.ai.audit import emit_ai_metric
+from app.services.ai.profile import extract_profile_turn
 from app.services.ai.tasks import (
     AiTaskRecord,
     claim_tasks,
@@ -97,18 +98,44 @@ async def _run_with_heartbeat(
     aborted by a transient DB blip; if the lease is genuinely lost the reaper
     still recovers the task (fallback, not the happy path).  On cancellation
     the child handler task is cancelled too.
+
+    When ``session_provider`` is set, the handler runs in its own session but
+    its business writes are **not** committed here.  Instead the result is a
+    ``(outcome, finalize_handler)`` pair where ``finalize_handler`` is an
+    awaitable closure the caller (:func:`_process`) must ``await`` to either
+    commit (argument truthy) or roll back (argument falsy) the handler's
+    business side effects — but only after :func:`complete_task`'s
+    consent/revision gate has been evaluated.  If the gate supersedes the task
+    the caller finalizes with ``False`` so a consent revoked between handler
+    run and finalize cannot leak business writes (AI-P0-07).  When
+    ``session_provider`` is ``None`` the result is simply ``outcome``.
     """
     async def invoke_handler() -> Any:
         if session_provider is None:
             return await handler(db, task, worker_id)
-        async with session_provider() as handler_db:
+        handler_db_cm = session_provider()
+        handler_db = await handler_db_cm.__aenter__()
+        finalized = False
+
+        async def finalize_handler(should_commit: bool) -> None:
+            nonlocal finalized
+            if finalized:
+                return
+            finalized = True
             try:
-                outcome = await handler(handler_db, task, worker_id)
-                await handler_db.commit()
-                return outcome
-            except Exception:
-                await handler_db.rollback()
-                raise
+                if should_commit:
+                    await handler_db.commit()
+                else:
+                    await handler_db.rollback()
+            finally:
+                await handler_db_cm.__aexit__(None, None, None)
+
+        try:
+            outcome = await handler(handler_db, task, worker_id)
+            return outcome, finalize_handler
+        except BaseException:
+            await finalize_handler(False)
+            raise
 
     async def renew_lease() -> None:
         if session_provider is None:
@@ -127,7 +154,7 @@ async def _run_with_heartbeat(
                 return handler_task.result()
             try:
                 await renew_lease()
-            except Exception:  # noqa: BLE001 - heartbeat must never kill the handler
+            except Exception:
                 logger.warning(
                     "ai_worker_heartbeat_failed task_id=%s",
                     task.task_id,
@@ -169,7 +196,7 @@ async def _process(
 
     try:
         started = await start_in_session()
-    except Exception:  # noqa: BLE001 - lease or status race, leave for reaper
+    except Exception:
         logger.exception("ai_worker_start_failed task_id=%s", task.task_id)
         return "skipped"
     handler = TASK_HANDLERS.get(started.task_type)
@@ -192,13 +219,13 @@ async def _process(
                     retryable=False,
                 )
             )
-        except Exception:  # noqa: BLE001 - 终态写入失败，留给 reaper/下一轮兜底
+        except Exception:
             logger.exception(
                 "ai_worker_no_handler_fail_failed task_id=%s", started.task_id
             )
         return "failed"
     try:
-        outcome = await _run_with_heartbeat(
+        heartbeat_result = await _run_with_heartbeat(
             handler,
             started,
             worker_id,
@@ -223,7 +250,23 @@ async def _process(
         )
         emit_ai_metric("retry_rate", 1, {"task_type": started.task_type})
         return "failed"
+    # _run_with_heartbeat returns either a bare outcome (no session_provider)
+    # or a (outcome, finalize_handler) pair where finalize_handler must be
+    # awaited with should_commit to either durably commit the handler's
+    # business writes or roll them back.  finalize_handler is None when no
+    # session_provider is used.
+    if session_provider is None:
+        outcome = heartbeat_result
+        finalize_handler = None
+    else:
+        outcome, finalize_handler = heartbeat_result
     if outcome is None:
+        # Handler returned None (e.g. provider failure); its in-session writes
+        # (if any, e.g. an inner fail_task) must not be persisted — _process
+        # re-records the failure via a separate finalize_db, and the handler's
+        # business writes are discarded.
+        if finalize_handler is not None:
+            await finalize_handler(False)
         await finish_in_session(
             lambda finalize_db: fail_task(
                 finalize_db,
@@ -236,11 +279,25 @@ async def _process(
         emit_ai_metric("retry_rate", 1, {"task_type": started.task_type})
         return "failed"
     result_ref, revisions = outcome
-    await finish_in_session(
+    # Run the consent/revision gate in a separate finalize_db session.  The
+    # returned task record tells us whether the gate passed (SUCCEEDED) or the
+    # task was superseded (SUPERSEDED — consent revoked / revision changed).
+    completed = await finish_in_session(
         lambda finalize_db: complete_task(
             finalize_db, started.task_id, worker_id, result_ref, revisions
         )
     )
+    if completed.status is AiTaskStatus.SUCCEEDED:
+        # Gate passed: now it is safe to durably commit the handler's business
+        # side effects (draft rows, session status flips).
+        if finalize_handler is not None:
+            await finalize_handler(True)
+        return "completed"
+    # Gate superseded the task (consent revoked / revision changed) or the task
+    # was otherwise finalized in a non-success terminal state: the handler's
+    # business writes must NOT become visible.  Roll them back.
+    if finalize_handler is not None:
+        await finalize_handler(False)
     return "completed"
 
 
@@ -258,7 +315,7 @@ async def _run_round(worker_id: str, batch_size: int) -> tuple[int, int, int]:
         try:
             reaped = await reap_expired_leases(reap_db, now, limit=batch_size)
             await reap_db.commit()
-        except Exception:  # noqa: BLE001 - reaping must not stop the round
+        except Exception:
             await reap_db.rollback()
             logger.exception("ai_worker_reap_failed")
             reaped = []
@@ -270,7 +327,7 @@ async def _run_round(worker_id: str, batch_size: int) -> tuple[int, int, int]:
         try:
             claimed = await claim_tasks(claim_db, worker_id, now, limit=batch_size)
             await claim_db.commit()
-        except Exception:  # noqa: BLE001 - claiming must not stop the round
+        except Exception:
             await claim_db.rollback()
             logger.exception("ai_worker_claim_failed")
             claimed = []
@@ -300,8 +357,9 @@ async def _run_cleanup_round(worker_id: str, batch_size: int) -> dict[str, int]:
     """One cleanup-consumer round: claim outbox delete events and consume them."""
     if session_factory is None:
         raise RuntimeError("数据库驱动未安装，无法运行 AI Worker 消费者")
-    from app.services.derivation_outbox import run_cleanup_consumer_round
     from sqlalchemy import text
+
+    from app.services.derivation_outbox import run_cleanup_consumer_round
 
     async with session_factory() as db:
         now = _now()
@@ -352,7 +410,7 @@ async def _run_forever(worker_id: str, batch_size: int, idle_seconds: float) -> 
                 completed,
                 failed,
             )
-        except Exception:  # noqa: BLE001 - keep the loop alive
+        except Exception:
             logger.exception("ai_worker_round_failed")
         await asyncio.sleep(idle_seconds)
 
@@ -364,7 +422,7 @@ async def _run_cleanup_forever(
         try:
             stats = await _run_cleanup_round(worker_id, batch_size)
             logger.info("ai_worker_cleanup_round %s", stats)
-        except Exception:  # noqa: BLE001 - keep the loop alive
+        except Exception:
             logger.exception("ai_worker_cleanup_round_failed")
         await asyncio.sleep(idle_seconds)
 
@@ -439,7 +497,7 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         logger.info("ai_worker_stopped worker_id=%s", worker_id)
         return 0
-    except Exception as exc:  # noqa: BLE001 - report and exit non-zero
+    except Exception as exc:
         logger.exception("ai_worker_fatal worker_id=%s", worker_id)
         print(f"worker failed: {type(exc).__name__}", file=sys.stderr)
         return 1

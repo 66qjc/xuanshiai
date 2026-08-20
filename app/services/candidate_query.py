@@ -6,13 +6,13 @@ import base64
 import hashlib
 import hmac
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, Mapping
+from typing import Any
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
-
 
 SORT_VERSION = "feed-rank-baseline-v1"
 _MAX_CURSOR_LENGTH = 512

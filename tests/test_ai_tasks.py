@@ -71,7 +71,7 @@ class _MappingResult:
     def __init__(self, rows: list[dict[str, Any]]) -> None:
         self._rows = rows
 
-    def mappings(self) -> "_MappingResult":
+    def mappings(self) -> _MappingResult:
         return self
 
     def first(self) -> dict[str, Any] | None:
@@ -89,7 +89,7 @@ class _WriteResult:
 class FakeAiSession:
     """Routes the service SQL by substring onto one in-memory TaskStore."""
 
-    def __init__(self, store: "TaskStore") -> None:
+    def __init__(self, store: TaskStore) -> None:
         self._store = store
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.commits = 0

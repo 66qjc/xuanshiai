@@ -3,12 +3,12 @@ from datetime import datetime, timedelta
 import pytest
 
 from app.services.candidate_query import (
+    SORT_VERSION,
     CandidateCursor,
     CandidateQueryService,
     CandidateQuerySnapshot,
     CandidateRankRow,
     InvalidCandidateCursor,
-    SORT_VERSION,
     sort_candidate_rows,
 )
 

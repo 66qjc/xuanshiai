@@ -96,7 +96,7 @@ class ReleaseEvidence:
     phase5_requires_fairness_review: bool = False
     blockers: tuple[str, ...] = field(default_factory=tuple)
 
-    def with_blockers(self, blockers: tuple[str, ...]) -> "ReleaseEvidence":
+    def with_blockers(self, blockers: tuple[str, ...]) -> ReleaseEvidence:
         """Return a copy carrying additional evidence blockers."""
         return ReleaseEvidence(
             required_paths=self.required_paths,
@@ -124,13 +124,13 @@ class ReleaseGateDecision:
     blockers: tuple[str, ...] = field(default_factory=tuple)
 
     @classmethod
-    def approved(cls, code: str = "AI_RELEASE_APPROVED") -> "ReleaseGateDecision":
+    def approved(cls, code: str = "AI_RELEASE_APPROVED") -> ReleaseGateDecision:
         return cls(enabled=True, code=code)
 
     @classmethod
     def blocked(
         cls, code: str = "AI_FEATURE_DISABLED", blockers: tuple[str, ...] = ()
-    ) -> "ReleaseGateDecision":
+    ) -> ReleaseGateDecision:
         return cls(enabled=False, code=code, blockers=tuple(blockers))
 
     @property

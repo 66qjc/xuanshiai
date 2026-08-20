@@ -1,0 +1,2 @@
+# AI migration SQL files must always use LF line endings.
+migrations/ai/*.sql text eol=lf

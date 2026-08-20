@@ -10,6 +10,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.schemas.ai_compatibility import CompatibilitySnapshotStatus
+from app.schemas.discovery import DiscoveryFilters
 from app.services.ai.compatibility import (
     COMPATIBILITY_CONSENT_SCOPE,
     compatibility_execute_handler,
@@ -17,6 +18,7 @@ from app.services.ai.compatibility import (
     request_compatibility_recompute,
 )
 from app.services.ai.tasks import get_task
+from app.services.discovery import get_discovery_page
 
 VIEWER_ID = 9_876_543_231
 TARGET_ID = VIEWER_ID + 1
@@ -221,8 +223,36 @@ async def test_real_compatibility_persists_pair_provenance_and_blocks_revocation
     assert json.loads(handler_snapshot["source_revision_pair_json"])["target"] == vector_target
     assert json.loads(handler_snapshot["consent_snapshot_pair_json"])["viewer"]["version"] == "compatibility-shadow-v1"
 
+    # G4-B shadow 守卫：写入恒定 display_eligible=0 + shadow 桶 + shadow 语义，
+    # 算法版本恒为 compatibility-rule-v1（后端保证不外显可读新兼容度）。
+    shadow_row = (
+        await real_db_session.execute(
+            text(
+                "SELECT display_eligible, experiment_bucket, score_semantics, algorithm_version "
+                "FROM ai_compatibility_snapshot WHERE snapshot_id = :snapshot_id"
+            ),
+            {"snapshot_id": accepted.snapshot_id},
+        )
+    ).mappings().one()
+    assert int(shadow_row["display_eligible"] or 0) == 0
+    assert shadow_row["experiment_bucket"] == "shadow"
+    assert shadow_row["score_semantics"] == "rule_based_reference_shadow"
+    assert shadow_row["algorithm_version"] == "compatibility-rule-v1"
+
     ready = await read_compatibility_snapshot(real_db_session, VIEWER_ID, TARGET_ID)
     assert ready.status == CompatibilitySnapshotStatus.READY
+    assert ready.display_eligible is False
+
+    # legacy 分数语义不被 shadow 写入破坏：旧推荐流卡片仍恒为 legacy-rule-v1。
+    legacy_page = await get_discovery_page(
+        real_db_session, VIEWER_ID, DiscoveryFilters(), plaza=False
+    )
+    assert legacy_page.items, "shadow 写入后旧推荐流仍应产出候选卡片"
+    assert all(
+        card.algorithm_version == "legacy-rule-v1"
+        and card.match_score_source == "legacy-rule-v1"
+        for card in legacy_page.items
+    )
 
     await real_db_session.execute(
         text(

@@ -15,6 +15,7 @@ from app.schemas.ai_common import (
     AiConsentGrantRequest,
     AiConsentListResponse,
     AiConsentOperationResponse,
+    AiConsentScope,
     AiErrorResponse,
 )
 from app.services.ai.consents import (
@@ -73,11 +74,11 @@ async def get_ai_consents(
     summary="Grant an AI consent scope",
 )
 async def put_ai_consent(
-    scope: str = Path(..., min_length=1, max_length=64),
+    scope: AiConsentScope = Path(...),
     body: AiConsentGrantRequest = ...,
     current: CurrentUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
-    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    idempotency_key: str = Header(..., alias="Idempotency-Key"),
     expected_privacy_revision: int = Header(
         ..., alias="X-Expected-Privacy-Revision", ge=0
     ),
@@ -105,10 +106,10 @@ async def put_ai_consent(
     summary="Revoke an AI consent scope and schedule cleanup",
 )
 async def delete_ai_consent(
-    scope: str = Path(..., min_length=1, max_length=64),
+    scope: AiConsentScope = Path(...),
     current: CurrentUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
-    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    idempotency_key: str = Header(..., alias="Idempotency-Key"),
     expected_privacy_revision: int = Header(
         ..., alias="X-Expected-Privacy-Revision", ge=0
     ),

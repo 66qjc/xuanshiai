@@ -59,7 +59,7 @@ class ExtractedField(BaseModel):
     policy_revision: str = Field(default="ai-policy-2026-08-07-v1", min_length=1, max_length=64)
 
     @model_validator(mode="after")
-    def validate_subject_aware_value_and_provenance(self) -> "ExtractedField":
+    def validate_subject_aware_value_and_provenance(self) -> ExtractedField:
         self.value = normalize_profile_extracted_value(self.subject, self.field_key, self.value)
         if self.source_span is None:
             self.source_span = self.source_quote

@@ -43,8 +43,10 @@ async def test_real_user_cleanup_removes_content_keeps_revision_header(
     await real_db_session.execute(
         text(
             "INSERT INTO ai_profile_session "
-            "(session_id, user_id, subject, consent_version, policy_revision) "
-            "VALUES ('cleanup-session', :user_id, 'personal', 'v1', 'policy-v1')"
+            "(session_id, user_id, subject, consent_version, policy_revision, "
+            "status, active_status) "
+            "VALUES ('cleanup-session', :user_id, 'personal', 'v1', 'policy-v1', "
+            "'cancelled', 0)"
         ),
         {"user_id": USER_ID},
     )
@@ -59,8 +61,8 @@ async def test_real_user_cleanup_removes_content_keeps_revision_header(
     await real_db_session.execute(
         text(
             "INSERT INTO ai_profile_draft "
-            "(draft_id, user_id, subject, policy_revision) "
-            "VALUES ('cleanup-draft', :user_id, 'personal', 'policy-v1')"
+            "(draft_id, user_id, subject, policy_revision, status) "
+            "VALUES ('cleanup-draft', :user_id, 'personal', 'policy-v1', 'deleted')"
         ),
         {"user_id": USER_ID},
     )
@@ -118,8 +120,8 @@ async def test_real_user_cleanup_removes_content_keeps_revision_header(
     await real_db_session.execute(
         text(
             "INSERT INTO ai_search_draft "
-            "(draft_id, user_id, query_text, policy_revision) "
-            "VALUES ('cleanup-search-draft', :user_id, 'SECRET_QUERY', 'policy-v1')"
+            "(draft_id, user_id, query_text, policy_revision, status) "
+            "VALUES ('cleanup-search-draft', :user_id, 'SECRET_QUERY', 'policy-v1', 'invalidated')"
         ),
         {"user_id": USER_ID},
     )
@@ -133,24 +135,24 @@ async def test_real_user_cleanup_removes_content_keeps_revision_header(
     await real_db_session.execute(
         text(
             "INSERT INTO ai_search_snapshot "
-            "(snapshot_id, user_id, snapshot_hash, policy_revision) "
-            "VALUES ('cleanup-snapshot', :user_id, :hash, 'policy-v1')"
+            "(snapshot_id, user_id, snapshot_hash, policy_revision, status, invalidated_at) "
+            "VALUES ('cleanup-snapshot', :user_id, :hash, 'policy-v1', 'invalidated', UTC_TIMESTAMP())"
         ),
         {"user_id": USER_ID, "hash": "e" * 64},
     )
     await real_db_session.execute(
         text(
             "INSERT INTO ai_search_result "
-            "(snapshot_id, target_user_id, rank_position) "
-            "VALUES ('cleanup-snapshot', :user_id, 1)"
+            "(snapshot_id, target_user_id, rank_position, stale) "
+            "VALUES ('cleanup-snapshot', :user_id, 1, 1)"
         ),
         {"user_id": USER_ID},
     )
     await real_db_session.execute(
         text(
             "INSERT INTO ai_compatibility_snapshot "
-            "(snapshot_id, viewer_user_id, target_user_id, snapshot_hash) "
-            "VALUES ('cleanup-compat', :user_id, :target_id, :hash)"
+            "(snapshot_id, viewer_user_id, target_user_id, snapshot_hash, status) "
+            "VALUES ('cleanup-compat', :user_id, :target_id, :hash, 'blocked')"
         ),
         {"user_id": USER_ID, "target_id": USER_ID + 1, "hash": "f" * 64},
     )

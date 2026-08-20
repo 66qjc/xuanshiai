@@ -15,6 +15,7 @@ from app.schemas.ai_profile import ProfileSubject
 from app.schemas.social import BlockRequest
 from app.services.ai.compatibility import (
     COMPATIBILITY_CONSENT_SCOPE,
+    CandidateNotVisible,
     compatibility_execute_handler,
     read_compatibility_snapshot,
     request_compatibility_recompute,
@@ -28,8 +29,6 @@ from app.services.ai.search import (
 )
 from app.services.ai.tasks import get_task
 from app.services.social import set_block
-from app.services.ai.compatibility import CandidateNotVisible
-
 
 POLICY_REVISION = "ai-policy-2026-08-07-v1"
 USER_A = 9_876_544_310

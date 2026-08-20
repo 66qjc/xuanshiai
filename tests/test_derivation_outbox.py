@@ -91,7 +91,7 @@ class RevisionRecordingSession:
         # 独立事务消费失败时回滚：fake session 无挂起写入需撤销。
         pass
 
-    async def __aenter__(self) -> "RevisionRecordingSession":
+    async def __aenter__(self) -> RevisionRecordingSession:
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:

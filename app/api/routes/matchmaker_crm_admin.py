@@ -30,11 +30,14 @@ async def members(page: int = Query(1, ge=1, le=1000), page_size: int = Query(20
     where = "1=1"
     params: dict = {}
     if gender is not None:
-        where += " AND u.gender = :gender"; params["gender"] = gender
+        where += " AND u.gender = :gender"
+        params["gender"] = gender
     if status is not None:
-        where += " AND u.status = :status"; params["status"] = status
+        where += " AND u.status = :status"
+        params["status"] = status
     if search:
-        where += " AND (u.nickname LIKE CONCAT('%', :search, '%') OR u.phone LIKE CONCAT('%', :search, '%'))"; params["search"] = search
+        where += " AND (u.nickname LIKE CONCAT('%', :search, '%') OR u.phone LIKE CONCAT('%', :search, '%'))"
+        params["search"] = search
     if vip is True:
         where += " AND v.user_id IS NOT NULL AND (v.vip_end_at IS NULL OR v.vip_end_at > UTC_TIMESTAMP())"
     if vip is False:

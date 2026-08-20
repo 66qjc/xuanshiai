@@ -32,9 +32,10 @@ import hashlib
 import json
 import logging
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
-from typing import Any, Callable
+from typing import Any
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -185,7 +186,7 @@ class CompatibilityResult:
         directions: tuple[float, float],
         coverage: float,
         reason_codes: tuple[str, ...],
-    ) -> "CompatibilityResult":
+    ) -> CompatibilityResult:
         return cls(
             pair_score=round(float(pair_score), 2),
             directions=(float(directions[0]), float(directions[1])),
@@ -200,7 +201,7 @@ class CompatibilityResult:
         *,
         coverage: float,
         reason_codes: tuple[str, ...],
-    ) -> "CompatibilityResult":
+    ) -> CompatibilityResult:
         """覆盖度不足/无可用维度时的结果：不伪造完整分（§9.2）。"""
         return cls(
             pair_score=None,
@@ -326,7 +327,7 @@ def _as_str(value: Any) -> str | None:
     if isinstance(value, str) and value.strip():
         return value.strip()
     if hasattr(value, "value"):
-        raw = getattr(value, "value")
+        raw = value.value
         if isinstance(raw, str) and raw.strip():
             return raw.strip()
     return None
@@ -1269,33 +1270,37 @@ async def request_compatibility_recompute(
     )
     existing_payload = task.payload_summary or {}
     if existing_payload.get("snapshot_id"):
+        # Replayed concurrent request: the winner already committed the payload.
+        # Re-write would take an X lock on the task row while sibling replays
+        # hold S locks left by their duplicate-key INSERT — a deadlock cycle.
         snapshot_id = str(existing_payload["snapshot_id"])
-    await db.execute(
-        text(
-            "UPDATE ai_task SET payload_summary = :payload_summary, "
-            "updated_at = UTC_TIMESTAMP() WHERE task_id = :task_id"
-        ),
-        {
-            "payload_summary": json.dumps(
-                {
-                    "snapshot_id": snapshot_id,
-                    "target_user_id": int(target_user_id),
-                    "expected_viewer_profile_revision": int(
-                        expected_viewer_profile_revision
-                    ),
-                    "expected_target_profile_revision": int(
-                        expected_target_profile_revision
-                    ),
-                    "viewer_source_revision": owner_rev.as_dict(),
-                    "target_source_revision": target_rev.as_dict(),
-                    "consent_snapshot": consent_snapshot,
-                },
-                ensure_ascii=False,
+    else:
+        await db.execute(
+            text(
+                "UPDATE ai_task SET payload_summary = :payload_summary, "
+                "updated_at = UTC_TIMESTAMP() WHERE task_id = :task_id"
             ),
-            "task_id": task.task_id,
-        },
-    )
-    await db.flush()
+            {
+                "payload_summary": json.dumps(
+                    {
+                        "snapshot_id": snapshot_id,
+                        "target_user_id": int(target_user_id),
+                        "expected_viewer_profile_revision": int(
+                            expected_viewer_profile_revision
+                        ),
+                        "expected_target_profile_revision": int(
+                            expected_target_profile_revision
+                        ),
+                        "viewer_source_revision": owner_rev.as_dict(),
+                        "target_source_revision": target_rev.as_dict(),
+                        "consent_snapshot": consent_snapshot,
+                    },
+                    ensure_ascii=False,
+                ),
+                "task_id": task.task_id,
+            },
+        )
+        await db.flush()
     expires_at = _now_utc() + timedelta(
         minutes=settings.ai_compatibility_snapshot_ttl_minutes
     )

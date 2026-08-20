@@ -255,7 +255,7 @@ class _MappingResult:
     def __init__(self, rows: list[dict[str, Any]]) -> None:
         self._rows = rows
 
-    def mappings(self) -> "_MappingResult":
+    def mappings(self) -> _MappingResult:
         return self
 
     def first(self) -> dict[str, Any] | None:

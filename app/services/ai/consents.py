@@ -23,10 +23,26 @@ from app.services.ai.profile import PROFILE_POLICY_REVISION
 from app.services.ai.tasks import enqueue_task
 from app.services.revisions import RevisionKind, RevisionVector, increment_revision_and_enqueue
 
-
 # 冻结的授权文案版本：客户端提交的 consent_version 必须匹配此值，否则拒绝授权。
 # policy_revision 复用 profile.py 中的 PROFILE_POLICY_REVISION（单一事实源），避免漂移。
-PROFILE_CONSENT_VERSION = "profile-consent-v1"
+# 每个 scope 有独立的 consent_version（统一方案 §6.3），不再复用单一常量。
+CONSENT_VERSIONS: dict[str, str] = {
+    "profile_text_extract": "profile-text-v1",
+    "search_parse": "search-parse-v1",
+    "compatibility_shadow": "compatibility-shadow-v1",
+}
+
+
+def get_consent_version(scope: str) -> str:
+    """Return the frozen consent_version for the given scope."""
+    if scope not in CONSENT_VERSIONS:
+        raise ConsentError("AI_INPUT_INVALID", "AI consent scope is invalid", 400)
+    return CONSENT_VERSIONS[scope]
+
+
+# Backwards-compat alias used by other modules that imported the old constant.
+# Tests assert this is no longer "profile-consent-v1".
+PROFILE_CONSENT_VERSION = CONSENT_VERSIONS["profile_text_extract"]
 
 
 class ConsentError(Exception):
@@ -339,12 +355,21 @@ async def grant_consent(
     expected_privacy_revision: int,
 ) -> AiConsentOperationResponse:
     scope = validate_scope(scope)
+    digest = _digest("grant", scope, body)
+    # Idempotency wins over payload validation for an already-used key.  A
+    # replay with a different (even malformed/stale) payload must report the
+    # stable idempotency conflict instead of leaking a version-validation
+    # result for the new payload.
+    existing = await _find_operation(db, user_id, "grant", idempotency_key)
+    if existing:
+        return _decode_operation(existing, digest)
     # 缺陷18：运行时门禁——客户端提交的 consent_version / policy_revision 必须匹配
-    # 服务端冻结常量，否则拒绝授权，防止客户端用过期/篡改的授权文案绕过。
-    if body.consent_version != PROFILE_CONSENT_VERSION:
+    # 服务端冻结的 per-scope 版本，否则拒绝授权，防止客户端用过期/篡改的授权文案绕过。
+    frozen_version = get_consent_version(scope)
+    if body.consent_version != frozen_version:
         raise ConsentError(
             "AI_CONSENT_VERSION_CONFLICT",
-            f"consent_version does not match the frozen value ({PROFILE_CONSENT_VERSION})",
+            f"consent_version does not match the frozen value ({frozen_version})",
             409,
         )
     if body.policy_revision != PROFILE_POLICY_REVISION:
@@ -353,10 +378,6 @@ async def grant_consent(
             f"policy_revision does not match the frozen value ({PROFILE_POLICY_REVISION})",
             409,
         )
-    digest = _digest("grant", scope, body)
-    existing = await _find_operation(db, user_id, "grant", idempotency_key)
-    if existing:
-        return _decode_operation(existing, digest)
     current_privacy = await _lock_privacy_revision(db, user_id)
     existing = await _find_operation(db, user_id, "grant", idempotency_key)
     if existing:

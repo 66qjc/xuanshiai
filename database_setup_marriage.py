@@ -373,17 +373,23 @@ class DatabaseManager:
         for table_name in ("community_post", "community_comment"):
             try:
                 cursor.execute(
-                    f"""UPDATE `{table_name}`
-                    SET moderation_status = CASE moderation_status
-                        WHEN 'pending' THEN 0
-                        WHEN 'approved' THEN 1
-                        WHEN 'replaced' THEN 1
-                        WHEN 'rejected' THEN 2
-                        WHEN 'hidden' THEN 2
-                        WHEN 'deleted' THEN 2
-                        ELSE moderation_status
-                    END"""
+                    f"SHOW COLUMNS FROM `{table_name}` LIKE 'moderation_status'"
                 )
+                row = cursor.fetchone()
+                col_type = str(row["Type"]).lower() if row else ""
+                if "char" in col_type or "text" in col_type or "enum" in col_type:
+                    cursor.execute(
+                        f"""UPDATE `{table_name}`
+                        SET moderation_status = CASE moderation_status
+                            WHEN 'pending' THEN 0
+                            WHEN 'approved' THEN 1
+                            WHEN 'replaced' THEN 1
+                            WHEN 'rejected' THEN 2
+                            WHEN 'hidden' THEN 2
+                            WHEN 'deleted' THEN 2
+                            ELSE moderation_status
+                        END"""
+                    )
                 cursor.execute(
                     f"""ALTER TABLE `{table_name}`
                     MODIFY COLUMN `moderation_status` tinyint NOT NULL DEFAULT 1

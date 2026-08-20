@@ -15,9 +15,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.profile_tags import TAG_OPTIONS_BY_CATEGORY
-from app.core.redis import consume_daily, refund_daily, redis_client
+from app.core.redis import consume_daily, redis_client, refund_daily
 from app.schemas.discovery import (
     ApplicationCreateRequest,
+    ApplicationPage,
     ApplicationRejectRequest,
     ApplicationResponse,
     BrowseHistoryItem,
@@ -26,35 +27,34 @@ from app.schemas.discovery import (
     DiscoveryFilters,
     DiscoveryPage,
     DiscoverySearch,
-    FavoriteResponse,
-    FilterOptionsResponse,
-    ApplicationPage,
     FavoritePage,
     FavoriteReceivedItem,
     FavoriteReceivedPage,
-    RelationUserSummary,
+    FavoriteResponse,
+    FilterOptionsResponse,
     PublicProfileResponse,
+    RelationUserSummary,
     SavedFilterResponse,
-    SuperLikeResponse,
     SuperLikeItem,
     SuperLikePage,
+    SuperLikeResponse,
     VisitorPage,
 )
-from app.services.notifications import emit_notification
+from app.services.candidate_query import (
+    SORT_VERSION,
+    CandidatePage,
+    CandidateQueryService,
+    CandidateQuerySnapshot,
+    InvalidCandidateCursor,
+    build_query_fingerprint,
+)
 from app.services.candidate_visibility import (
     CandidateVisibilityService,
     SqlPredicate,
     ViewerContext,
     VisibilityScene,
 )
-from app.services.candidate_query import (
-    CandidatePage,
-    CandidateQueryService,
-    CandidateQuerySnapshot,
-    InvalidCandidateCursor,
-    SORT_VERSION,
-    build_query_fingerprint,
-)
+from app.services.notifications import emit_notification
 from app.services.profile import _calculate_age, _json_dict, _json_list, get_profile
 from app.services.quotas import consume_extra
 from app.services.restrictions import ensure_user_allowed

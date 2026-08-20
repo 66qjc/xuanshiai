@@ -41,7 +41,7 @@ import json
 import logging
 import math
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field as dc_field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -64,6 +64,8 @@ from app.schemas.ai_profile import (
 from app.services.ai.base import AITaskContext, StructuredExtractRequest
 from app.services.ai.features import (
     ProjectionBuildError,
+    _load_latest_revision,
+    _subject_for_kind,
     build_feature_projection,
 )
 from app.services.ai.gateway import AIGateway
@@ -150,33 +152,59 @@ _SESSION_TRANSITIONS: dict[ProfileSessionStatus, set[ProfileSessionStatus]] = {
 }
 
 # 缺失字段 → 追问问题字典（固定文案，不诱导敏感信息；§7.5 示例对齐）。
+# Task6 Step2：每个问题补稳定 ``field_key``（属于 AI_FIELD_ALLOWLIST），前端据
+# 此映射到 typed field 编辑器，不依赖问题文案或顺序。加法字段，保留 id/text。
 _PROFILE_QUESTION_BANK: dict[str, ProfileQuestion] = {
     "interest_tags": ProfileQuestion(
-        id="interest_lifestyle_v1", text="最近让你投入的事情是什么？"
+        id="interest_lifestyle_v1",
+        text="最近让你投入的事情是什么？",
+        field_key="interest_tags",
     ),
     "city_code": ProfileQuestion(
-        id="city_residence_v1", text="你现在生活在哪座城市？"
+        id="city_residence_v1",
+        text="你现在生活在哪座城市？",
+        field_key="city_code",
     ),
     "marriage_status": ProfileQuestion(
-        id="marriage_status_v1", text="你目前的婚姻状态是？"
+        id="marriage_status_v1",
+        text="你目前的婚姻状态是？",
+        field_key="marriage_status",
     ),
     "education_level": ProfileQuestion(
-        id="education_v1", text="你的最高学历是？"
+        id="education_v1",
+        text="你的最高学历是？",
+        field_key="education_level",
     ),
-    "height_cm": ProfileQuestion(id="height_v1", text="你的身高是多少？"),
+    "height_cm": ProfileQuestion(
+        id="height_v1",
+        text="你的身高是多少？",
+        field_key="height_cm",
+    ),
     "income_band": ProfileQuestion(
-        id="income_v1", text="你的收入大概在什么范围？"
+        id="income_v1",
+        text="你的收入大概在什么范围？",
+        field_key="income_band",
     ),
     "occupation_group": ProfileQuestion(
-        id="occupation_v1", text="你从事什么职业？"
+        id="occupation_v1",
+        text="你从事什么职业？",
+        field_key="occupation_group",
     ),
     "lifestyle_tags": ProfileQuestion(
-        id="lifestyle_v1", text="你平时的生活方式有什么特点？"
+        id="lifestyle_v1",
+        text="你平时的生活方式有什么特点？",
+        field_key="lifestyle_tags",
     ),
     "relationship_goal": ProfileQuestion(
-        id="relationship_goal_v1", text="你对这段关系的期待是什么？"
+        id="relationship_goal_v1",
+        text="你对这段关系的期待是什么？",
+        field_key="relationship_goal",
     ),
-    "age": ProfileQuestion(id="age_v1", text="你今年多大了？"),
+    "age": ProfileQuestion(
+        id="age_v1",
+        text="你今年多大了？",
+        field_key="age",
+    ),
 }
 
 _SESSION_COLUMNS = (
@@ -368,6 +396,10 @@ class ProfileSession:
     expires_at: datetime | None
     created_at: datetime
     updated_at: datetime | None
+    # Task6 Step2：当前会话的活动草稿 ID（无活动草稿为 None）。加法字段，
+    # 由 ``_load_active_draft_id_for_session`` 在装配 session 时回填，路由层
+    # 透传到 ``ProfileSessionRead.draft_id``。
+    draft_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -402,7 +434,7 @@ class TurnSubmission:
     expires_at: datetime | None
 
     @classmethod
-    def accepted(cls, turn: ProfileTurn, task: AiTaskRecord) -> "TurnSubmission":
+    def accepted(cls, turn: ProfileTurn, task: AiTaskRecord) -> TurnSubmission:
         return cls(
             turn_id=turn.turn_id,
             session_id=turn.session_id,
@@ -419,7 +451,7 @@ class TurnSubmission:
         )
 
     @classmethod
-    def replay(cls, turn: ProfileTurn) -> "TurnSubmission":
+    def replay(cls, turn: ProfileTurn) -> TurnSubmission:
         return cls(
             turn_id=turn.turn_id,
             session_id=turn.session_id,
@@ -481,10 +513,10 @@ class ProfileDraft:
     revision: int = 0
     policy_revision: str = PROFILE_POLICY_REVISION
     schema_version: str = PROFILE_SCHEMA_VERSION
-    consent_snapshot: dict[str, Any] = field(default_factory=dict)
+    consent_snapshot: dict[str, Any] = dc_field(default_factory=dict)
     last_operation_idempotency_key: str | None = None
     last_operation_request_digest: str | None = None
-    operation_history: dict[str, Any] = field(default_factory=dict)
+    operation_history: dict[str, Any] = dc_field(default_factory=dict)
     session_id: str | None = None
     fields: tuple[ProfileDraftField, ...] = ()
     expires_at: datetime | None = None
@@ -514,7 +546,7 @@ class TaskSubmission:
     revision: PublishedRevision | None
 
     @classmethod
-    def accepted(cls, task: AiTaskRecord, revision: PublishedRevision) -> "TaskSubmission":
+    def accepted(cls, task: AiTaskRecord, revision: PublishedRevision) -> TaskSubmission:
         return cls(
             task_id=task.task_id,
             status=task.status.value,
@@ -523,7 +555,7 @@ class TaskSubmission:
         )
 
     @classmethod
-    def replay(cls, task: AiTaskRecord) -> "TaskSubmission":
+    def replay(cls, task: AiTaskRecord) -> TaskSubmission:
         return cls(
             task_id=task.task_id,
             status=task.status.value,
@@ -724,6 +756,28 @@ async def _load_field_keys(
     return frozenset(field_keys), frozenset(confirmed_keys)
 
 
+async def _load_active_draft_id_for_session(
+    db: AsyncSession, session_id: str
+) -> str | None:
+    """Return the active draft id for a session, or ``None`` if none exists.
+
+    Task6 Step2：会话读取路径回填 ``draft_id``。只挑选非终态（非
+    published/deleted/cancelled）的最新草稿；published 之后的历史草稿只读，
+    不作为「可继续编辑的 draft_id」暴露给前端。加法查询，不改变现有写入。
+    """
+    result = await db.execute(
+        text(
+            "SELECT draft_id FROM ai_profile_draft "
+            "WHERE session_id = :session_id AND status IN ('draft', 'extracting', "
+            "'awaiting_confirmation', 'paused') "
+            "ORDER BY updated_at DESC LIMIT 1"
+        ),
+        {"session_id": session_id},
+    )
+    row = await _first_row(result)
+    return str(row["draft_id"]) if row else None
+
+
 def _subject(value: Any) -> ProfileSubject:
     if isinstance(value, ProfileSubject):
         return value
@@ -737,6 +791,7 @@ def _session_from_row(
     consent_snapshot: dict[str, Any],
     field_keys: frozenset[str],
     confirmed_keys: frozenset[str],
+    draft_id: str | None = None,
 ) -> ProfileSession:
     session = ProfileSession(
         session_id=str(row["session_id"]),
@@ -756,6 +811,7 @@ def _session_from_row(
         expires_at=row.get("expires_at"),
         created_at=row.get("created_at"),
         updated_at=row.get("updated_at"),
+        draft_id=draft_id,
     )
     object.__setattr__(session, "current_question", next_profile_question(session))
     return session
@@ -826,12 +882,14 @@ async def _reuse_active_session(
         await _mark_stale(db, str(row["session_id"]))
         raise ProfileSessionStale()
     field_keys, confirmed_keys = await _load_field_keys(db, str(row["session_id"]))
+    draft_id = await _load_active_draft_id_for_session(db, str(row["session_id"]))
     return _session_from_row(
         row,
         revision=revision,
         consent_snapshot=consent_snapshot,
         field_keys=field_keys,
         confirmed_keys=confirmed_keys,
+        draft_id=draft_id,
     )
 
 
@@ -955,6 +1013,7 @@ async def load_owned_session(
         raise ProfileSessionNotFound()
     revision = await _load_revision_vector(db, owner_user_id)
     field_keys, confirmed_keys = await _load_field_keys(db, session_id)
+    draft_id = await _load_active_draft_id_for_session(db, session_id)
     consent = await _load_consent_grant(
         db, owner_user_id, PROFILE_CONSENT_SCOPE, str(row["consent_version"])
     )
@@ -964,6 +1023,7 @@ async def load_owned_session(
         consent_snapshot=_consent_snapshot(consent) if consent else {},
         field_keys=field_keys,
         confirmed_keys=confirmed_keys,
+        draft_id=draft_id,
     )
 
 
@@ -1003,12 +1063,14 @@ async def load_owned_active_session(
     if consent is None:
         raise AIConsentRequired()
     field_keys, confirmed_keys = await _load_field_keys(db, session_id)
+    draft_id = await _load_active_draft_id_for_session(db, session_id)
     return _session_from_row(
         row,
         revision=revision,
         consent_snapshot=_consent_snapshot(consent),
         field_keys=field_keys,
         confirmed_keys=confirmed_keys,
+        draft_id=draft_id,
     )
 
 
@@ -1339,7 +1401,7 @@ async def extract_profile_turn(
             # or another bypass, so the draft writer must never silently filter
             # an unknown/authentication field.
             if not isinstance(field.subject, ProfileSubject):
-                raise ValueError("provider subject is not typed")
+                raise TypeError("provider subject is not typed")
             if field.subject is not expected_subject:
                 raise ValueError("provider subject does not match session")
             if field.schema_version != PROFILE_SCHEMA_VERSION:
@@ -1352,7 +1414,7 @@ async def extract_profile_turn(
                 field.subject, field.field_key, field.value
             )
             if isinstance(field.confidence, bool):
-                raise ValueError("provider confidence must be numeric")
+                raise TypeError("provider confidence must be numeric")
             confidence = float(field.confidence)
             if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
                 raise ValueError("provider confidence is outside the allowed range")
@@ -2634,6 +2696,25 @@ async def delete_ai_profile(
         ),
         {"user_id": owner_user_id},
     )
+    # 代际 fence 标记（Plan Task 5 Step 4）：把该用户的搜索快照/草稿标记为
+    # 旧代资源，purge 只删除带标记的行；删除后重建的新草稿/快照不受影响。
+    await db.execute(
+        text(
+            "UPDATE ai_search_snapshot SET status = 'invalidated', "
+            "invalidated_at = UTC_TIMESTAMP(), updated_at = UTC_TIMESTAMP() "
+            "WHERE user_id = :user_id AND invalidated_at IS NULL"
+        ),
+        {"user_id": owner_user_id},
+    )
+    await db.execute(
+        text(
+            "UPDATE ai_search_draft SET status = 'invalidated', "
+            "updated_at = UTC_TIMESTAMP() "
+            "WHERE user_id = :user_id "
+            "AND status NOT IN ('invalidated', 'expired', 'failed')"
+        ),
+        {"user_id": owner_user_id},
+    )
     await db.execute(
         text(
             "UPDATE ai_compatibility_snapshot SET status = 'blocked', "
@@ -2865,13 +2946,18 @@ async def profile_projection_handler(
     """``profile_projection`` Worker handler：发布后重建特征投影。
 
     读取已发布 ``ai_profile_revision`` 的已确认字段（Task 8 构造保证只有
-    confirmed 字段），按主体映射投影种类：``personal`` → ``personal_searchable``
-    + ``personal_compatibility``；``ideal_partner`` → ``ideal_partner_preference``。
-    每种调用 ``build_feature_projection``（revision_vector=None 使投影以任务执行
-    时的最新五维版本向量为准，保证投影 valid）；``ProjectionBuildError``（无已
-    发布版本/无 allowlist 字段/无授权）按 Task 6 语义不可重试地失败为
-    ``RESULT_STALE``，绝不落空投影。返回 ``(result_ref, revisions)``，revisions
-    取任务入队时的 source_revision 使 ``complete_task`` 版本复核不误 supersede。
+    confirmed 字段），每次发布重建全部三种投影：``personal`` 主体对应
+    ``personal_searchable`` + ``personal_compatibility``，``ideal_partner``
+    主体对应 ``ideal_partner_preference``。任何一次发布都会推进五维版本向量，
+    若只重建本次发布主体的投影，其他主体的投影会停留在旧向量上，按 §5.5
+    全维比对被判过期，搜索随之静默为空，因此三种都要重建。每种调用
+    ``build_feature_projection``（revision_vector=None 使投影以任务执行时的
+    最新五维版本向量为准，保证投影 valid）：本次发布主体的 kind 钉住
+    ``published_revision_id``，其他主体的 kind 取该主体最新已发布 revision，
+    尚无已发布 revision 的主体跳过。``ProjectionBuildError``（无 allowlist
+    字段/无授权等）按 Task 6 语义不可重试地失败为 ``RESULT_STALE``，绝不落
+    空投影。返回 ``(result_ref, revisions)``，revisions 取任务入队时的
+    source_revision 使 ``complete_task`` 版本复核不误 supersede。
     """
     payload = task.payload_summary or {}
     user_id = payload.get("user_id")
@@ -2896,33 +2982,44 @@ async def profile_projection_handler(
         )
         return None
     subject_value = str(subject)
-    if subject_value == ProfileSubject.PERSONAL.value:
-        kinds = (
-            ProjectionKind.PERSONAL_SEARCHABLE,
-            ProjectionKind.PERSONAL_COMPATIBILITY,
-        )
-    elif subject_value == ProfileSubject.IDEAL_PARTNER.value:
-        kinds = (ProjectionKind.IDEAL_PARTNER_PREFERENCE,)
-    else:
+    if subject_value not in {
+        ProfileSubject.PERSONAL.value,
+        ProfileSubject.IDEAL_PARTNER.value,
+    }:
         await fail_task(
             db, task.task_id, worker_id,
             error_code="AI_INPUT_INVALID", retryable=False,
         )
         return None
+    user_id_int = int(user_id)
+    built: list[str] = []
     try:
-        built: list[str] = []
-        for kind in kinds:
+        for kind in (
+            ProjectionKind.PERSONAL_SEARCHABLE,
+            ProjectionKind.PERSONAL_COMPATIBILITY,
+            ProjectionKind.IDEAL_PARTNER_PREFERENCE,
+        ):
+            pinned_revision_id: int | None = None
+            if _subject_for_kind(kind) == subject_value:
+                pinned_revision_id = int(published_revision_id)
+            elif await _load_latest_revision(
+                db, user_id_int, _subject_for_kind(kind)
+            ) is None:
+                # 该主体尚无已发布 revision；本次发布不负责从空主体建投影。
+                continue
             projection = await build_feature_projection(
                 db,
-                int(user_id),
+                user_id_int,
                 kind,
-                revision_vector=RevisionVector(**source_revision),
-                published_revision_id=int(published_revision_id),
+                revision_vector=None,
+                published_revision_id=pinned_revision_id,
                 consent_snapshot=consent_snapshot,
             )
-            built.append(f"{kind.value}:{projection.id if projection.id is not None else 'ok'}")
+            built.append(
+                f"{kind.value}:{projection.id if projection.id is not None else 'ok'}"
+            )
     except ProjectionBuildError:
-        # 投影不可构建（发布后无该主体已确认字段/授权撤回等）：不可重试终态。
+        # 投影不可构建（无该主体已确认字段/授权撤回等）：不可重试终态。
         await fail_task(
             db, task.task_id, worker_id,
             error_code="RESULT_STALE", retryable=False,

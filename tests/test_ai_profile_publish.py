@@ -43,10 +43,12 @@ from app.services.ai.profile import (
 )
 from app.services.ai.tasks import TaskError
 from tests.test_ai_profile_sessions import (
-    _MappingResult,
-    _WriteResult,
-    _now,
     FakeProfileSession,
+    _MappingResult,
+    _now,
+    _WriteResult,
+)
+from tests.test_ai_profile_sessions import (
     ProfileStore as Task7ProfileStore,
 )
 
@@ -177,6 +179,13 @@ class PublishFakeSession(FakeProfileSession):
         if "UPDATE ai_compatibility_snapshot" in sql:
             store.apply_compat_update(values)
             return _WriteResult(rowcount=1)
+        # 代际 fence 标记（本 store 不建模搜索草稿/快照集合，仅记录调用）。
+        if "UPDATE ai_search_snapshot" in sql:
+            store.deletion_marks.append(("snapshot_invalidated", dict(values)))
+            return _WriteResult(rowcount=1)
+        if "UPDATE ai_search_draft" in sql:
+            store.deletion_marks.append(("draft_invalidated", dict(values)))
+            return _WriteResult(rowcount=1)
         if "UPDATE ai_consent_grant" in sql:
             store.apply_consent_update(values)
             return _WriteResult(rowcount=1)
@@ -211,6 +220,7 @@ class ProfileStore(Task7ProfileStore):
         self.projections: list[dict[str, Any]] = []
         self.search_results: list[dict[str, Any]] = []
         self.compat_snapshots: list[dict[str, Any]] = []
+        self.deletion_marks: list[tuple[str, dict[str, Any]]] = []
         self._next_revision_id = 1
         self.session = PublishFakeSession(self)
         self.db = self.session
