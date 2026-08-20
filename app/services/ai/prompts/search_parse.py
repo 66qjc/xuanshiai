@@ -10,7 +10,7 @@ from __future__ import annotations
 # 每个字段允许的 operator，与 FIELD_OPERATOR_ALLOWLIST 一致。
 _FIELD_OPERATOR_GUIDE = {
     "age": "between（{\"min\": 最小, \"max\": 最大}）/ gte（最小）/ lte（最大）",
-    "city_code": "eq（单个城市代码）/ in（城市代码数组）",
+    "city_code": "eq（单个 6 位行政区划代码）/ in（6 位代码数组）。必须用数字代码，不要用拼音或中文城市名。常见城市：330100=杭州, 110100=北京, 440100=广州, 310100=上海, 440300=深圳, 330200=宁波, 320100=南京, 510100=成都, 420100=武汉, 370100=济南",
     "marriage_status": "eq（单个状态）/ in（状态数组）",
     "education_level": "gte（最低学历等级，整数 1-8。中文映射：1=初中及以下，2=高中/中专，3=大专，4=本科，5=硕士，6=博士。用户说“本科以上/本科及以上”时 value=4）",
     "height_cm": "between / gte / lte，数值为厘米数",
