@@ -1,0 +1,24 @@
+{
+  "argv": [
+    "python",
+    "scripts/evaluate_ai_quality.py"
+  ],
+  "branch": "codex/ai-remediation-backend-20260816",
+  "command": "python scripts/evaluate_ai_quality.py",
+  "commit_sha": "496c39aa17dc07b26a1b8fca5a16cf12f8d8475f",
+  "dirty": false,
+  "environment": "testing",
+  "evidence_kind": "release-verification",
+  "exit_code": 0,
+  "finished_at": "2026-08-20T04:54:39Z",
+  "gate": "G5",
+  "id": "g5.quality.eval",
+  "input_artifacts": [],
+  "output_artifacts": [],
+  "recorded_by": "scripts/capture_ai_evidence.py",
+  "result": "PASS",
+  "schema_version": "ai-command-result-v1",
+  "started_at": "2026-08-20T04:54:38Z",
+  "stderr_path": "D:\\Users\\ASUS\\Desktop\\宣誓爱\\xuanshiai-backend-ai-remediation\\artifacts\\raw\\g5.quality.eval.stderr.log",
+  "stdout_path": "D:\\Users\\ASUS\\Desktop\\宣誓爱\\xuanshiai-backend-ai-remediation\\artifacts\\raw\\g5.quality.eval.stdout.log"
+}

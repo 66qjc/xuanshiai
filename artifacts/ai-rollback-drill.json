@@ -1,0 +1,102 @@
+{
+  "schema_version": "ai-evidence-v1",
+  "artifact_type": "rollback",
+  "target": "internal",
+  "branch": "codex/ai-remediation-backend-20260816",
+  "commit_sha": "6f8f09ce8bea29d5b649501465fe04f56c4768ab",
+  "dirty": false,
+  "environment": "testing",
+  "generated_at": "2026-08-19T15:47:43Z",
+  "policy_version": "NOT_RUN",
+  "provider": "mock",
+  "model": null,
+  "schema_versions": {
+    "evidence": "ai-evidence-v1",
+    "command_result": "ai-command-result-v1"
+  },
+  "commands": [
+    {
+      "id": "drill.migration.up.fresh",
+      "argv": ["python", "scripts/manage_ai_migration.py", "up", "--target", "test"],
+      "exit_code": 0,
+      "note": "fresh up on disposable DB xuanshiai_ai_drill (mysql 127.0.0.1:3307)"
+    },
+    {
+      "id": "drill.migration.verify.current",
+      "argv": ["python", "scripts/manage_ai_migration.py", "verify", "--target", "test", "--expect", "current"],
+      "exit_code": 0,
+      "note": "verified=current"
+    },
+    {
+      "id": "drill.migration.up.repeated",
+      "argv": ["python", "scripts/manage_ai_migration.py", "up", "--target", "test"],
+      "exit_code": 0,
+      "note": "repeated up idempotent; verified=current"
+    },
+    {
+      "id": "drill.migration.down.fault",
+      "argv": ["python", "scripts/manage_ai_migration.py", "down", "--target", "test"],
+      "exit_code": 1,
+      "note": "injected data-dependent DDL fault: duplicate (snapshot_id, rank_position) rows trip 1062 on uk_ai_search_result_rank re-add; history records 20260809_01 rollback_failed"
+    },
+    {
+      "id": "drill.migration.down.resume",
+      "argv": ["python", "scripts/manage_ai_migration.py", "down", "--target", "test"],
+      "exit_code": 0,
+      "note": "remediated duplicate row, resumed down; verified=previous"
+    },
+    {
+      "id": "drill.migration.up.restore",
+      "argv": ["python", "scripts/manage_ai_migration.py", "up", "--target", "test"],
+      "exit_code": 0,
+      "note": "restore up from previous schema; verified=current; turn_id backfilled legacy-turn-<id>, generation reset to 1 per documented loss scope"
+    }
+  ],
+  "exit_codes": {
+    "drill.migration.up.fresh": 0,
+    "drill.migration.verify.current": 0,
+    "drill.migration.up.repeated": 0,
+    "drill.migration.down.fault": 1,
+    "drill.migration.down.resume": 0,
+    "drill.migration.up.restore": 0
+  },
+  "input_artifact_hashes": {},
+  "output_artifact_hashes": {},
+  "reviewer": {
+    "name": "product-owner",
+    "role": "rollback-reviewer",
+    "status": "PENDING"
+  },
+  "gates": {
+    "G0": {"status": "NOT_RUN", "command_ids": []},
+    "G1": {"status": "NOT_RUN", "command_ids": []},
+    "G2": {"status": "NOT_RUN", "command_ids": []},
+    "G3": {"status": "NOT_RUN", "command_ids": []},
+    "G4": {"status": "NOT_RUN", "command_ids": []},
+    "G5": {"status": "NOT_RUN", "command_ids": []},
+    "G6": {"status": "NOT_RUN", "command_ids": []},
+    "G7": {"status": "NOT_RUN", "command_ids": []}
+  },
+  "blockers": [],
+  "result": "PASS",
+  "release_gate": "disabled-until-approved",
+  "details": {
+    "template": false,
+    "placeholder": false,
+    "rollback": {
+      "snapshot_reference": "/tmp/ai-drill-snapshot-6f8f09c.sql",
+      "snapshot_sha256": "a5f69feb2cc2a9fb8acfca546ff37d77f7983d3263320cbd6b95dcaec5254542",
+      "data_loss_scope": "20260815_01 down 丢 generation 列（active generation 退化默认 1）；20260809_01 down 丢 turn_id 列（restore up 按 legacy-turn-<id> 回填）；其余 down 丢列范围见各 down SQL 注释。演练中 probe 行 answer_text 与 search 结果行完整保留。",
+      "steps": [
+        {"id": "disable_flags", "status": "PASS", "note": "AI_MASTER_ENABLED 未开；testing 环境 feature flags 关闭"},
+        {"id": "stop_workers", "status": "PASS", "note": "compose ps：worker-a/worker-b Exited(137)，mysql/redis healthy"},
+        {"id": "restore_snapshot_or_down", "status": "PASS", "note": "down 执行；注入 1062 故障 → rollback_failed 记录 → 删除重复行后 down 恢复完成"},
+        {"id": "verify_legacy_discovery", "status": "PASS", "note": "verify expect=previous exit 0；ai_profile_turn.answer_text 与 ai_search_result 行可读"},
+        {"id": "invalidate_new_results", "status": "PASS", "note": "down 移除 generation/turn_id 等新列，新格式数据随列删除失效（损失范围已记录）"},
+        {"id": "forward_recovery", "status": "PASS", "note": "restore up + verify expect=current exit 0；turn_id 回填 legacy-turn-1，generation=1"}
+      ],
+      "restoration_verified": true,
+      "forward_recovery_verified": true
+    }
+  }
+}

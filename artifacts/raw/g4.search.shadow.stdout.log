@@ -1,0 +1,5 @@
+..................................................s..................... [ 66%]
+.....................................                                    [100%]
+=========================== short test summary info ===========================
+SKIPPED [1] tests\test_ai_search.py:2546: snapshot has <= page_size results, no cursor to test
+108 passed, 1 skipped in 4.72s
