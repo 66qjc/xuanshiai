@@ -90,6 +90,7 @@ logger = logging.getLogger(__name__)
 # ----------------------------------------------------------------------
 
 SEARCH_SCHEMA_VERSION = "search-condition-v1"
+SEARCH_PROMPT_VERSION = "search-parse-prompt-v1"
 SEARCH_POLICY_REVISION = "ai-policy-2026-08-07-v1"
 SEARCH_CONSENT_SCOPE = "search_parse"
 SEARCH_PARSE_TASK_TYPE = "search_parse"
@@ -1112,9 +1113,9 @@ async def parse_search_draft(
             task_id=task.task_id,
             request_id=uuid.uuid4().hex,
             scene="search_parse",
-            provider="mock",
-            model="mock-model-v1",
-            prompt_version="search-parse-prompt-v1",
+            provider=settings.ai_provider_name,
+            model=settings.ai_model_name,
+            prompt_version=SEARCH_PROMPT_VERSION,
             schema_version=SEARCH_SCHEMA_VERSION,
             input_revision=task.source_revision_json or {},
         )

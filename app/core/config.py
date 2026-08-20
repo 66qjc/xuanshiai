@@ -120,12 +120,22 @@ class Settings(BaseSettings):
     ai_profile_enabled: bool = False
     ai_search_enabled: bool = False
     ai_compatibility_shadow_enabled: bool = False
-    # 一期唯一 provider；生产环境启用 AI 时禁止使用 mock。
-    ai_provider: Literal["mock"] = "mock"
+    # 一期默认 mock；deepseek 为首个真 provider（开发/测试可用，生产启用需
+    # 先满足 ai_policy_approved / ai_provider_approved / retention 三道门禁）。
+    ai_provider: Literal["mock", "deepseek"] = "mock"
     # 生产启用门禁（Task 1 冻结）：缺任一批准项则校验失败。
     ai_policy_approved: bool = False
     ai_provider_approved: bool = False
     ai_retention_policy_version: str | None = None
+
+    # DeepSeek provider 配置（OpenAI 兼容 API）。真实 api_key 仅存于被忽略的
+    # .env；.env.example 只放占位符 YOUR_DEEPSEEK_API_KEY。生产启用需先走
+    # Provider 审批门禁（ai_policy_approved 等）。deepseek-chat 已弃用，
+    # 由 deepseek-v4-flash 接替。
+    ai_deepseek_api_key: SecretStr | None = None
+    ai_deepseek_base_url: str = "https://api.deepseek.com"
+    ai_deepseek_model: str = "deepseek-v4-flash"
+    ai_deepseek_max_tokens: int = Field(default=2048, gt=0, le=8192)
 
     # AI 任务/租约/重试/限流配置。
     ai_lease_seconds: int = Field(default=300, gt=0, le=3600)
@@ -147,6 +157,21 @@ class Settings(BaseSettings):
     def cors_origins(self) -> list[str]:
         """Convert the comma-separated environment value into CORS origins."""
         return [origin.strip() for origin in self.cors_origins_raw.split(",") if origin.strip()]
+
+    @property
+    def ai_provider_name(self) -> str:
+        """当前生效的 provider 名称，用于 AITaskContext 审计元数据。"""
+        return self.ai_provider
+
+    @property
+    def ai_model_name(self) -> str:
+        """当前 provider 对应的模型名，用于 AITaskContext 审计元数据。
+
+        mock 时返回固定占位以保持历史审计一致性；真 provider 返回配置值。
+        """
+        if self.ai_provider == "deepseek":
+            return self.ai_deepseek_model
+        return "mock-model-v1"
 
     @property
     def agreement_versions(self) -> dict[str, str]:

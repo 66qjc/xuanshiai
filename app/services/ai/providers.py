@@ -1,16 +1,20 @@
-"""Deterministic mock provider and the provider registry.
+"""AI providers and the provider registry.
 
-``MockAIProvider`` is the only runnable provider in phase 1: inputs and outputs
-are deterministic fixtures, and it supports injecting timeout / 429 / 5xx /
-schema-invalid / policy-blocked scenarios so the Gateway error classification
-can be exercised without a real model.
+``MockAIProvider`` is the deterministic fixture provider with failure injection.
+``DeepSeekAIProvider`` is the first real provider, using DeepSeek's OpenAI-compatible
+API with JSON output mode for structured extraction and search parsing. It is
+intended for development/testing only — production enablement requires the full
+approval gate (``ai_policy_approved`` / ``ai_provider_approved`` / retention).
 """
 
 from __future__ import annotations
 
+import json
+import logging
 from collections.abc import Callable, Iterable
 from typing import Any
 
+from app.core.config import settings
 from app.schemas.ai_profile import ProfileSubject
 from app.services.ai.base import (
     AIProvider,
@@ -25,6 +29,41 @@ from app.services.ai.base import (
     StructuredExtractRequest,
     StructuredExtractResult,
 )
+from app.services.ai.prompts.profile_extract import build_profile_extract_prompt
+from app.services.ai.prompts.search_parse import build_search_parse_prompt
+
+logger = logging.getLogger(__name__)
+
+# OpenAI SDK 异常类与客户端构造（DeepSeek 兼容 OpenAI API）。
+#
+# 依赖选择理由（PROJECT_RULES §2.4.3）：项目已有 httpx，但 DeepSeek 是 OpenAI 兼容
+# API，openai SDK 提供了类型化异常分类（RateLimitError / APITimeoutError /
+# APIConnectionError / APIError 及其 4xx 子类）、自动重试、response_format JSON
+# 模式辅助与 AsyncOpenAI 异步客户端，裸 httpx 需要手写这些能力且易出错。openai
+# 是 MIT 许可、活跃维护的成熟库，与现有 httpx 共存（openai 内部亦依赖 httpx），
+# 无版本冲突风险。替代方案 httpx 已评估但不采用，理由如上。
+from openai import (  # noqa: E402
+    APIConnectionError as _APIConnectionError,
+    APIError as _APIError,
+    APITimeoutError as _APITimeoutError,
+    AsyncOpenAI,
+    RateLimitError as _RateLimitError,
+)
+# 4xx 状态码异常子类，用于区分可重试与不可重试。
+from openai import (  # noqa: E402
+    APIStatusError as _APIStatusError,
+    AuthenticationError as _AuthenticationError,
+    BadRequestError as _BadRequestError,
+    PermissionDeniedError as _PermissionDeniedError,
+)
+
+
+def _build_deepseek_client(api_key: Any) -> AsyncOpenAI:
+    """构造 DeepSeek 的 OpenAI 兼容异步客户端。"""
+    return AsyncOpenAI(
+        api_key=api_key.get_secret_value() if hasattr(api_key, "get_secret_value") else api_key,
+        base_url=settings.ai_deepseek_base_url,
+    )
 
 # Deterministic fixture field values for profile extraction. Keys are the
 # frozen allowlist field names; values are (value, source_quote, confidence).
@@ -264,12 +303,243 @@ class MockAIProvider:
         return tuple(fields)
 
 
+# ==================== DeepSeek provider ====================
+
+# 版本常量与业务模块保持一致，确保审计元数据可追溯。
+_PROFILE_SCHEMA_VERSION = "profile-extract-v1"
+_PROFILE_PROMPT_VERSION = "profile-extract-prompt-v1"
+_SEARCH_SCHEMA_VERSION = "search-condition-v1"
+_SEARCH_PROMPT_VERSION = "search-parse-prompt-v1"
+
+_MODERATION_SYSTEM = (
+    "你是文本安全审核器。判断以下文本是否包含联系方式、引流、"
+    "色情、暴力、诈骗或其它违规内容。以 JSON 格式输出："
+    "{\"allowed\": true 或 false, \"reason_code\": 违规类型或 null}。"
+)
+
+
+def _safe_confidence(value: Any) -> float:
+    """把模型返回的 confidence 安全转为 0-1 浮点，非法值回退到 1.0。
+
+    防御 ``float(None)``（模型返回 JSON null）和 ``float("高")`` 抛 TypeError/
+    ValueError 绕过 Gateway 的 ProviderError 分类。
+    """
+    if isinstance(value, bool):  # bool 是 int 子类，先排除
+        return 1.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    return 1.0
+
+
+def _parse_json_response(content: str) -> Any:
+    """解析 DeepSeek 返回的 JSON 内容，空内容或格式错误转为 ProviderError。"""
+    if not content or not content.strip():
+        raise ProviderError(
+            code="AI_INPUT_INVALID",
+            message="provider 返回空内容",
+            kind=ProviderErrorKind.NON_RETRYABLE,
+        )
+    try:
+        return json.loads(content)
+    except (ValueError, TypeError) as exc:
+        raise ProviderError(
+            code="AI_INPUT_INVALID",
+            message=f"provider 返回非合法 JSON: {exc}",
+            kind=ProviderErrorKind.NON_RETRYABLE,
+        ) from exc
+
+
+class DeepSeekAIProvider:
+    """DeepSeek 真 provider，通过 OpenAI 兼容 API 调用。
+
+    使用 JSON output mode（response_format=json_object）获取结构化输出，
+    再由本类映射为 ``AIProvider`` Protocol 要求的类型化结果。Gateway 会对
+    返回值做二次 schema 校验，因此即使模型输出偏差也会被拦在业务下游之外。
+
+    开发/测试环境可用；生产启用需先满足三道审批门禁（见 config.py）。
+    """
+
+    def __init__(self, **kwargs: Any) -> None:
+        # 延迟 key 校验到首次调用：__init__ 阶段抛异常会绕过 Gateway.invoke 的
+        # except ProviderError（AIGateway 在 handler 内构造），被 worker 的
+        # except Exception 误判为 retryable=True。改为在 _chat_json 内抛
+        # ProviderError(NON_RETRYABLE)，由 Gateway.invoke 正确分类。
+        api_key = settings.ai_deepseek_api_key
+        self._api_key = api_key
+        # 测试可通过 kwargs 注入 mock client；生产/开发从 settings 读 key 构造。
+        self._client = kwargs.pop("client", None)
+        self._model = settings.ai_deepseek_model
+        self._max_tokens = settings.ai_deepseek_max_tokens
+
+    def _ensure_client(self) -> Any:
+        """惰性构造客户端；缺 key 时抛 NON_RETRYABLE ProviderError。
+
+        该方法在 _chat_json（即 Gateway.invoke 的 try 块内）被调用，因此抛出的
+        ProviderError 会被 Gateway 的 except ProviderError 正确分类为
+        non-retryable，不会被 worker 误判为可重试。
+        """
+        if self._client is not None:
+            return self._client
+        if self._api_key is None:
+            raise ProviderError(
+                code="AI_INPUT_INVALID",
+                message=(
+                    "DeepSeek provider 缺少 API key，请在 .env 配置 "
+                    "AI_DEEPSEEK_API_KEY（仅开发/测试环境）"
+                ),
+                kind=ProviderErrorKind.NON_RETRYABLE,
+            )
+        self._client = _build_deepseek_client(self._api_key)
+        return self._client
+
+    async def _chat_json(self, prompt: str) -> Any:
+        """调用 DeepSeek 并返回解析后的 JSON 对象。"""
+        client = self._ensure_client()
+        try:
+            response = await client.chat.completions.create(
+                model=self._model,
+                messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"},
+                max_tokens=self._max_tokens,
+            )
+        except _RateLimitError as exc:
+            raise ProviderError(
+                code="AI_QUOTA_EXCEEDED",
+                message=str(exc),
+                kind=ProviderErrorKind.RETRYABLE,
+                retry_after_ms=2000,
+            ) from exc
+        except (_APITimeoutError, _APIConnectionError) as exc:
+            raise ProviderError(
+                code="AI_TEMPORARILY_UNAVAILABLE",
+                message=str(exc),
+                kind=ProviderErrorKind.RETRYABLE,
+            ) from exc
+        except (_AuthenticationError, _PermissionDeniedError, _BadRequestError) as exc:
+            # 4xx 认证/权限/请求格式错误是永久性配置问题，重试无意义。
+            raise ProviderError(
+                code="AI_INPUT_INVALID",
+                message=str(exc),
+                kind=ProviderErrorKind.NON_RETRYABLE,
+            ) from exc
+        except _APIStatusError as exc:
+            # 其余带状态码的错误（主要为 5xx）视为可重试。
+            raise ProviderError(
+                code="AI_TEMPORARILY_UNAVAILABLE",
+                message=str(exc),
+                kind=ProviderErrorKind.RETRYABLE,
+            ) from exc
+        except _APIError as exc:
+            # 无状态码的非 4xx/5xx SDK 错误，保守视为可重试。
+            raise ProviderError(
+                code="AI_TEMPORARILY_UNAVAILABLE",
+                message=str(exc),
+                kind=ProviderErrorKind.RETRYABLE,
+            ) from exc
+
+        if not response.choices:
+            raise ProviderError(
+                code="AI_INPUT_INVALID",
+                message="provider 返回空 choices",
+                kind=ProviderErrorKind.NON_RETRYABLE,
+            )
+        content = response.choices[0].message.content
+        return _parse_json_response(content)
+
+    # ------------------------------------------------------------------
+    # AIProvider Protocol
+    # ------------------------------------------------------------------
+    async def structured_extract(
+        self, request: StructuredExtractRequest
+    ) -> StructuredExtractResult:
+        prompt = build_profile_extract_prompt(
+            request.subject, request.turn_texts
+        )
+        data = await self._chat_json(prompt)
+        fields_data = data.get("fields", []) if isinstance(data, dict) else []
+        fields: list[ExtractedField] = []
+        subject = ProfileSubject(request.subject)
+        for item in fields_data:
+            if not isinstance(item, dict):
+                continue
+            field_key = item.get("field_key", "")
+            if field_key not in request.allowlist:
+                continue
+            fields.append(
+                ExtractedField(
+                    field_key=field_key,
+                    subject=subject,
+                    value=item.get("value"),
+                    source_quote=item.get("source_quote"),
+                    confidence=_safe_confidence(item.get("confidence")),
+                    needs_confirmation=True,
+                    confirmation_status="suggested",
+                    schema_version=_PROFILE_SCHEMA_VERSION,
+                    prompt_version=_PROFILE_PROMPT_VERSION,
+                    policy_revision=request.policy_revision,
+                )
+            )
+        return StructuredExtractResult(
+            schema_version=_PROFILE_SCHEMA_VERSION,
+            fields=tuple(fields),
+        )
+
+    async def parse_search_query(
+        self, request: SearchParseRequest
+    ) -> SearchParseResult:
+        prompt = build_search_parse_prompt(request.query_text)
+        data = await self._chat_json(prompt)
+        conditions_data = data.get("conditions", []) if isinstance(data, dict) else []
+        conditions: list[SearchCondition] = []
+        for item in conditions_data:
+            if not isinstance(item, dict):
+                continue
+            field_key = item.get("field_key", "")
+            if field_key not in request.allowlist:
+                continue
+            conditions.append(
+                SearchCondition(
+                    field_key=field_key,
+                    operator=item.get("operator", ""),
+                    value=item.get("value"),
+                    kind=item.get("kind", "hard"),
+                    confidence=_safe_confidence(item.get("confidence")),
+                    source_span=item.get("source_span"),
+                )
+            )
+        return SearchParseResult(
+            schema_version=_SEARCH_SCHEMA_VERSION,
+            conditions=tuple(conditions),
+        )
+
+    async def moderate_text(
+        self, request: ModerationRequest
+    ) -> ModerationResult:
+        prompt = f"{_MODERATION_SYSTEM}\n\n待审核文本：\n{request.text}"
+        data = await self._chat_json(prompt)
+        # 审核闸门 fail-closed：无法解析或字段缺失时拒绝，不放行。
+        if not isinstance(data, dict):
+            return ModerationResult(
+                allowed=False, action="review", reason_code="MODERATION_PARSE_FAILED"
+            )
+        # 显式判断 True（避免 bool("false") == True 的真值陷阱）。
+        allowed_value = data.get("allowed")
+        if allowed_value is True:
+            return ModerationResult(allowed=True, action="allow")
+        return ModerationResult(
+            allowed=False,
+            action="reject",
+            reason_code=data.get("reason_code") or "SENSITIVE_TEXT",
+        )
+
+
 class AIProviderRegistry:
     """Provider registry keyed by configuration name."""
 
     def __init__(self) -> None:
         self._factories: dict[str, Callable[..., AIProvider]] = {
             "mock": MockAIProvider,
+            "deepseek": DeepSeekAIProvider,
         }
 
     def register(self, name: str, factory: Callable[..., AIProvider]) -> None:
