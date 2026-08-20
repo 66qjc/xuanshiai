@@ -189,3 +189,26 @@ class MatchmakerAdminServiceRequestUpdate(BaseModel):
         if self.status in (2, 3) and not self.feedback:
             raise ValueError("完成或取消服务时必须填写处理说明")
         return self
+
+
+class MatchmakerRatingCreate(BaseModel):
+    score: int = Field(ge=1, le=5)
+    content: str | None = Field(default=None, max_length=500)
+
+
+class MatchmakerRatingResponse(BaseModel):
+    id: int
+    service_id: int
+    user_id: int
+    matchmaker_id: int
+    score: int
+    content: str | None
+    created_at: datetime
+
+
+class MatchmakerRatingPage(BaseModel):
+    items: list[MatchmakerRatingResponse]
+    page: int
+    page_size: int
+    total: int
+    has_more: bool
