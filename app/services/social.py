@@ -254,6 +254,11 @@ async def send_message(db: AsyncSession, user_id: int, session_id: int, request:
         updated_at = UTC_TIMESTAMP() WHERE id = :session_id"""), {
             "last_message": preview, "session_id": session_id, "target_id": target_id,
         })
+    await emit_notification(
+        db, recipient_user_id=target_id, actor_user_id=user_id, event_type="message",
+        title="?????", content=preview, target_type="chat_session",
+        target_id=session_id, payload={"message_type": request.type},
+    )
     await db.commit()
     created = await db.execute(text("SELECT id, session_id, from_user_id, to_user_id, type, content, media_url, is_read, revoked_at, created_at FROM chat_message WHERE id = :id"), {"id": result.lastrowid})
     return _message(dict(created.mappings().one()))
@@ -280,6 +285,12 @@ async def recall_message(db: AsyncSession, user_id: int, message_id: int) -> Cha
         refreshed = await db.execute(text("SELECT revoked_at FROM chat_message WHERE id = :id"), {"id": message_id})
         row = dict(row)
         row["revoked_at"] = refreshed.scalar()
+    await emit_notification(
+        db, recipient_user_id=int(row["to_user_id"]), actor_user_id=user_id,
+        event_type="message_recalled", title="?????", content="?????????",
+        target_type="chat_session", target_id=int(row["session_id"]),
+        payload={"message_id": message_id},
+    )
     await db.commit()
     return _message(dict(row))
 
@@ -1110,6 +1121,12 @@ async def create_chat_session_request(db: AsyncSession, user_id: int, session_id
         {"session_id": session_id, "requester_id": user_id, "responder_id": target_id,
          "request_type": request.request_type, "payload": json.dumps(request.payload, ensure_ascii=False) if request.payload else None,
          "expire_at": expire_at})
+    await emit_notification(
+        db, recipient_user_id=target_id, actor_user_id=user_id,
+        event_type="chat_session_request", title="??????",
+        content="????????????", target_type="chat_session_request",
+        target_id=int(result.lastrowid), payload={"request_type": request.request_type},
+    )
     await db.commit()
     row = (await db.execute(text("SELECT * FROM chat_session_request WHERE id = :id"), {"id": result.lastrowid})).mappings().one()
     return _request_response(row)
@@ -1140,6 +1157,13 @@ async def respond_chat_session_request(db: AsyncSession, user_id: int, request_i
             raise HTTPException(403, detail="只有接收人可以处理")
         status = "ACCEPTED" if action == "ACCEPT" else "REJECTED"
     await db.execute(text("UPDATE chat_session_request SET status = :status, responded_at = UTC_TIMESTAMP(), updated_at = UTC_TIMESTAMP() WHERE id = :id"), {"status": status, "id": request_id})
+    recipient_id = int(row["requester_id"]) if user_id == int(row["responder_id"]) else int(row["responder_id"])
+    await emit_notification(
+        db, recipient_user_id=recipient_id, actor_user_id=user_id,
+        event_type="chat_session_request_result", title="????????",
+        content=f"????????{status}", target_type="chat_session_request",
+        target_id=request_id, payload={"status": status, "request_type": row["request_type"]},
+    )
     await db.commit()
     updated = (await db.execute(text("SELECT * FROM chat_session_request WHERE id = :id"), {"id": request_id})).mappings().one()
     return _request_response(updated)

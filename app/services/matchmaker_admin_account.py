@@ -131,6 +131,8 @@ async def create_account(db: AsyncSession, body: MatchmakerAdminAccountCreate, a
 
 async def update_account(db: AsyncSession, account_id: int, body: MatchmakerAdminAccountUpdate, actor_id: int) -> MatchmakerAdminAccountItem:
     await get_account(db, account_id)
+    if account_id == actor_id and body.permissions is not None:
+        raise HTTPException(403, detail="?????????")
     updates: list[str] = []
     params: dict[str, object] = {"id": account_id}
     if body.display_name is not None:
@@ -164,6 +166,8 @@ async def update_account(db: AsyncSession, account_id: int, body: MatchmakerAdmi
 
 async def update_account_status(db: AsyncSession, account_id: int, body: MatchmakerAdminAccountStatusUpdate, actor_id: int) -> MatchmakerAdminAccountItem:
     await get_account(db, account_id)
+    if account_id == actor_id and body.status != 1:
+        raise HTTPException(403, detail="??????????????")
     await db.execute(text("UPDATE matchmaker_admin_account SET status = :status, updated_at = UTC_TIMESTAMP() WHERE id = :id"), {
         "status": body.status, "id": account_id,
     })

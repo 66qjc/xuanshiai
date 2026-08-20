@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass, field
 
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -118,11 +118,80 @@ class CurrentMatchmakerAdmin:
     permissions: frozenset[str] = field(default_factory=frozenset)
 
     def require(self, permission: str) -> None:
-        if "*" not in self.permissions and permission not in self.permissions:
-            raise HTTPException(status_code=403, detail="红娘后台权限不足")
+        aliases = {
+            "finance.read": {"finance.read", "finance.write"},
+            "meeting.read": {"meeting.read", "meeting.write"},
+            "community.read": {"community.read", "community.moderate"},
+            "matchmaker.read": {"matchmaker.read", "matchmaker.manage"},
+            "matchmaker.product.read": {"matchmaker.product.read", "matchmaker.product.manage"},
+            "matchmaker.service.read": {"matchmaker.service.read", "matchmaker.service.manage"},
+            "matchmaker.organization.read": {"matchmaker.organization.read", "matchmaker.organization.manage"},
+            "matchmaker.member.read": {"matchmaker.member.read", "matchmaker.member.manage"},
+            "community.activity.read": {"community.activity.read", "community.activity.manage"},
+            "community.moderate": {"community.moderate", "admin.moderate"},
+            "meeting.read": {"meeting.read", "meeting.write"},
+            "finance.read": {"finance.read", "finance.write"},
+            "reward.read": {"reward.read", "reward.write", "matchmaker.reward.read", "matchmaker.reward.manage"},
+        }
+        allowed = aliases.get(permission, {permission})
+        if "*" not in self.permissions and not (allowed & self.permissions):
+            raise HTTPException(status_code=403, detail="????????")
+
+
+    def scope_condition(
+        self,
+        *,
+        organization_column: str,
+        params: dict[str, object],
+        user_column: str | None = None,
+    ) -> str:
+        """Return a SQL predicate for the account's declared data scope."""
+        scope = self.account.data_scope
+        if scope == "ALL" or "*" in self.permissions:
+            return "1 = 1"
+        if scope == "SELF":
+            if user_column is None:
+                raise HTTPException(status_code=403, detail="?????????????")
+            params["scope_user_id"] = self.account.matchmaker_user_id or self.account.id
+            return f"{user_column} = :scope_user_id"
+        if not self.account.organization_id:
+            raise HTTPException(status_code=403, detail="?????????????")
+        params["scope_organization_id"] = self.account.organization_id
+        return f"{organization_column} = :scope_organization_id"
+
+
+def _matchmaker_admin_permission(request: Request) -> str | None:
+    path = request.url.path
+    method = request.method.upper()
+    if path.endswith("/auth/me") or path.endswith("/auth/logout") or "/auth/" in path:
+        return None
+    if "/accounts" in path:
+        return "matchmaker.account.manage"
+    if "/members" in path:
+        return "matchmaker.member.manage" if method != "GET" else "matchmaker.member.read"
+    if "/matchmakers" in path:
+        return "matchmaker.manage" if method != "GET" else "matchmaker.read"
+    if "/service-products" in path:
+        return "matchmaker.product.manage" if method != "GET" else "matchmaker.product.read"
+    if "/service-requests" in path:
+        return "matchmaker.service.manage" if method != "GET" else "matchmaker.service.read"
+    if "/branches" in path or "/stores" in path or "/assignments" in path:
+        return "matchmaker.organization.manage" if method != "GET" else "matchmaker.organization.read"
+    if "/meetings" in path:
+        return "meeting.write" if method != "GET" else "meeting.read"
+    if "/finance" in path:
+        return "finance.write" if method != "GET" else "finance.read"
+    if "/activities" in path:
+        return "community.activity.manage" if method != "GET" else "community.activity.read"
+    if "/community" in path or "/reports" in path or "/media/" in path:
+        return "community.moderate" if method != "GET" else "community.read"
+    if "/reward-rules" in path:
+        return "reward.write" if method != "GET" else "reward.read"
+    return None
 
 
 async def get_current_matchmaker_admin(
+    request: Request,
     credentials: HTTPAuthorizationCredentials | None = Depends(bearer),
     db: AsyncSession = Depends(get_db),
 ) -> CurrentMatchmakerAdmin:
@@ -141,8 +210,12 @@ async def get_current_matchmaker_admin(
         {"id": account_id},
     )
     permissions = frozenset(str(row[0]) for row in result.all())
-    return CurrentMatchmakerAdmin(
+    current = CurrentMatchmakerAdmin(
         account=account,
         session_id=session_id,
         permissions=permissions,
     )
+    permission = _matchmaker_admin_permission(request)
+    if permission:
+        current.require(permission)
+    return current
