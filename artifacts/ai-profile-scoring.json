@@ -1,0 +1,31 @@
+{
+  "provenance": {
+    "commit_sha": "1839779",
+    "branch": "main",
+    "run_at": "2026-08-20T17:12:14.383562+00:00",
+    "environment": "docker-compose-ai-test",
+    "provider": "deepseek",
+    "model": "deepseek-v4-flash"
+  },
+  "module": "M04-profile",
+  "case_count": 20,
+  "metrics": {
+    "total": 20,
+    "succeeded": 20,
+    "field_precision": 97.73,
+    "field_recall": 94.51,
+    "true_positive": 86,
+    "false_positive": 2,
+    "false_negative": 5,
+    "forbidden_published": 0,
+    "extract_latency_p50_ms": 6611.9,
+    "extract_latency_p95_ms": 12611.5,
+    "publish_success_rate": 100.0,
+    "failures": []
+  },
+  "thresholds": {
+    "field_precision": 70.0,
+    "field_recall": 70.0
+  },
+  "verdict": "PASS"
+}
