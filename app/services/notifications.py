@@ -22,6 +22,11 @@ _PREFERENCE_BY_EVENT = {
     "match_application_rejected": "notify_apply",
     "apply": "notify_apply",
     "message": "notify_message",
+    "message_recalled": "notify_message",
+    "chat_session_request": "notify_message",
+    "chat_session_request_result": "notify_message",
+    "matchmaker_service_updated": "notify_system",
+    "matchmaker_service_admin_updated": "notify_system",
     "activity": "notify_activity",
     "system": "notify_system",
 }

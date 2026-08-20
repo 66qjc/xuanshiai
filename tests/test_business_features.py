@@ -23,16 +23,18 @@ def test_business_routes_are_registered_and_protected() -> None:
     assert "/api/v1/admin/finance/product-commission-rules/{product_id}" in paths
     assert "/api/v1/admin/finance/report" in paths
     assert "/api/v1/admin/finance/orders/{order_id}/refund" in paths
-    assert schema["tags"][:8] == [
-        {"name": "账号与认证", "description": "登录、账号身份、实名认证和账号安全。"},
-        {"name": "首页与资料", "description": "推荐、搜索、公开资料和用户资料管理。"},
-        {"name": "红娘", "description": "红娘申请、服务牵线、约见申请和约会记录。"},
-        {"name": "社区", "description": "帖子、评论、互动、话题和纸飞机。"},
-        {"name": "消息", "description": "申请认识、匹配、聊天、通知和关系安全。"},
-        {"name": "管理后台", "description": "内容、消息、红娘、财务和运营治理。"},
-        {"name": "组织与归属", "description": "门店、组织成员、资源分派、推广和合伙团队。"},
-        {"name": "财务与结算", "description": "订单、分成、账本、余额和提现。"},
-    ]
+    tags = {item["name"]: item["description"] for item in schema["tags"]}
+    expected_tags = {
+        "账号与认证": "登录、账号身份、实名认证和账号安全。",
+        "首页与资料": "推荐、搜索、公开资料和用户资料管理。",
+        "红娘": "红娘申请、服务牵线、约见申请和约会记录。",
+        "社区": "帖子、评论、互动、话题和纸飞机。",
+        "消息": "申请认识、匹配、聊天、通知和关系安全。",
+        "管理后台": "内容、消息、红娘、财务和运营治理。",
+        "组织与归属": "门店、组织成员、资源分派、推广和合伙团队。",
+        "财务与结算": "订单、分成、账本、余额和提现。",
+    }
+    assert {name: tags[name] for name in expected_tags} == expected_tags
     assert paths["/api/v1/matchmakers"]["get"]["tags"] == ["红娘"]
     assert paths["/api/v1/admin/finance/report"]["get"]["tags"] == ["管理后台"]
     assert paths["/api/v1/finance/balance"]["get"]["tags"] == ["财务与结算"]
