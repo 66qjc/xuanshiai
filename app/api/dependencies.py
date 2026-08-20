@@ -132,6 +132,7 @@ class CurrentMatchmakerAdmin:
             "meeting.read": {"meeting.read", "meeting.write"},
             "finance.read": {"finance.read", "finance.write"},
             "reward.read": {"reward.read", "reward.write", "matchmaker.reward.read", "matchmaker.reward.manage"},
+            "message.read": {"message.read", "message.manage", "message.moderate"},
         }
         allowed = aliases.get(permission, {permission})
         if "*" not in self.permissions and not (allowed & self.permissions):
@@ -183,6 +184,8 @@ def _matchmaker_admin_permission(request: Request) -> str | None:
         return "finance.write" if method != "GET" else "finance.read"
     if "/activities" in path:
         return "community.activity.manage" if method != "GET" else "community.activity.read"
+    if "/messages" in path or "/announcements" in path:
+        return "message.manage" if method != "GET" else "message.read"
     if "/community" in path or "/reports" in path or "/media/" in path:
         return "community.moderate" if method != "GET" else "community.read"
     if "/reward-rules" in path:
