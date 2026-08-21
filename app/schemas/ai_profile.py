@@ -373,3 +373,59 @@ class CleanupTaskAccepted(BaseModel):
     task_id: str
     status: AiTaskStatus
     cleanup_requested: bool = True
+
+
+# ----------------------------------------------------------------------
+# 画像叙事层（narrative）响应 schema — 对齐前端 mock 数据结构
+# ----------------------------------------------------------------------
+
+
+class ProfileNarrativeDimension(BaseModel):
+    """叙事层维度卡片。"""
+
+    key: str
+    icon: str
+    title: str
+    summary: str
+
+
+class ProfileNarrativeIdealWeight(BaseModel):
+    """理想型权重（仅 ideal_partner subject 有值）。"""
+
+    key: str
+    label: str
+    percent: int
+
+
+class ProfileNarrativeRecentChange(BaseModel):
+    """最近变化趋势。"""
+
+    direction: str
+    summary: str
+    observation: str
+
+
+class ProfileNarrativeHistoryObservation(BaseModel):
+    """历史版本观察记录。"""
+
+    revision_id: int = 1
+    keywords: list[str] = []
+    observation: str
+
+
+class ProfileNarrativeRead(BaseModel):
+    """GET /ai/profiles/{subject}/narrative 响应。
+
+    ``status`` 为 ``'pending'``（未发布或 narrative 任务未完成）或
+    ``'published'``（已生成）。pending 状态下 persona_title/insight 等字段为空。
+    """
+
+    subject: str
+    status: str = "pending"
+    persona_title: str = ""
+    persona_tags: list[str] = []
+    insight: str = ""
+    dimensions: list[ProfileNarrativeDimension] = []
+    ideal_weights: list[ProfileNarrativeIdealWeight] = []
+    recent_change: ProfileNarrativeRecentChange | None = None
+    history_observations: list[ProfileNarrativeHistoryObservation] = []

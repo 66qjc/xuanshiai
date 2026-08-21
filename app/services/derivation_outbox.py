@@ -772,6 +772,7 @@ async def purge_ai_resources(
         "consent_profile",
         "compatibility",
         "consent_compatibility",
+        "consent_compatibility_display",
         "user",
     }:
         await db.execute(
@@ -866,6 +867,7 @@ async def _consent_revoked_cleanup(db: AsyncSession, event: DerivationEvent) -> 
         "profile_text_extract": "consent_profile",
         "search_parse": "consent_search",
         "compatibility_shadow": "consent_compatibility",
+        "compatibility_display": "consent_compatibility_display",
     }.get(scope)
     if cleanup_scope:
         await purge_ai_resources(db, event.aggregate_id, scope=cleanup_scope)

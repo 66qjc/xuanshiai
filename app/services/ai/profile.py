@@ -61,7 +61,7 @@ from app.schemas.ai_profile import (
     ProfileSubject,
     normalize_profile_extracted_value,
 )
-from app.services.ai.base import AITaskContext, StructuredExtractRequest
+from app.services.ai.base import AITaskContext, NarrativeRequest, StructuredExtractRequest
 from app.services.ai.features import (
     ProjectionBuildError,
     _load_latest_revision,
@@ -69,6 +69,7 @@ from app.services.ai.features import (
     build_feature_projection,
 )
 from app.services.ai.gateway import AIGateway
+from app.services.ai.prompts.profile_narrative import serialize_fields_for_prompt
 from app.services.ai.tasks import AiTaskRecord, TaskError, enqueue_task, fail_task
 from app.services.derivation_outbox import purge_ai_resources, run_cleanup_for_user
 from app.services.revisions import (
@@ -84,6 +85,11 @@ PROFILE_SCHEMA_VERSION = "profile-extract-v1"
 PROFILE_PROMPT_VERSION = "profile-extract-prompt-v1"
 PROFILE_POLICY_REVISION = "ai-policy-2026-08-07-v1"
 PROFILE_CONSENT_SCOPE = "profile_text_extract"
+
+# 画像叙事层（narrative）版本常量——发布后生成人格画像解读成品。
+NARRATIVE_SCHEMA_VERSION = "profile-narrative-v1"
+NARRATIVE_PROMPT_VERSION = "profile-narrative-prompt-v1"
+_NARRATIVE_TASK_TYPE = "profile_narrative"
 
 # 会话依赖的当前 revision 版本变化（profile/preference 任一）即视为 stale，
 # 客户端必须重新创建会话（统一方案 §7.5 PROFILE_SESSION_STALE）。
@@ -229,6 +235,7 @@ _RESTORE_TASK_TYPE = "profile_restore"
 # 供 app.workers.ai_worker.register_business_handlers 引用的公共常量。
 PROJECTION_TASK_TYPE = _PROJECTION_TASK_TYPE
 CLEANUP_TASK_TYPE = _CLEANUP_TASK_TYPE
+NARRATIVE_TASK_TYPE = _NARRATIVE_TASK_TYPE
 
 _DRAFT_COLUMNS = (
     "draft_id, user_id, subject, session_id, status, expected_revision, "
@@ -599,6 +606,17 @@ def hash_request(session_id: str, client_turn_id: str, answer_text: str) -> str:
             "client_turn_id": client_turn_id,
             "answer_text": answer_text,
         },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def hash_narrative_request(revision_id: int, subject: str) -> str:
+    """Stable digest for narrative task idempotency."""
+    payload = json.dumps(
+        {"revision_id": revision_id, "subject": subject, "type": "narrative"},
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
@@ -2374,6 +2392,48 @@ async def publish_profile_draft(
         consent_snapshot=draft.consent_snapshot,
         reserved_task=reserved_task,
     )
+    # 入队画像叙事层（narrative）任务——与投影任务并列，发布后异步生成
+    # 人格画像解读成品（persona_title/insight/dimensions/ideal_weights）。
+    # 失败不影响发布本身，只改变 narrative 任务状态。
+    narrative_request_hash = hash_narrative_request(
+        revision.revision_id, str(revision.subject)
+    )
+    narrative_task = await enqueue_task(
+        db=db,
+        owner_user_id=owner_user_id,
+        task_type=_NARRATIVE_TASK_TYPE,
+        idempotency_key=idempotency_key + "-narrative",
+        request_hash=narrative_request_hash,
+        revisions=published_vector,
+        consent=draft.consent_snapshot,
+    )
+    await db.execute(
+        text(
+            "UPDATE ai_task SET payload_summary = :payload_summary, "
+            "source_revision_json = :source_revision_json, "
+            "consent_snapshot_json = :consent_snapshot_json, "
+            "updated_at = UTC_TIMESTAMP() WHERE task_id = :task_id"
+        ),
+        {
+            "payload_summary": json.dumps(
+                {
+                    "published_revision_id": revision.revision_id,
+                    "subject": revision.subject,
+                    "user_id": owner_user_id,
+                    "source_revision": published_vector.as_dict(),
+                    "consent_snapshot": draft.consent_snapshot,
+                },
+                ensure_ascii=False,
+            ),
+            "source_revision_json": json.dumps(
+                published_vector.as_dict(), ensure_ascii=False
+            ),
+            "consent_snapshot_json": json.dumps(
+                draft.consent_snapshot, ensure_ascii=False
+            ),
+            "task_id": narrative_task.task_id,
+        },
+    )
     await db.flush()
     return TaskSubmission.accepted(task, revision)
 
@@ -3031,6 +3091,285 @@ async def profile_projection_handler(
         else RevisionVector()
     )
     return f"profile-projection:{subject_value}:{','.join(built)}", revisions
+
+
+async def _load_revision_fields(
+    db: AsyncSession, revision_id: int
+) -> list[dict[str, Any]]:
+    """读取一个已发布 revision 的全部字段行（field_key + display_value）。"""
+    result = await db.execute(
+        text(
+            "SELECT field_key, value_json, display_value "
+            "FROM ai_profile_revision_field WHERE revision_id = :revision_id"
+        ),
+        {"revision_id": revision_id},
+    )
+    rows = result.mappings().all()
+    return [dict(r) for r in rows] if rows else []
+
+
+async def _load_previous_revision_id(
+    db: AsyncSession, user_id: int, subject: str, current_revision_id: int
+) -> int | None:
+    """读取同 user+subject 的上一次发布 revision id。
+
+    用 ``revision_no < 当前版本号`` 而非 ``id <`` 定位：revision_no 是业务
+    语义上的版本序号，id 只保证插入顺序，二者不必然一致（并发重试时
+    revision_no 回滚但 id 可能更大）。先取当前 revision_no，再找比它小的
+    最大 revision_no 对应行。
+    """
+    cur_result = await db.execute(
+        text(
+            "SELECT revision_no FROM ai_profile_revision "
+            "WHERE id = :revision_id AND user_id = :user_id AND subject = :subject"
+        ),
+        {"revision_id": current_revision_id, "user_id": user_id, "subject": subject},
+    )
+    cur_row = cur_result.mappings().first()
+    if cur_row is None:
+        return None
+    current_revision_no = int(cur_row["revision_no"])
+    result = await db.execute(
+        text(
+            "SELECT id FROM ai_profile_revision "
+            "WHERE user_id = :user_id AND subject = :subject "
+            "AND revision_no < :current_revision_no "
+            "ORDER BY revision_no DESC LIMIT 1"
+        ),
+        {
+            "user_id": user_id,
+            "subject": subject,
+            "current_revision_no": current_revision_no,
+        },
+    )
+    row = result.mappings().first()
+    return int(row["id"]) if row else None
+
+
+async def _load_history_summaries(
+    db: AsyncSession,
+    user_id: int,
+    subject: str,
+    current_revision_id: int,
+    limit: int = 3,
+) -> tuple[dict[str, Any], ...]:
+    """读取近 N 次历史 revision 的字段摘要（用于 history_observations）。
+
+    排除当前 revision（``id != current_revision_id``）：history_observations
+    描述的是"过去的你"，当前版本的解读在 dimensions/insight 里，不应重复出现。
+    """
+    result = await db.execute(
+        text(
+            "SELECT id, revision_no FROM ai_profile_revision "
+            "WHERE user_id = :user_id AND subject = :subject "
+            "AND id != :current_revision_id "
+            "ORDER BY revision_no DESC LIMIT :limit"
+        ),
+        {
+            "user_id": user_id,
+            "subject": subject,
+            "current_revision_id": current_revision_id,
+            "limit": limit,
+        },
+    )
+    rev_rows = result.mappings().all()
+    if not rev_rows:
+        return ()
+    summaries: list[dict[str, Any]] = []
+    for rev_row in rev_rows:
+        rev_id = int(rev_row["id"])
+        fields = await _load_revision_fields(db, rev_id)
+        summaries.append(
+            {
+                "revision_id": rev_id,
+                "revision_no": int(rev_row["revision_no"]),
+                "fields": fields,
+            }
+        )
+    return tuple(summaries)
+
+
+async def generate_profile_narrative_handler(
+    db: AsyncSession, task: AiTaskRecord, worker_id: str
+) -> tuple[str, RevisionVector] | None:
+    """``profile_narrative`` Worker handler：发布后生成画像叙事层成品。
+
+    读取本次发布的已确认字段 + 上一次发布快照 + 历史摘要，调
+    ``AIGateway.generate_narrative`` 生成人格画像解读（persona_title /
+    insight / dimensions / ideal_weights / recent_change），写入
+    ``ai_profile_summary.summary_text``。叙事层是展示性内容，不参与
+    匹配/搜索/兼容度计算。失败只改任务状态，不影响发布本身。
+    """
+    payload = task.payload_summary or {}
+    user_id = payload.get("user_id")
+    subject = payload.get("subject")
+    published_revision_id = payload.get("published_revision_id")
+    source_revision = task.source_revision_json or payload.get("source_revision") or {}
+    consent_snapshot = task.consent_snapshot_json or payload.get("consent_snapshot") or {}
+    if (
+        not user_id
+        or not subject
+        or not published_revision_id
+        or not source_revision
+        or not consent_snapshot
+    ):
+        await fail_task(
+            db, task.task_id, worker_id,
+            error_code="AI_INPUT_INVALID", retryable=False,
+        )
+        return None
+
+    subject_value = str(subject)
+    if subject_value not in {
+        ProfileSubject.PERSONAL.value,
+        ProfileSubject.IDEAL_PARTNER.value,
+    }:
+        await fail_task(
+            db, task.task_id, worker_id,
+            error_code="AI_INPUT_INVALID", retryable=False,
+        )
+        return None
+
+    user_id_int = int(user_id)
+    revision_id_int = int(published_revision_id)
+
+    # 1. 读取本次发布的字段
+    current_field_rows = await _load_revision_fields(db, revision_id_int)
+    if not current_field_rows:
+        await fail_task(
+            db, task.task_id, worker_id,
+            error_code="AI_INPUT_INVALID", retryable=False,
+        )
+        return None
+
+    current_fields = serialize_fields_for_prompt(current_field_rows)
+
+    # 2. 读取上一次发布的字段（做 diff，生成 recent_change）
+    previous_revision_id = await _load_previous_revision_id(
+        db, user_id_int, subject_value, revision_id_int
+    )
+    previous_fields: tuple[dict[str, Any], ...] = ()
+    if previous_revision_id is not None:
+        prev_rows = await _load_revision_fields(db, previous_revision_id)
+        previous_fields = serialize_fields_for_prompt(prev_rows)
+
+    # 3. 读取历史摘要（用于 history_observations，排除当前 revision）
+    history_summaries = await _load_history_summaries(
+        db, user_id_int, subject_value, revision_id_int, limit=3
+    )
+
+    # 4. 调 Gateway 生成叙事层
+    context = AITaskContext(
+        task_id=task.task_id,
+        request_id=uuid.uuid4().hex,
+        scene="profile_narrative",
+        provider=settings.ai_provider_name,
+        model=settings.ai_model_name,
+        prompt_version=NARRATIVE_PROMPT_VERSION,
+        schema_version=NARRATIVE_SCHEMA_VERSION,
+        input_revision=source_revision,
+        policy_revision=consent_snapshot.get("policy_revision"),
+    )
+    request = NarrativeRequest(
+        subject=subject_value,
+        current_fields=current_fields,
+        previous_fields=previous_fields,
+        history_summaries=history_summaries,
+        consent_version=str(consent_snapshot.get("consent_version") or ""),
+        policy_revision=str(consent_snapshot.get("policy_revision") or PROFILE_POLICY_REVISION),
+    )
+    gateway = AIGateway(timeout_seconds=settings.ai_gateway_timeout_seconds)
+    outcome = await gateway.generate_narrative(context, request)
+    if outcome.result is None:
+        await fail_task(
+            db, task.task_id, worker_id,
+            error_code=outcome.error_code or "AI_TEMPORARILY_UNAVAILABLE",
+            retryable=outcome.retryable,
+        )
+        return None
+
+    result = outcome.result
+
+    # 5. Worker 边界复核（与 extract_profile_turn 一致的三道校验末道）
+    try:
+        if result.schema_version != NARRATIVE_SCHEMA_VERSION:
+            raise ValueError("narrative schema version does not match")
+        if result.prompt_version != NARRATIVE_PROMPT_VERSION:
+            raise ValueError("narrative prompt version does not match")
+        if not result.persona_title or not result.insight:
+            raise ValueError("narrative missing required persona_title or insight")
+        if len(result.persona_tags) > 8:
+            raise ValueError("too many persona_tags")
+        if not result.dimensions:
+            raise ValueError("narrative must have at least one dimension")
+        # subject 一致性：personal 画像不应返回 ideal_weights
+        if subject_value == ProfileSubject.PERSONAL.value and result.ideal_weights:
+            raise ValueError("personal narrative must not have ideal_weights")
+    except (AttributeError, TypeError, ValueError):
+        await fail_task(
+            db, task.task_id, worker_id,
+            error_code="AI_INPUT_INVALID", retryable=False,
+        )
+        return None
+
+    # 6. 写入 ai_profile_summary
+    summary_json = result.model_dump_json(ensure_ascii=False)
+    content_hash = hashlib.sha256(summary_json.encode("utf-8")).hexdigest()
+    await db.execute(
+        text(
+            "INSERT INTO ai_profile_summary "
+            "(session_id, draft_id, revision_id, user_id, subject, "
+            " summary_text, status, content_hash, created_at, updated_at) "
+            "VALUES (NULL, NULL, :revision_id, :user_id, :subject, "
+            " :summary_text, 'published', :content_hash, UTC_TIMESTAMP(), UTC_TIMESTAMP())"
+        ),
+        {
+            "revision_id": revision_id_int,
+            "user_id": user_id_int,
+            "subject": subject_value,
+            "summary_text": summary_json,
+            "content_hash": content_hash,
+        },
+    )
+
+    revisions = (
+        RevisionVector(**source_revision)
+        if source_revision
+        else RevisionVector()
+    )
+    return f"profile-narrative:{subject_value}:{revision_id_int}", revisions
+
+
+async def load_published_narrative(
+    db: AsyncSession, user_id: int, subject: str
+) -> dict[str, Any] | None:
+    """读取用户最新发布的画像叙事层成品。
+
+    返回 ``{status, summary_text}`` 或 ``None``（未发布或任务未完成）。
+    路由层据此构造 ``ProfileNarrativeRead``。解析 ``summary_text`` JSON
+    时如果格式异常，返回 ``status='pending'`` 而非抛异常——叙事层是展示性
+    内容，脏数据不应导致 500。
+    """
+    result = await db.execute(
+        text(
+            "SELECT summary_text, status "
+            "FROM ai_profile_summary "
+            "WHERE user_id = :user_id AND subject = :subject "
+            "ORDER BY created_at DESC LIMIT 1"
+        ),
+        {"user_id": user_id, "subject": subject},
+    )
+    row = result.mappings().first()
+    if row is None or not row.get("summary_text"):
+        return None
+    raw_text = str(row["summary_text"])
+    try:
+        data = json.loads(raw_text)
+        if not isinstance(data, dict):
+            return {"status": "pending", "data": None}
+    except (ValueError, TypeError):
+        return {"status": "pending", "data": None}
+    return {"status": str(row.get("status") or "published"), "data": data}
 
 
 async def cleanup_handler(

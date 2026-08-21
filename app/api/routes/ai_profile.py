@@ -36,6 +36,7 @@ from app.schemas.ai_profile import (
     CleanupTaskAccepted,
     ProfileDraftPatchRequest,
     ProfileDraftRead,
+    ProfileNarrativeRead,
     ProfileProgress,
     ProfilePublishAccepted,
     ProfileRevisionPage,
@@ -65,6 +66,7 @@ from app.services.ai.profile import (
     list_profile_revisions,
     load_owned_draft,
     load_owned_session,
+    load_published_narrative,
     pause_profile_session,
     progress_value,
     publish_profile_draft,
@@ -623,4 +625,42 @@ async def delete_ai_profile_field_route(
     await db.commit()
     return CleanupTaskAccepted(
         task_id=task.task_id, status=task.status, cleanup_requested=True
+    )
+
+
+@router.get(
+    "/profiles/{subject}/narrative",
+    response_model=ProfileNarrativeRead,
+    status_code=status.HTTP_200_OK,
+    summary="获取画像叙事层（AI 人格画像成品）",
+)
+async def get_profile_narrative_route(
+    subject: ProfileSubject,
+    current: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> ProfileNarrativeRead:
+    """返回用户最新发布的画像叙事层成品。
+
+    叙事层在发布画像后由 Worker 异步生成（``profile_narrative`` 任务），
+    包含人格标题、标签、AI 洞察、维度卡片、理想型权重和最近变化趋势。
+    如果尚未发布或叙事层任务尚未完成，返回 ``status='pending'``。
+    """
+    _require_profile_feature()
+    narrative = await load_published_narrative(db, current.id, subject.value)
+    if narrative is None or narrative.get("data") is None:
+        return ProfileNarrativeRead(
+            subject=subject.value,
+            status="pending",
+        )
+    data: dict = narrative["data"]
+    return ProfileNarrativeRead(
+        subject=subject.value,
+        status=str(narrative.get("status") or "published"),
+        persona_title=str(data.get("persona_title") or ""),
+        persona_tags=list(data.get("persona_tags") or []),
+        insight=str(data.get("insight") or ""),
+        dimensions=list(data.get("dimensions") or []),
+        ideal_weights=list(data.get("ideal_weights") or []),
+        recent_change=data.get("recent_change"),
+        history_observations=list(data.get("history_observations") or []),
     )

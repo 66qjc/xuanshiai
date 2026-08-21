@@ -316,6 +316,7 @@ _TASK_FEATURES = {
     "search_parse": AiFeature.SEARCH,
     "search_execute": AiFeature.SEARCH,
     "compatibility": AiFeature.COMPATIBILITY_SHADOW,
+    "voice_transcribe": AiFeature.VOICE,
 }
 
 

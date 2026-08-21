@@ -34,6 +34,7 @@ def test_ai_schema_contains_the_registered_fact_tables() -> None:
         "ai_profile_revision_field", "ai_profile_summary",
         "ai_search_draft", "ai_search_condition", "ai_search_snapshot",
         "ai_search_result", "ai_feature_projection", "ai_compatibility_snapshot",
+        "voice_transcript",
     }
 
 

@@ -523,8 +523,10 @@ def register_business_handlers() -> None:
     )
     from app.services.ai.profile import (
         CLEANUP_TASK_TYPE,
+        NARRATIVE_TASK_TYPE,
         PROJECTION_TASK_TYPE,
         cleanup_handler,
+        generate_profile_narrative_handler,
         profile_projection_handler,
     )
     from app.services.ai.search import (
@@ -533,12 +535,18 @@ def register_business_handlers() -> None:
         parse_search_draft,
         search_execute_handler,
     )
+    from app.services.voice.transcribe_handler import (
+        VOICE_TRANSCRIBE_TASK_TYPE,
+        voice_transcribe_handler,
+    )
 
     TASK_HANDLERS.setdefault(SEARCH_PARSE_TASK_TYPE, parse_search_draft)
     TASK_HANDLERS.setdefault(SEARCH_EXECUTE_TASK_TYPE, search_execute_handler)
     TASK_HANDLERS.setdefault(COMPATIBILITY_TASK_TYPE, compatibility_execute_handler)
     TASK_HANDLERS.setdefault(PROJECTION_TASK_TYPE, profile_projection_handler)
     TASK_HANDLERS.setdefault(CLEANUP_TASK_TYPE, cleanup_handler)
+    TASK_HANDLERS.setdefault(NARRATIVE_TASK_TYPE, generate_profile_narrative_handler)
+    TASK_HANDLERS.setdefault(VOICE_TRANSCRIBE_TASK_TYPE, voice_transcribe_handler)
 
 
 register_business_handlers()

@@ -38,6 +38,8 @@ from app.api.routes import (
     regions,
     social,
     users,
+    voice,
+    voice_ws,
 )
 
 
@@ -86,6 +88,8 @@ api_router.include_router(ai_consents.router, prefix="/ai", tags=["AI"])
 api_router.include_router(ai_profile.router, prefix="/ai", tags=["AI"])
 api_router.include_router(ai_search.router, prefix="/ai", tags=["AI"])
 api_router.include_router(ai_compatibility.router, prefix="/ai", tags=["AI"])
+api_router.include_router(voice.router, prefix="/voice", tags=["语音"])
+api_router.include_router(voice_ws.router, prefix="/voice", tags=["语音"])
 
 
 OPENAPI_TAGS = [
@@ -104,4 +108,5 @@ OPENAPI_TAGS = [
     {"name": "地区", "description": "省市区等地区数据查询。"},
     {"name": "系统", "description": "健康检查和系统发现信息。"},
     {"name": "AI", "description": "AI 画像、搜索与匹配度通用任务查询、取消和状态轮询。"},
+    {"name": "语音", "description": "语音转写（STT）与语音合成（TTS）。"},
 ]

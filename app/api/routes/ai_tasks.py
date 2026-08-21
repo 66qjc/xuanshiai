@@ -12,10 +12,12 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Any
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies import CurrentUser, get_current_user
@@ -32,9 +34,17 @@ router = APIRouter()
 
 
 class TaskDetailResponse(TaskPollState):
-    """Task detail: poll state plus safe result reference."""
+    """Task detail: poll state plus safe result reference.
+
+    ``result_payload`` carries task-type-specific result data (e.g.
+    ``voice_transcribe`` returns ``{"transcript": "..."}``); it is ``None``
+    for task types whose result is consumed elsewhere (e.g. ``profile_extract``
+    writes to a draft fetched separately).  Only allowlisted keys from
+    ``payload_summary`` are surfaced — never raw audio or secrets.
+    """
 
     result_ref: str | None = None
+    result_payload: dict[str, Any] | None = None
     error_code: str | None = None
     error_message: str | None = None
 
@@ -122,6 +132,25 @@ async def get_ai_task(
                 status_code=status.HTTP_404_NOT_FOUND,
             )
         )
+    # voice_transcribe 任务的转写文本存于独立的 voice_transcript 表，
+    # 仅在终态 succeeded 时通过 result_ref（即 task_id）关联查询并透传；
+    # 其余任务类型 result_payload 为 None。
+    result_payload: dict[str, Any] | None = None
+    if (
+        task.task_type == "voice_transcribe"
+        and task.status is AiTaskStatus.SUCCEEDED
+        and task.result_ref
+    ):
+        row = await db.execute(
+            text(
+                "SELECT transcript FROM voice_transcript "
+                "WHERE task_id = :task_id"
+            ),
+            {"task_id": task.result_ref},
+        )
+        transcript_row = row.mappings().first()
+        if transcript_row and transcript_row.get("transcript"):
+            result_payload = {"transcript": str(transcript_row["transcript"])}
     return TaskDetailResponse(
         task_id=task.task_id,
         status=task.status,
@@ -129,6 +158,7 @@ async def get_ai_task(
         poll_after_ms=_compute_poll_after_ms(task.status, task.next_run_at),
         expires_at=task.lease_until if task.lease_until is not None else None,
         result_ref=task.result_ref,
+        result_payload=result_payload,
         error_code=task.error_code,
         error_message=task.error_message,
     )

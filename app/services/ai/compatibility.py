@@ -69,7 +69,8 @@ LEGACY_ALGORITHM_VERSION = "legacy-rule-v1"
 SCORE_SEMANTICS = "rule_based_reference_shadow"
 COMPATIBILITY_EXPERIMENT_BUCKET = "shadow"
 COMPATIBILITY_CONSENT_SCOPE = "compatibility_shadow"
-COMPATIBILITY_POLICY_REVISION = "ai-policy-2026-08-07-v1"
+COMPATIBILITY_DISPLAY_CONSENT_SCOPE = "compatibility_display"
+COMPATIBILITY_POLICY_REVISION = "ai-policy-2026-08-20-v2"
 COMPATIBILITY_TASK_TYPE = "compatibility"
 PROJECTION_CONSENT_SCOPE = "profile_text_extract"
 DISCLAIMER = "仅根据双方当前可见且已确认资料整理，供了解和破冰参考"
@@ -1180,7 +1181,17 @@ async def read_compatibility_snapshot(
     }
     if not expected_projection_keys.issubset(current_projection_keys):
         return _snapshot_to_read(row, CompatibilitySnapshotStatus.BLOCKED.value)
-    return _snapshot_to_read(row, stored_status)
+    snapshot = _snapshot_to_read(row, stored_status)
+    # M06 外显门禁（D3 前提 4）：display_eligible 当前库值恒 0（shadow），
+    # 外显灰度切换后由 _apply_display_gate 覆盖。未授权 compatibility_display
+    # scope 的用户强制 display_eligible=False，即使灰度命中也不外显。
+    if snapshot.display_eligible:
+        display_consent = await _load_active_consent(
+            db, viewer_id, COMPATIBILITY_DISPLAY_CONSENT_SCOPE
+        )
+        if not display_consent:
+            snapshot = snapshot.model_copy(update={"display_eligible": False})
+    return snapshot
 
 
 # ----------------------------------------------------------------------

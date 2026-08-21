@@ -24,7 +24,7 @@ AI_TABLES = {
             `id` bigint unsigned NOT NULL AUTO_INCREMENT,
             `user_id` bigint unsigned DEFAULT NULL,
             `user_tombstone` char(64) DEFAULT NULL,
-            `scope` varchar(64) NOT NULL COMMENT 'profile_text_extract/search_parse/compatibility_shadow',
+            `scope` varchar(64) NOT NULL COMMENT 'profile_text_extract/search_parse/compatibility_shadow/compatibility_display',
             `version` varchar(32) NOT NULL COMMENT '授权文案版本',
             `policy_revision` varchar(64) NOT NULL COMMENT '策略版本，当前冻结 ai-policy-2026-08-07-v1',
             `granted_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -406,6 +406,28 @@ AI_TABLES = {
             KEY `idx_ai_compat_snapshot_expires` (`expires_at`, `status`),
             CONSTRAINT `chk_ai_compat_viewer_not_target` CHECK (`viewer_user_id` <> `target_user_id`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='AI 双向资料合拍参考 shadow 快照'
+    """,
+
+    # ============ 语音转写结果（P-04 / Phase 4）============
+    # voice_transcribe 任务的转写结果独立存储，不写入 ai_task.payload_summary
+    # （complete_task 成功时会 NULL 清除 payload_summary；handler 直接写 ai_task
+    # 还会与 complete_task 的 SELECT FOR UPDATE 行锁死锁）。handler 在自身会话中
+    # 写入本表，complete_task 在 finalize_db 中操作 ai_task，两表无行锁冲突。
+    # result_ref（varchar(128)）存 task_id 作为引用键，路由通过它关联到本表。
+    "voice_transcript": """
+        CREATE TABLE IF NOT EXISTS `voice_transcript` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `task_id` varchar(64) NOT NULL COMMENT '关联 ai_task.task_id',
+            `owner_user_id` bigint unsigned NOT NULL,
+            `transcript` text NOT NULL COMMENT '转写文本',
+            `confidence` float DEFAULT NULL,
+            `duration_ms` int unsigned DEFAULT NULL,
+            `detected_language` varchar(16) DEFAULT NULL,
+            `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`),
+            UNIQUE KEY `uk_voice_transcript_task` (`task_id`),
+            KEY `idx_voice_transcript_owner` (`owner_user_id`, `created_at`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='语音转写结果'
     """,
 }
 

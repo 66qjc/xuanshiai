@@ -21,6 +21,12 @@ from app.services.ai.base import (
     ExtractedField,
     ModerationRequest,
     ModerationResult,
+    NarrativeDimension,
+    NarrativeHistoryObservation,
+    NarrativeIdealWeight,
+    NarrativeRecentChange,
+    NarrativeRequest,
+    NarrativeResult,
     ProviderError,
     ProviderErrorKind,
     SearchCondition,
@@ -30,6 +36,7 @@ from app.services.ai.base import (
     StructuredExtractResult,
 )
 from app.services.ai.prompts.profile_extract import build_profile_extract_prompt
+from app.services.ai.prompts.profile_narrative import build_profile_narrative_prompt
 from app.services.ai.prompts.search_parse import build_search_parse_prompt
 
 logger = logging.getLogger(__name__)
@@ -128,6 +135,89 @@ _SEARCH_FIXTURE_CONDITIONS: tuple[SearchCondition, ...] = (
 )
 
 
+# Narrative fixtures for MockAIProvider — aligned with the frontend mock
+# (mock/ai-profile.uts mockGetPortraitNarrative) so tests see the same shape.
+_NARRATIVE_FIXTURE_PERSONAL = NarrativeResult(
+    persona_title="慢热但真诚的长期主义者",
+    persona_tags=("慢热", "真诚", "边界感", "长期主义"),
+    insight="你看起来并不依赖高频陪伴,但对于重要的人,你希望彼此能够真正回应。",
+    dimensions=(
+        NarrativeDimension(
+            key="relationship", icon="♡", title="感情观",
+            summary="希望建立稳定、长期,但彼此保留个人空间的关系。",
+        ),
+        NarrativeDimension(
+            key="personality", icon="☀", title="性格",
+            summary="慢热,熟悉以后表达欲明显增加。",
+        ),
+        NarrativeDimension(
+            key="lifestyle", icon="⌂", title="生活方式",
+            summary="喜欢相对规律、安静、有自己节奏的生活。",
+        ),
+        NarrativeDimension(
+            key="future", icon="↗", title="人生规划",
+            summary="对未来有比较明确的方向,希望另一半也拥有自己的目标。",
+        ),
+    ),
+    ideal_weights=(),
+    recent_change=NarrativeRecentChange(
+        direction="up",
+        summary="比三个月前,你现在更看重「稳定」",
+        observation="过去你更容易被有趣吸引,现在你开始更加关注长期相处是否舒服。",
+    ),
+    history_observations=(
+        NarrativeHistoryObservation(
+            revision_id=1,
+            keywords=("稳定", "长期主义", "边界感"),
+            observation="你现在比以前更加确定自己想要怎样的关系。",
+        ),
+    ),
+)
+
+_NARRATIVE_FIXTURE_IDEAL_PARTNER = NarrativeResult(
+    persona_title="温柔稳定且拥有自己世界的人",
+    persona_tags=("真诚", "稳定", "有目标", "边界感", "愿意沟通"),
+    insight="你更看重对方在重要时刻的回应,而不是日常的高频陪伴。",
+    dimensions=(
+        NarrativeDimension(
+            key="relationship", icon="♡", title="感情观",
+            summary="希望建立稳定、长期,但彼此保留个人空间的关系。",
+        ),
+        NarrativeDimension(
+            key="personality", icon="☀", title="性格",
+            summary="期待对方情绪稳定,熟悉以后愿意表达。",
+        ),
+        NarrativeDimension(
+            key="lifestyle", icon="⌂", title="生活方式",
+            summary="希望对方有相对规律、安静、有自己节奏的生活。",
+        ),
+        NarrativeDimension(
+            key="future", icon="↗", title="人生规划",
+            summary="希望另一半也拥有自己的目标与方向。",
+        ),
+    ),
+    ideal_weights=(
+        NarrativeIdealWeight(key="values", label="价值观", percent=92),
+        NarrativeIdealWeight(key="communication", label="沟通方式", percent=88),
+        NarrativeIdealWeight(key="emotion", label="情绪稳定", percent=84),
+        NarrativeIdealWeight(key="lifestyle", label="生活节奏", percent=73),
+        NarrativeIdealWeight(key="appearance", label="外在条件", percent=41),
+    ),
+    recent_change=NarrativeRecentChange(
+        direction="up",
+        summary="比三个月前,你现在更看重「稳定」",
+        observation="过去你更容易被有趣吸引,现在你开始更加关注长期相处是否舒服。",
+    ),
+    history_observations=(
+        NarrativeHistoryObservation(
+            revision_id=1,
+            keywords=("稳定", "长期主义", "边界感"),
+            observation="你现在比以前更加确定自己想要怎样的关系。",
+        ),
+    ),
+)
+
+
 class MockAIProvider:
     """Deterministic fixture provider with failure injection.
 
@@ -190,6 +280,13 @@ class MockAIProvider:
         if blocked:
             return ModerationResult(allowed=False, action="reject", reason_code="SENSITIVE_TEXT")
         return ModerationResult(allowed=True, action="allow")
+
+    async def generate_narrative(
+        self, request: NarrativeRequest
+    ) -> NarrativeResult:
+        self._check_failure("generate_narrative")
+        is_personal = request.subject == ProfileSubject.PERSONAL.value
+        return _NARRATIVE_FIXTURE_PERSONAL if is_personal else _NARRATIVE_FIXTURE_IDEAL_PARTNER
 
     # ------------------------------------------------------------------
     # Deterministic fixture accessor (used by the acceptance test)
@@ -531,6 +628,21 @@ class DeepSeekAIProvider:
             action="reject",
             reason_code=data.get("reason_code") or "SENSITIVE_TEXT",
         )
+
+    async def generate_narrative(
+        self, request: NarrativeRequest
+    ) -> NarrativeResult:
+        prompt = build_profile_narrative_prompt(
+            request.subject,
+            request.current_fields,
+            request.previous_fields,
+            request.history_summaries,
+        )
+        data = await self._chat_json(prompt)
+        # NarrativeResult.model_validate 会做完整的字段校验
+        # （长度/格式/recent_change direction/ideal_weights percent 范围），
+        # 校验失败会抛 ValidationError，由 Gateway 转为 AI_INPUT_INVALID。
+        return NarrativeResult.model_validate(data)
 
 
 class AIProviderRegistry:

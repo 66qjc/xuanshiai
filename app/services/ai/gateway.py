@@ -27,6 +27,7 @@ from app.services.ai.base import (
     AITaskContext,
     GatewayCallRecord,
     ModerationResult,
+    NarrativeResult,
     ProviderError,
     ProviderErrorKind,
     SearchParseResult,
@@ -340,4 +341,12 @@ class AIGateway:
         return await self.invoke(
             context, "moderate_text", request,
             response_type=ModerationResult,
+        )
+
+    async def generate_narrative(
+        self, context: AITaskContext, request: Any
+    ) -> InvokeOutcome[NarrativeResult]:
+        return await self.invoke(
+            context, "generate_narrative", request,
+            response_type=NarrativeResult,
         )

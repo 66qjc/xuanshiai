@@ -28,12 +28,12 @@ AI_FIELD_ALLOWLIST = frozenset(
     }
 )
 
-# consent scope 三个（Task 1 冻结）。
-CONSENT_SCOPES = frozenset({"profile_text_extract", "search_parse", "compatibility_shadow"})
+# consent scope 四个（Task 1 冻结三个；M06 外显 D3 解冻后新增 compatibility_display）。
+CONSENT_SCOPES = frozenset({"profile_text_extract", "search_parse", "compatibility_shadow", "compatibility_display"})
 
 # 用于 OpenAPI path 参数，使 scope 在契约中呈现为枚举，与服务端注册表
 # ``CONSENT_SCOPES``（app/services/ai/consents.py 的 ``CONSENT_VERSIONS``）保持一致。
-AiConsentScope = Literal["profile_text_extract", "search_parse", "compatibility_shadow"]
+AiConsentScope = Literal["profile_text_extract", "search_parse", "compatibility_shadow", "compatibility_display"]
 
 
 class AiTaskStatus(str, Enum):

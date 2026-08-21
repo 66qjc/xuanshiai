@@ -57,9 +57,9 @@ POLICY_REVISION = "ai-policy-2026-08-07-v1"
 PROFILE_SCOPE = ("profile_text_extract", "profile-text-v1")
 COMPAT_SCOPE = ("compatibility_shadow", "compatibility-shadow-v1")
 
-# 测试用户 id 段（与 conftest sweep 范围一致）
-RUN_TS = int(time.time()) % 100000
-USER_A = 9_876_548_000 + RUN_TS
+# 测试用户 id 段（必须在 conftest sweep 范围 9_876_543_000-9_876_549_999 内）
+RUN_TS = int(time.time()) % 6000
+USER_A = 9_876_543_000 + RUN_TS
 USER_B = USER_A + 1
 
 # ── 真实自然语言画像文本（非 Mock 固定文本）────────────────────────

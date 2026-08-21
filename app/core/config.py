@@ -137,6 +137,38 @@ class Settings(BaseSettings):
     ai_deepseek_model: str = "deepseek-v4-flash"
     ai_deepseek_max_tokens: int = Field(default=2048, gt=0, le=8192)
 
+    # ==================== 语音（STT/TTS）功能开关与配置 ====================
+    # P-04 / Phase 4。一期默认关闭、provider 为 mock。生产启用需满足三道
+    # 审批门禁且 voice provider 不为 mock（见 _validate_ai_feature_gates）。
+    ai_voice_enabled: bool = False
+    ai_voice_provider: Literal["mock", "aliyun"] = "mock"
+    # 阿里云智能语音交互（NLS）配置。api_key/app_key 仅存于被忽略的 .env，
+    # 不进 .env.example；生产启用需先走语音 Provider 审批 + DPA / 数据出境审查。
+    ai_aliyun_voice_api_key: SecretStr | None = None
+    ai_aliyun_voice_app_key: SecretStr | None = None
+    ai_aliyun_voice_region: str = "cn-shanghai"
+    ai_aliyun_voice_asr_model: str = "paraformer-realtime-v2"
+    ai_aliyun_voice_tts_model: str = "cosyvoice-v1"
+    # 语音合成单次文本上限（与 voice/base.MAX_TTS_TEXT_LENGTH 对齐）。
+    ai_tts_max_text_length: int = Field(default=500, gt=0, le=2000)
+    # 语音转写单次音频时长上限（秒，与前端录音 60s 上限对齐）。
+    ai_asr_max_duration_seconds: int = Field(default=60, gt=0, le=300)
+    # 临时音频文件过期清理（小时），合规要求转写后短期保留即删除。
+    ai_voice_audio_retention_hours: int = Field(default=24, gt=0)
+
+    # ==================== 实时半双工语音对话（P-04b）====================
+    # 实时对话模式开关：默认关闭。生产环境 fail closed（见
+    # ``_validate_ai_feature_gates``）：需满足三道审批门禁且 voice provider
+    # 不为 mock。实时 ASR 鉴权需要 AccessKey ID/Secret（不只是 api_key/app_key），
+    # 用以换取 NLS Token；该凭据仅存于被忽略的 .env，不进 .env.example。
+    ai_voice_conversation_enabled: bool = False
+    ai_aliyun_voice_access_key_id: SecretStr | None = None
+    ai_aliyun_voice_access_key_secret: SecretStr | None = None
+    # 单次实时对话轮次最长音频时长（秒），与前端实时录音上限对齐。
+    ai_voice_conversation_max_turn_seconds: int = Field(default=60, gt=0, le=300)
+    # 实时 ASR WebSocket 接入点（阿里云 NLS 实时语音识别）。
+    ai_aliyun_voice_asr_ws_url: str = "wss://nls-gateway.cn-shanghai.aliyuncs.com/ws/v1"
+
     # AI 任务/租约/重试/限流配置。
     ai_lease_seconds: int = Field(default=300, gt=0, le=3600)
     ai_max_attempts: int = Field(default=3, gt=0, le=10)
@@ -172,6 +204,17 @@ class Settings(BaseSettings):
         if self.ai_provider == "deepseek":
             return self.ai_deepseek_model
         return "mock-model-v1"
+
+    @property
+    def ai_voice_model_name(self) -> str:
+        """语音 provider 对应的模型名，用于语音任务审计元数据。
+
+        STT 与 TTS 模型不同，这里返回 ASR 模型作为代表；TTS 审计由
+        VoiceGateway 场景区分。mock 时返回固定占位。
+        """
+        if self.ai_voice_provider == "aliyun":
+            return self.ai_aliyun_voice_asr_model
+        return "mock-voice-v1"
 
     @property
     def agreement_versions(self) -> dict[str, str]:
@@ -246,6 +289,7 @@ class Settings(BaseSettings):
                 self.ai_profile_enabled,
                 self.ai_search_enabled,
                 self.ai_compatibility_shadow_enabled,
+                self.ai_voice_enabled,
             )
         )
         if not any_ai_enabled:
@@ -257,6 +301,28 @@ class Settings(BaseSettings):
             )
         if self.ai_provider == "mock":
             raise ValueError("生产环境禁止使用 mock AI Provider")
+        if self.ai_voice_enabled and self.ai_voice_provider == "mock":
+            raise ValueError("生产环境启用语音功能禁止使用 mock Voice Provider")
+        if self.ai_voice_conversation_enabled:
+            # 实时对话模式同样需要三道审批门禁，且禁止 mock provider。
+            if not self.ai_approvals_complete():
+                raise ValueError(
+                    "生产环境启用实时语音对话必须同时满足 ai_policy_approved、"
+                    "ai_provider_approved 和 ai_retention_policy_version"
+                )
+            if self.ai_voice_provider == "mock":
+                raise ValueError(
+                    "生产环境启用实时语音对话禁止使用 mock Voice Provider"
+                )
+            # 实时 ASR 需要 AccessKey 鉴权（换取 NLS Token），与 REST 模式的
+            # api_key/app_key 不同：缺 AccessKey 直接 fail closed。
+            if (
+                not self.ai_aliyun_voice_access_key_id
+                or not self.ai_aliyun_voice_access_key_secret
+            ):
+                raise ValueError(
+                    "生产环境启用实时语音对话必须配置 AccessKey ID/Secret"
+                )
 
 
 @lru_cache

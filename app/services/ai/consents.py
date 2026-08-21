@@ -30,6 +30,7 @@ CONSENT_VERSIONS: dict[str, str] = {
     "profile_text_extract": "profile-text-v1",
     "search_parse": "search-parse-v1",
     "compatibility_shadow": "compatibility-shadow-v1",
+    "compatibility_display": "compatibility-display-v1",
 }
 
 

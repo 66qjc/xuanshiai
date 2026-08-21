@@ -124,6 +124,84 @@ class ModerationResult(BaseModel):
     reason_code: str | None = None
 
 
+# ----------------------------------------------------------------------
+# Narrative (画像叙事层) — 发布后基于已确认字段生成人格画像解读
+# ----------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class NarrativeRequest:
+    """Input for profile narrative generation.
+
+    Carries the user's confirmed fields (current + previous revision) so the
+    provider can synthesise a persona portrait and detect changes over time.
+    Field dicts are plain ``{field_key, value, display_value}`` — no raw
+    answer text, no ids.
+    """
+
+    subject: str
+    current_fields: tuple[dict[str, Any], ...]
+    previous_fields: tuple[dict[str, Any], ...]
+    history_summaries: tuple[dict[str, Any], ...]
+    consent_version: str
+    policy_revision: str
+
+
+class NarrativeDimension(BaseModel):
+    """One persona dimension card (e.g. 感情观 / 性格 / 生活方式)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    key: str = Field(..., min_length=1, max_length=64)
+    icon: str = Field(..., max_length=8)
+    title: str = Field(..., min_length=1, max_length=32)
+    summary: str = Field(..., min_length=1, max_length=200)
+
+
+class NarrativeIdealWeight(BaseModel):
+    """One ideal-partner preference weight (only for ideal_partner subject)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    key: str = Field(..., min_length=1, max_length=64)
+    label: str = Field(..., min_length=1, max_length=32)
+    percent: int = Field(..., ge=0, le=100)
+
+
+class NarrativeRecentChange(BaseModel):
+    """Diff insight between current and previous revision."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    direction: str = Field(..., pattern="^(up|down)$")
+    summary: str = Field(..., min_length=1, max_length=200)
+    observation: str = Field(..., min_length=1, max_length=300)
+
+
+class NarrativeHistoryObservation(BaseModel):
+    """One historical revision observation for the timeline."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    revision_id: int = Field(..., ge=1)
+    keywords: tuple[str, ...] = ()
+    observation: str = Field(..., min_length=1, max_length=300)
+
+
+class NarrativeResult(BaseModel):
+    """Typed provider result for narrative generation (画像叙事层)."""
+
+    schema_version: str = Field(default="profile-narrative-v1", min_length=1, max_length=32)
+    prompt_version: str = Field(default="profile-narrative-prompt-v1", min_length=1, max_length=32)
+    persona_title: str = Field(..., min_length=1, max_length=64)
+    persona_tags: tuple[str, ...] = ()
+    insight: str = Field(..., min_length=1, max_length=500)
+    dimensions: tuple[NarrativeDimension, ...] = ()
+    ideal_weights: tuple[NarrativeIdealWeight, ...] = ()
+    recent_change: NarrativeRecentChange | None = None
+    history_observations: tuple[NarrativeHistoryObservation, ...] = ()
+
+
 class AIProvider(Protocol):
     """Provider adapter interface. One implementation in phase 1: MockAIProvider."""
 
@@ -138,6 +216,10 @@ class AIProvider(Protocol):
     async def moderate_text(
         self, request: ModerationRequest
     ) -> ModerationResult: ...
+
+    async def generate_narrative(
+        self, request: NarrativeRequest
+    ) -> NarrativeResult: ...
 
 
 class ProviderErrorKind(str, Enum):

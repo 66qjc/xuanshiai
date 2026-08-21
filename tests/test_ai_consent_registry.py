@@ -45,10 +45,11 @@ EXPECTED_CONSENT_VERSIONS = {
     "profile_text_extract": "profile-text-v1",
     "search_parse": "search-parse-v1",
     "compatibility_shadow": "compatibility-shadow-v1",
+    "compatibility_display": "compatibility-display-v1",
 }
 
 
-def test_three_scopes_exist() -> None:
+def test_scopes_exist() -> None:
     assert CONSENT_SCOPES == frozenset(EXPECTED_CONSENT_VERSIONS.keys())
 
 
@@ -73,7 +74,7 @@ def test_consent_version_for_each_scope() -> None:
         )
 
 
-def test_validate_scope_accepts_all_three() -> None:
+def test_validate_scope_accepts_all_scopes() -> None:
     for scope in EXPECTED_CONSENT_VERSIONS:
         assert validate_scope(scope) == scope
 
