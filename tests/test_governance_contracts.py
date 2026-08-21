@@ -1,13 +1,12 @@
+import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
-import pytest
 
-from app.main import app
 from app.api.dependencies import CurrentUser, get_realname_verified_user
+from app.main import app
 from app.schemas.admin import ReportReviewRequest
 from app.schemas.restrictions import RestrictionCreate
 from app.schemas.social import ChatMessageResponse
-
 
 client = TestClient(app)
 
@@ -51,6 +50,7 @@ def test_chat_response_keeps_legacy_revoke_field_and_new_fields() -> None:
 
 def test_double_verification_requires_realname_and_face() -> None:
     import asyncio
+
     from fastapi import HTTPException
 
     with pytest.raises(HTTPException):

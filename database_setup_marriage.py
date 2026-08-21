@@ -373,17 +373,23 @@ class DatabaseManager:
         for table_name in ("community_post", "community_comment"):
             try:
                 cursor.execute(
-                    f"""UPDATE `{table_name}`
-                    SET moderation_status = CASE moderation_status
-                        WHEN 'pending' THEN 0
-                        WHEN 'approved' THEN 1
-                        WHEN 'replaced' THEN 1
-                        WHEN 'rejected' THEN 2
-                        WHEN 'hidden' THEN 2
-                        WHEN 'deleted' THEN 2
-                        ELSE moderation_status
-                    END"""
+                    f"SHOW COLUMNS FROM `{table_name}` LIKE 'moderation_status'"
                 )
+                row = cursor.fetchone()
+                col_type = str(row["Type"]).lower() if row else ""
+                if "char" in col_type or "text" in col_type or "enum" in col_type:
+                    cursor.execute(
+                        f"""UPDATE `{table_name}`
+                        SET moderation_status = CASE moderation_status
+                            WHEN 'pending' THEN 0
+                            WHEN 'approved' THEN 1
+                            WHEN 'replaced' THEN 1
+                            WHEN 'rejected' THEN 2
+                            WHEN 'hidden' THEN 2
+                            WHEN 'deleted' THEN 2
+                            ELSE moderation_status
+                        END"""
+                    )
                 cursor.execute(
                     f"""ALTER TABLE `{table_name}`
                     MODIFY COLUMN `moderation_status` tinyint NOT NULL DEFAULT 1
@@ -530,7 +536,7 @@ class DatabaseManager:
             cursor.execute(f"""
                 SELECT CONSTRAINT_NAME, DELETE_RULE
                 FROM information_schema.REFERENTIAL_CONSTRAINTS
-                WHERE TABLE_SCHEMA = DATABASE()
+                WHERE CONSTRAINT_SCHEMA = DATABASE()
                 AND TABLE_NAME = '{table_name}'
                 AND CONSTRAINT_NAME = '{fk_name}'
             """)
@@ -2482,6 +2488,26 @@ class DatabaseManager:
         # 本次一期商业化领域表与基础用户表保持同一初始化入口。
         tables.update(BUSINESS_TABLES)
 
+        # AI 派生投影（revision/outbox/消费收据）与业务表同一入口。
+        from app.db.derivation_schema import (
+            DERIVATION_TABLES,
+            ensure_derivation_task10_columns,
+        )
+
+        tables.update(DERIVATION_TABLES)
+
+        # AI-CORE/M04/M03/M06 表（ai_consent_grant、ai_task、ai_generation_audit
+        # 及 13 张画像/搜索/投影/兼容度表）只做幂等建表，不做生产自动迁移。
+        from app.db.ai_schema import (
+            AI_CONSENT_OPERATION_TABLE,
+            AI_TABLES,
+            ensure_ai_legacy_columns,
+            ensure_ai_projection_columns,
+        )
+
+        tables.update(AI_TABLES)
+        tables["ai_consent_operation"] = AI_CONSENT_OPERATION_TABLE
+
         # 创建所有表
         for table_name, sql in tables.items():
             cursor.execute(sql)
@@ -2516,6 +2542,15 @@ class DatabaseManager:
 
         # 兼容已存在的旧库：CREATE TABLE IF NOT EXISTS 不会补齐新增字段。
         self._ensure_required_columns(cursor)
+
+        # 旧库的 ai_feature_projection 不会由 CREATE TABLE IF NOT EXISTS 补齐
+        # Task 9 新增列（版本向量/可见性/失效原因等），与上面同模式幂等补列
+        # （SHOW COLUMNS→ALTER TABLE ADD COLUMN；表不存在时由 helper 静默跳过）。
+        ensure_ai_projection_columns(cursor)
+        # Task 2 additive AI fields are safe to backfill during bootstrap;
+        # constraint/index changes remain in the reviewed migration runner.
+        ensure_ai_legacy_columns(cursor)
+        ensure_derivation_task10_columns(cursor)
 
         self._backfill_comment_roots(cursor)
 

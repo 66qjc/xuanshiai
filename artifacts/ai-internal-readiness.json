@@ -1,0 +1,94 @@
+{
+  "blockers": [
+    "master_disabled",
+    "policy_not_approved",
+    "provider_not_approved",
+    "retention_policy_missing",
+    "cleanup_consumer_not_schedulable",
+    "evidence_bundle_reported:gate_not_run:G6",
+    "evidence_bundle_reported:gate_not_run:G7"
+  ],
+  "config": {
+    "ai_master_enabled": false,
+    "ai_policy_approved": false,
+    "ai_provider": "mock",
+    "ai_provider_approved": false,
+    "ai_retention_policy_version": null
+  },
+  "decision_code": "AI_FEATURE_DISABLED",
+  "environment": "testing",
+  "evidence": {
+    "bundle": {
+      "artifact_type": "command-bundle",
+      "bundle_blocker_count": 2,
+      "command_count": 10,
+      "commit_sha": "496c39aa17dc07b26a1b8fca5a16cf12f8d8475f",
+      "environment": "testing",
+      "generated_at": "2026-08-20T04:54:53Z",
+      "result": "NO-GO",
+      "schema_version": "ai-evidence-v1",
+      "target": "internal"
+    },
+    "bundle_present": true,
+    "cleanup_consumer": {
+      "scheduling": "python -m app.workers.ai_worker --consumers",
+      "verified": false
+    },
+    "deletion_replay": {
+      "verified": true
+    },
+    "mock_failure_injection": {
+      "verified": true
+    },
+    "openapi": {
+      "missing": [],
+      "required_paths": [
+        "/api/v1/ai/tasks/{task_id}",
+        "/api/v1/ai/profile-sessions",
+        "/api/v1/ai/search-drafts",
+        "/api/v1/ai/compatibility/{target_user_id}"
+      ]
+    },
+    "phase4_requires_dpa": true,
+    "phase5_requires_fairness_review": true,
+    "privacy_matrix": {
+      "verified": true
+    },
+    "rollback_drill": {
+      "verified": true
+    },
+    "shadow_report": {
+      "verified": true
+    },
+    "tables": {
+      "ai_tables_expected": 16,
+      "ai_tables_verified": 16,
+      "derivation_tables_expected": 3,
+      "derivation_tables_verified": 3,
+      "missing_ai_tables": [],
+      "missing_derivation_tables": [],
+      "verified": true
+    },
+    "worker_handlers": {
+      "missing": [],
+      "registered": [
+        "cleanup",
+        "compatibility",
+        "profile_extract",
+        "profile_projection",
+        "search_execute",
+        "search_parse"
+      ],
+      "required_task_types": [
+        "profile_extract",
+        "search_parse",
+        "search_execute",
+        "compatibility",
+        "profile_projection",
+        "cleanup"
+      ]
+    }
+  },
+  "release_gate": "disabled-until-approved",
+  "target": "internal"
+}

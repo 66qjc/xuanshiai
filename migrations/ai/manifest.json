@@ -1,0 +1,60 @@
+{
+  "target": "ai",
+  "requires": [
+    "ai_consent_grant",
+    "ai_task",
+    "ai_generation_audit",
+    "ai_profile_session",
+    "ai_profile_turn",
+    "ai_search_result",
+    "ai_feature_projection",
+    "ai_compatibility_snapshot"
+  ],
+  "versions": [
+    {
+      "version": "20260809_01_hardening",
+      "up": "20260809_01_hardening_up.sql",
+      "down": "20260809_01_hardening_down.sql",
+      "sha256": {
+        "up": "330a38838b47258979c5ae074a77adca1bfa3d19e12b6eb2d9b94fad306abb34",
+        "down": "ae2d468d472c38b01cd280ace073aaadab44bba2f4a0e0629dd687dc1290d23f"
+      }
+    },
+    {
+      "version": "20260809_02_outbox_cleanup",
+      "up": "20260809_02_outbox_cleanup_up.sql",
+      "down": "20260809_02_outbox_cleanup_down.sql",
+      "sha256": {
+        "up": "e798f1d619feab06f4292804004cbe371fd6627dc9105b4d937c931e422c2d1d",
+        "down": "2eddc54426d990bf21fa6d7e9598863436a411aa7b55887fb61c5a3e5ab2ec46"
+      }
+    },
+    {
+      "version": "20260815_01_search_result_generation",
+      "up": "20260815_01_search_result_generation_up.sql",
+      "down": "20260815_01_search_result_generation_down.sql",
+      "sha256": {
+        "up": "5553adc8a226d65a8d139401b66bcce269d486d968e63b4c5cae25db8ca598fe",
+        "down": "aa08f30f94df13bf169e49beab266bd277525cebc600ac4031e14c2ee35259c1"
+      }
+    },
+    {
+      "version": "20260815_02_search_snapshot_updated_at",
+      "up": "20260815_02_search_snapshot_updated_at_up.sql",
+      "down": "20260815_02_search_snapshot_updated_at_down.sql",
+      "sha256": {
+        "up": "0e9817300628cca75247cb593fb2ce2b3cd638ab3c8949a48f9b15f8c2f0abd2",
+        "down": "5b155426efc0b973aaaf0a0db9602d7842a2396adf3919700699c11d8aacdf2d"
+      }
+    },
+    {
+      "version": "20260815_03_consent_unique_key_user_id",
+      "up": "20260815_03_consent_unique_key_user_id_up.sql",
+      "down": "20260815_03_consent_unique_key_user_id_down.sql",
+      "sha256": {
+        "up": "46f755f773ba39d522d2a3d13c206d91edb6f80e9d9b9b486155960803542015",
+        "down": "fc958c4bbaff65e962d906e567b0092792a2be3d5807224e4cd8f4b1a06b4729"
+      }
+    }
+  ]
+}

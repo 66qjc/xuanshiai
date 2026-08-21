@@ -1,0 +1,63 @@
+{
+  "artifact": "ai-search-quality",
+  "dataset": {
+    "extensible": true,
+    "path": "tests/fixtures/ai/search_quality_cases.json",
+    "sample_size": 3,
+    "version": "2026-08-19-v1"
+  },
+  "evaluation_only": true,
+  "generated_at": "2026-08-20T04:54:39Z",
+  "metrics": {
+    "evidence_consistency_pct": 100.0,
+    "exact_match_pct": 100.0,
+    "forbidden_ast_field_count": 0.0,
+    "hard_violation_count": 0.0,
+    "sensitive_marker_hits": 0.0
+  },
+  "module": "M03",
+  "notes": [
+    "Real metrics computed by scripts/evaluate_ai_quality.py from the reviewed fixture dataset; not hand-written.",
+    "Synthetic offline evaluation only; not real runtime acceptance evidence.",
+    "allow_expansion=false：expansion requires independent reviewer sign-off and real runtime evidence."
+  ],
+  "provenance": {
+    "captured_at": "2026-08-20T04:54:39Z",
+    "captured_at_commit": "496c39aa17dc07b26a1b8fca5a16cf12f8d8475f",
+    "captured_at_environment": "testing",
+    "captured_by": "codex-ai-remediation-g5",
+    "dataset_kind": "synthetic-offline",
+    "dataset_path": "tests/fixtures/ai/search_quality_cases.json",
+    "dataset_sample_size": "3",
+    "dataset_version": "2026-08-19-v1",
+    "source_review_status": "PENDING"
+  },
+  "reviewed": false,
+  "reviewer": {
+    "name": "product-owner",
+    "role": "quality-reviewer",
+    "status": "PENDING"
+  },
+  "schema_version": "ai-quality-eval-v1",
+  "thresholds": {
+    "evidence_consistency_pct_min": 100.0,
+    "exact_match_pct_min": 90.0,
+    "forbidden_ast_field_count_max": 0,
+    "hard_violation_count_max": 0,
+    "sensitive_marker_hits_max": 0
+  },
+  "use_limitation": {
+    "expansion_requires": "independent reviewer sign-off and real runtime evidence",
+    "must_not_change": [
+      "search AST",
+      "thresholds",
+      "ranking weights"
+    ],
+    "scope": "offline evaluation only; not real runtime acceptance evidence"
+  },
+  "verdict": {
+    "allow_expansion": false,
+    "result": "PASS",
+    "thresholds_met": true
+  }
+}

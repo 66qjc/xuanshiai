@@ -1,0 +1,65 @@
+name: xuanshiai-ai-test
+
+x-ai-worker: &ai-worker
+  build:
+    context: .
+    dockerfile_inline: |
+      FROM python:3.13-slim
+      WORKDIR /app
+      COPY . .
+      RUN pip install --no-cache-dir -e .
+  working_dir: /app
+  volumes:
+    - .:/app:ro
+  environment:
+    ENVIRONMENT: testing
+    AUTO_INIT_DB: "false"
+    DATABASE_URL: "mysql+aiomysql://root:@mysql:3306/${AI_TEST_MYSQL_DATABASE:-xuanshiai_ai_test}"
+    REDIS_URL: redis://redis:6379/5
+    PYTHONUNBUFFERED: "1"
+  depends_on:
+    mysql:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+  restart: unless-stopped
+
+services:
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+      MYSQL_DATABASE: ${AI_TEST_MYSQL_DATABASE:-xuanshiai_ai_test}
+    ports:
+      - "127.0.0.1:${AI_TEST_MYSQL_PORT:-3307}:3306"
+    volumes:
+      - ai-test-mysql:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "127.0.0.1:${AI_TEST_REDIS_PORT:-6380}:6379"
+    volumes:
+      - ai-test-redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  worker-a:
+    <<: *ai-worker
+    command: ["python", "-m", "app.workers.ai_worker", "--idle-seconds", "2"]
+
+  worker-b:
+    <<: *ai-worker
+    command: ["python", "-m", "app.workers.ai_worker", "--idle-seconds", "2"]
+
+volumes:
+  ai-test-mysql:
+  ai-test-redis:

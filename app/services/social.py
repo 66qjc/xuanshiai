@@ -46,6 +46,7 @@ from app.services.profile import _calculate_age
 from app.services.restrictions import ensure_user_allowed
 from app.services.restrictions import create_restriction
 from app.schemas.restrictions import RestrictionCreate
+from app.services.revisions import RevisionKind, increment_revision_and_enqueue
 
 
 def _social_user(row: dict[str, Any]) -> SocialUser:
@@ -318,6 +319,14 @@ async def update_privacy(db: AsyncSession, user_id: int, request: PrivacyUpdateR
         placeholders = ", ".join(f":{column}" for column in columns)
         updates = ", ".join(f"{column} = VALUES({column})" for column in values)
         await db.execute(text(f"INSERT INTO user_privacy ({', '.join(columns)}) VALUES ({placeholders}) ON DUPLICATE KEY UPDATE {updates}, updated_at = UTC_TIMESTAMP()"), {"user_id": user_id, **values})
+        await increment_revision_and_enqueue(
+            db,
+            user_id,
+            RevisionKind.PRIVACY,
+            tuple(values.keys()),
+            "privacy_updated",
+            10,
+        )
         await db.commit()
     return await get_privacy(db, user_id)
 
@@ -331,14 +340,24 @@ async def list_blocks(db: AsyncSession, user_id: int) -> list[SocialUser]:
 async def set_block(db: AsyncSession, user_id: int, target_id: int, request: BlockRequest, enabled: bool) -> None:
     if enabled:
         await _ensure_target(db, user_id, target_id)
-        await db.execute(text("INSERT IGNORE INTO user_block (user_id, target_user_id, reason) VALUES (:user_id, :target_id, :reason)"), {"user_id": user_id, "target_id": target_id, "reason": request.reason if request else None})
+        inserted = await db.execute(text("INSERT IGNORE INTO user_block (user_id, target_user_id, reason) VALUES (:user_id, :target_id, :reason)"), {"user_id": user_id, "target_id": target_id, "reason": request.reason if request else None})
         await db.execute(text("UPDATE user_match SET status = 3, updated_at = UTC_TIMESTAMP() WHERE (user_id = :user_id AND target_user_id = :target_id) OR (user_id = :target_id AND target_user_id = :user_id)"), {"user_id": user_id, "target_id": target_id})
         await db.execute(text("UPDATE match_apply SET status = 3, updated_at = UTC_TIMESTAMP() WHERE status = 0 AND ((from_user_id = :user_id AND to_user_id = :target_id) OR (from_user_id = :target_id AND to_user_id = :user_id))"), {"user_id": user_id, "target_id": target_id})
+        # Only enqueue an invalidation when the block actually took effect;
+        # INSERT IGNORE with rowcount 0 means the pair was already blocked.
+        if getattr(inserted, "rowcount", 1) > 0:
+            await increment_revision_and_enqueue(db, user_id, RevisionKind.RELATIONSHIP, ("block",), "relationship_blocked", 10)
+            await increment_revision_and_enqueue(db, target_id, RevisionKind.RELATIONSHIP, ("block",), "relationship_blocked", 10)
     else:
         result = await db.execute(text("SELECT 1 FROM users WHERE id = :target_id AND status = 1"), {"target_id": target_id})
         if not result.scalar():
             raise HTTPException(404, detail="目标用户不存在")
-        await db.execute(text("DELETE FROM user_block WHERE user_id = :user_id AND target_user_id = :target_id"), {"user_id": user_id, "target_id": target_id})
+        deleted = await db.execute(text("DELETE FROM user_block WHERE user_id = :user_id AND target_user_id = :target_id"), {"user_id": user_id, "target_id": target_id})
+        # Only enqueue an invalidation when the block was actually lifted;
+        # DELETE with rowcount 0 means the pair was not blocked.
+        if getattr(deleted, "rowcount", 1) > 0:
+            await increment_revision_and_enqueue(db, user_id, RevisionKind.RELATIONSHIP, ("block",), "relationship_unblocked", 10)
+            await increment_revision_and_enqueue(db, target_id, RevisionKind.RELATIONSHIP, ("block",), "relationship_unblocked", 10)
     await db.commit()
 
 

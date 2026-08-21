@@ -204,6 +204,14 @@ Breaking Change 必须提供版本迁移方案，不能只在代码中直接替�
 - 日志中对于密码、身份证号等字段进行脱敏（如 `******`）。
 - 返回给前端的响应中，移除密码哈希、密钥等字段（可在全局序列化层过滤）。
 
+#### 3.2.1 语音 Provider（STT/TTS）专项约束
+
+- 阿里云 NLS `api_key`/`app_key` 仅存于被忽略的 `.env`，不进 `.env.example`、不进代码、不进日志。
+- **音频不进审计**：`GatewayCallRecord` 与 `GenerationAuditEvent` 只记录元数据（provider、model、duration、error_code），绝不包含音频原文、转写文本、音频 URL 或密钥。
+- 转写文本（transcript）通过 `payload_summary` 存储、通过 `result_payload` 透传，不写入 `result_ref`（varchar(128) 长度限制）。
+- 临时音频文件须有过期清理（`ai_voice_audio_retention_hours`），转写完成后短期保留即删除，合规要求不长期留存原始音频。
+- 生产启用须满足三道审批门禁且 `ai_voice_provider != "mock"`（`_validate_ai_feature_gates` 已强制 fail-closed）。
+
 ### 3.3 接口权限与校验
 
 **每个接口必须明确权限要求**（如 `@Permission("user:read")`）。

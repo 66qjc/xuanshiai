@@ -6,6 +6,11 @@ from app.api.routes import location
 
 from app.api.routes import (
     admin,
+    ai_compatibility,
+    ai_consents,
+    ai_profile,
+    ai_search,
+    ai_tasks,
     matchmaker_admin,
     matchmaker_crm_admin,
     customer_leads_admin,
@@ -33,6 +38,8 @@ from app.api.routes import (
     regions,
     social,
     users,
+    voice,
+    voice_ws,
 )
 
 
@@ -76,6 +83,13 @@ api_router.include_router(organization.router, tags=["组织与归属"])
 api_router.include_router(organization.promotion_router, tags=["组织与归属"])
 api_router.include_router(organization.partner_router, tags=["组织与归属"])
 api_router.include_router(finance.router, tags=["财务与结算"])
+api_router.include_router(ai_tasks.router, prefix="/ai", tags=["AI"])
+api_router.include_router(ai_consents.router, prefix="/ai", tags=["AI"])
+api_router.include_router(ai_profile.router, prefix="/ai", tags=["AI"])
+api_router.include_router(ai_search.router, prefix="/ai", tags=["AI"])
+api_router.include_router(ai_compatibility.router, prefix="/ai", tags=["AI"])
+api_router.include_router(voice.router, prefix="/voice", tags=["语音"])
+api_router.include_router(voice_ws.router, prefix="/voice", tags=["语音"])
 
 
 OPENAPI_TAGS = [
@@ -93,4 +107,6 @@ OPENAPI_TAGS = [
     {"name": "积分", "description": "积分账户和积分流水相关能力。"},
     {"name": "地区", "description": "省市区等地区数据查询。"},
     {"name": "系统", "description": "健康检查和系统发现信息。"},
+    {"name": "AI", "description": "AI 画像、搜索与匹配度通用任务查询、取消和状态轮询。"},
+    {"name": "语音", "description": "语音转写（STT）与语音合成（TTS）。"},
 ]

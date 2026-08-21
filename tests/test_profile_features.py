@@ -4,7 +4,12 @@ import pytest
 from PIL import Image
 from pydantic import ValidationError
 
-from app.schemas.auth import NicknameUpdateRequest, PhotoOrderRequest, PreferenceUpdateRequest, ProfileUpdateRequest
+from app.schemas.auth import (
+    NicknameUpdateRequest,
+    PhotoOrderRequest,
+    PreferenceUpdateRequest,
+    ProfileUpdateRequest,
+)
 from app.services.profile import COMPLETION_RULES, IMAGE_MAX_PIXELS, _image_outputs
 
 

@@ -1,0 +1,26 @@
+{
+  "schema_version": "ai-migration-rollback-plan-v1",
+  "status": "NOT_RUN",
+  "target": "disposable-test-database-only",
+  "snapshot": {
+    "reference": "NOT_RUN",
+    "sha256": "NOT_RUN",
+    "created_at": null,
+    "verified": false
+  },
+  "ddl_steps": [
+    {"id": "up-01", "direction": "up", "status": "NOT_RUN", "last_durable_step": 0},
+    {"id": "up-02", "direction": "up", "status": "NOT_RUN", "last_durable_step": 0},
+    {"id": "down-02", "direction": "down", "status": "NOT_RUN", "last_durable_step": 0},
+    {"id": "down-01", "direction": "down", "status": "NOT_RUN", "last_durable_step": 0}
+  ],
+  "failure_injection": {
+    "status": "NOT_RUN",
+    "failed_step": null,
+    "compensation_verified": false
+  },
+  "data_loss_scope": "NOT_RUN",
+  "operator_acknowledgement": "NOT_RUN",
+  "instructions": "Populate only from a disposable DB drill; do not use as a production command.",
+  "result": "NOT_RUN"
+}

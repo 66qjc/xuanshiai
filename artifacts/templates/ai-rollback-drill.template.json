@@ -1,0 +1,54 @@
+{
+  "schema_version": "ai-evidence-v1",
+  "artifact_type": "rollback",
+  "target": "internal",
+  "branch": "NOT_RUN",
+  "commit_sha": "0000000000000000000000000000000000000000",
+  "dirty": true,
+  "environment": "testing",
+  "generated_at": "1970-01-01T00:00:00Z",
+  "policy_version": "NOT_RUN",
+  "provider": "NOT_RUN",
+  "model": null,
+  "schema_versions": {"evidence": "ai-evidence-v1"},
+  "commands": [],
+  "exit_codes": {},
+  "input_artifact_hashes": {},
+  "output_artifact_hashes": {},
+  "reviewer": {
+    "name": "NOT_RUN",
+    "role": "rollback-reviewer",
+    "status": "NOT_RUN"
+  },
+  "gates": {
+    "G0": {"status": "NOT_RUN", "command_ids": []},
+    "G1": {"status": "NOT_RUN", "command_ids": []},
+    "G2": {"status": "NOT_RUN", "command_ids": []},
+    "G3": {"status": "NOT_RUN", "command_ids": []},
+    "G4": {"status": "NOT_RUN", "command_ids": []},
+    "G5": {"status": "NOT_RUN", "command_ids": []},
+    "G6": {"status": "NOT_RUN", "command_ids": []},
+    "G7": {"status": "NOT_RUN", "command_ids": []}
+  },
+  "blockers": ["NOT_RUN: rollback drill has not been executed"],
+  "result": "NOT_RUN",
+  "release_gate": "disabled-until-approved",
+  "details": {
+    "template": true,
+    "rollback": {
+      "snapshot_reference": "NOT_RUN",
+      "snapshot_sha256": "NOT_RUN",
+      "data_loss_scope": "NOT_RUN",
+      "steps": [
+        {"id": "disable_flags", "status": "NOT_RUN"},
+        {"id": "stop_workers", "status": "NOT_RUN"},
+        {"id": "restore_snapshot_or_down", "status": "NOT_RUN"},
+        {"id": "verify_legacy_discovery", "status": "NOT_RUN"},
+        {"id": "invalidate_new_results", "status": "NOT_RUN"},
+        {"id": "forward_recovery", "status": "NOT_RUN"}
+      ],
+      "restoration_verified": false,
+      "forward_recovery_verified": false
+    }
+  }
+}

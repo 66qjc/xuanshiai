@@ -1,0 +1,3 @@
+profile: result=PASS thresholds_met=True allow_expansion=False
+search: result=PASS thresholds_met=True allow_expansion=False
+compatibility-shadow: result=CONDITIONAL thresholds_met=False allow_expansion=False

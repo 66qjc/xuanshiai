@@ -15,9 +15,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.profile_tags import TAG_OPTIONS_BY_CATEGORY
-from app.core.redis import consume_daily, refund_daily, redis_client
+from app.core.redis import consume_daily, redis_client, refund_daily
 from app.schemas.discovery import (
     ApplicationCreateRequest,
+    ApplicationPage,
     ApplicationRejectRequest,
     ApplicationResponse,
     BrowseHistoryItem,
@@ -26,19 +27,32 @@ from app.schemas.discovery import (
     DiscoveryFilters,
     DiscoveryPage,
     DiscoverySearch,
-    FavoriteResponse,
-    FilterOptionsResponse,
-    ApplicationPage,
     FavoritePage,
     FavoriteReceivedItem,
     FavoriteReceivedPage,
-    RelationUserSummary,
+    FavoriteResponse,
+    FilterOptionsResponse,
     PublicProfileResponse,
+    RelationUserSummary,
     SavedFilterResponse,
-    SuperLikeResponse,
     SuperLikeItem,
     SuperLikePage,
+    SuperLikeResponse,
     VisitorPage,
+)
+from app.services.candidate_query import (
+    SORT_VERSION,
+    CandidatePage,
+    CandidateQueryService,
+    CandidateQuerySnapshot,
+    InvalidCandidateCursor,
+    build_query_fingerprint,
+)
+from app.services.candidate_visibility import (
+    CandidateVisibilityService,
+    SqlPredicate,
+    ViewerContext,
+    VisibilityScene,
 )
 from app.services.notifications import emit_notification
 from app.services.profile import _calculate_age, _json_dict, _json_list, get_profile
@@ -46,6 +60,13 @@ from app.services.quotas import consume_extra
 from app.services.restrictions import ensure_user_allowed
 
 logger = logging.getLogger(__name__)
+candidate_visibility_service = CandidateVisibilityService()
+candidate_query_service = CandidateQueryService(secret_key=settings.secret_key)
+
+# 旧 match_score/match_reason 的算法版本（统一方案 §9.1/§10.4）：语义恒为
+# legacy-rule-v1；新兼容度（compatibility-rule-v1）只写 ai_compatibility_snapshot，
+# 不触碰旧字段或推荐排序。
+LEGACY_MATCH_ALGORITHM_VERSION = "legacy-rule-v1"
 
 
 CARD_SELECT = """
@@ -78,6 +99,10 @@ CARD_SELECT = """
                      AND (b.end_at IS NULL OR b.end_at > UTC_TIMESTAMP())) AS is_boosted,
            EXISTS (SELECT 1 FROM user_favorite f
                    WHERE f.user_id = :viewer_id AND f.target_user_id = u.id AND f.type = 2) AS is_favorite
+"""
+
+
+CARD_FROM = """
     FROM users u
     LEFT JOIN user_profile p ON p.user_id = u.id
     LEFT JOIN user_profile_completion c ON c.user_id = u.id
@@ -94,8 +119,8 @@ async def _viewer_context(db: AsyncSession, user_id: int) -> dict[str, Any]:
                p.personality_tags, p.tags, p.residence_city_code,
                COALESCE(ua.realname_status, 0) AS realname_status,
                       pref.age_min, pref.age_max, pref.height_min, pref.height_max,
-                      pref.education_min, pref.income_min, pref.marriage_status,
-                      pref.preferred_city_codes
+                       pref.education_min, pref.income_min, pref.marriage_status,
+                       pref.preferred_province_code, pref.preferred_city_codes
                FROM users u LEFT JOIN user_profile p ON p.user_id = u.id
                LEFT JOIN user_profile_completion c ON c.user_id = u.id
                LEFT JOIN user_auth ua ON ua.user_id = u.id
@@ -118,6 +143,55 @@ async def _is_vip(db: AsyncSession, user_id: int) -> bool:
         {"user_id": user_id},
     )
     return bool(result.scalar())
+
+
+def _visibility_predicate(
+    viewer_id: int,
+    viewer: dict[str, Any],
+    viewer_is_vip: bool,
+    scene: VisibilityScene,
+    *,
+    candidate_alias: str = "u",
+    privacy_alias: str = "pr",
+    completion_alias: str = "c",
+) -> SqlPredicate:
+    return candidate_visibility_service.predicate(
+        ViewerContext(
+            user_id=viewer_id,
+            realname_status=int(viewer.get("realname_status") or 0),
+            is_vip=viewer_is_vip,
+        ),
+        scene,
+        candidate_alias=candidate_alias,
+        privacy_alias=privacy_alias,
+        completion_alias=completion_alias,
+    )
+
+
+async def _scene_visibility(
+    db: AsyncSession,
+    viewer_id: int,
+    scene: VisibilityScene,
+    *,
+    candidate_alias: str = "u",
+    privacy_alias: str = "pr",
+    completion_alias: str = "c",
+) -> tuple[dict[str, Any], bool, SqlPredicate]:
+    viewer = await _viewer_context(db, viewer_id)
+    viewer_is_vip = await _is_vip(db, viewer_id)
+    return (
+        viewer,
+        viewer_is_vip,
+        _visibility_predicate(
+            viewer_id,
+            viewer,
+            viewer_is_vip,
+            scene,
+            candidate_alias=candidate_alias,
+            privacy_alias=privacy_alias,
+            completion_alias=completion_alias,
+        ),
+    )
 
 
 def _json_city_list(value: Any) -> list[str]:
@@ -209,6 +283,8 @@ def _card(row: dict[str, Any], score: float, reason: str, detail_locked: bool = 
         certification_tags=certification_tags,
         match_score=score,
         match_reason=reason,
+        algorithm_version=LEGACY_MATCH_ALGORITHM_VERSION,
+        match_score_source=LEGACY_MATCH_ALGORITHM_VERSION,
         is_favorite=bool(row.get("is_favorite")),
         is_pure_free=not bool(row.get("is_vip")) and not bool(row.get("is_boosted")),
         is_boosted=bool(row.get("is_boosted")),
@@ -258,6 +334,153 @@ def _filter_sql(filters: DiscoveryFilters, params: dict[str, Any]) -> list[str]:
     return clauses
 
 
+def _candidate_snapshot(
+    *,
+    viewer_id: int,
+    viewer: dict[str, Any],
+    viewer_is_vip: bool,
+    filters: DiscoveryFilters,
+    plaza: bool,
+    nickname: str | None,
+    tag: str | None,
+    respect_preferences: bool,
+) -> CandidateQuerySnapshot:
+    """Build one server-owned candidate SELECT/count pair.
+
+    Both statements consume the same visibility and filter clauses.  The
+    query fingerprint deliberately excludes the page and cursor so a cursor
+    can advance through one logical result set without changing its identity.
+    """
+    scene = VisibilityScene.SEARCH if nickname or tag else VisibilityScene.DISCOVERY
+    visibility = _visibility_predicate(
+        viewer_id,
+        viewer,
+        viewer_is_vip,
+        scene,
+    )
+    params: dict[str, Any] = {
+        "viewer_id": viewer_id,
+        **visibility.params,
+    }
+    clauses = [visibility.clause]
+    if nickname:
+        clauses.append("u.nickname LIKE CONCAT('%', :search_nickname, '%') ESCAPE '!' ")
+        params["search_nickname"] = _escape_like(nickname)
+    if tag:
+        clauses.append(
+            """(
+            JSON_CONTAINS(p.interest_tags, JSON_QUOTE(:search_tag))
+            OR JSON_CONTAINS(p.personality_tags, JSON_QUOTE(:search_tag))
+            OR JSON_SEARCH(p.tags, 'one', :search_tag) IS NOT NULL
+        )"""
+        )
+        params["search_tag"] = tag
+    if viewer.get("gender") in (1, 2):
+        clauses.append("u.gender <> :opposite_gender")
+        params["opposite_gender"] = viewer["gender"]
+    if respect_preferences:
+        clauses.extend(
+            [
+                "(vp.age_min IS NULL OR TIMESTAMPDIFF(YEAR, u.birthday, CURDATE()) >= vp.age_min)",
+                "(vp.age_max IS NULL OR TIMESTAMPDIFF(YEAR, u.birthday, CURDATE()) <= vp.age_max)",
+                "(vp.height_min IS NULL OR p.height >= vp.height_min)",
+                "(vp.height_max IS NULL OR p.height <= vp.height_max)",
+                "(vp.education_min IS NULL OR p.education_level >= vp.education_min)",
+                "(vp.income_min IS NULL OR p.income >= vp.income_min)",
+                "(vp.marriage_status IS NULL OR vp.marriage_status = 0 OR u.is_married = vp.marriage_status)",
+                "(vp.preferred_province_code IS NULL OR p.residence_province_code = vp.preferred_province_code)",
+                "(vp.preferred_city_codes IS NULL OR JSON_LENGTH(vp.preferred_city_codes) = 0 OR JSON_CONTAINS(vp.preferred_city_codes, JSON_QUOTE(p.residence_city_code)))",
+            ]
+        )
+    if not plaza:
+        clauses.extend(
+            [
+                "NOT EXISTS (SELECT 1 FROM user_browse_history bh WHERE bh.user_id = :viewer_id AND bh.target_user_id = u.id)",
+                "NOT EXISTS (SELECT 1 FROM user_swipe_record sw WHERE sw.user_id = :viewer_id AND sw.target_user_id = u.id AND sw.action = 2)",
+                "NOT EXISTS (SELECT 1 FROM match_apply ma WHERE ((ma.from_user_id = :viewer_id AND ma.to_user_id = u.id) OR (ma.from_user_id = u.id AND ma.to_user_id = :viewer_id)) AND ma.status IN (0, 1))",
+            ]
+        )
+    clauses.extend(_filter_sql(filters, params))
+    filter_facts = filters.model_dump(mode="json")
+    filter_facts.pop("cursor", None)
+    filter_facts.pop("page", None)
+    viewer_predicate_facts: dict[str, Any] = {
+        "gender": viewer.get("gender"),
+    }
+    if respect_preferences:
+        viewer_predicate_facts["partner_preferences"] = {
+            "age_min": viewer.get("age_min"),
+            "age_max": viewer.get("age_max"),
+            "height_min": viewer.get("height_min"),
+            "height_max": viewer.get("height_max"),
+            "education_min": viewer.get("education_min"),
+            "income_min": viewer.get("income_min"),
+            "marriage_status": viewer.get("marriage_status"),
+            "preferred_province_code": viewer.get("preferred_province_code"),
+            "preferred_city_codes": sorted(
+                _json_city_list(viewer.get("preferred_city_codes"))
+            ),
+        }
+    query_fingerprint = build_query_fingerprint(
+        {
+            "viewer_id": viewer_id,
+            "viewer_realname_status": viewer.get("realname_status") or 0,
+            "viewer_is_vip": viewer_is_vip,
+            "viewer_predicate_facts": viewer_predicate_facts,
+            "scene": scene.value,
+            "plaza": plaza,
+            "respect_preferences": respect_preferences,
+            "nickname": nickname,
+            "tag": tag,
+            "filters": filter_facts,
+            "policy_revision": visibility.policy_revision,
+            "sort_version": SORT_VERSION,
+        }
+    )
+    return CandidateQuerySnapshot(
+        select_sql=CARD_SELECT + CARD_FROM,
+        count_sql="SELECT COUNT(DISTINCT u.id)" + CARD_FROM,
+        where_sql=" AND ".join(clauses),
+        params=params,
+        query_fingerprint=query_fingerprint,
+        page=filters.page,
+    )
+
+
+async def _candidate_query_page(
+    db: AsyncSession,
+    viewer_id: int,
+    filters: DiscoveryFilters,
+    *,
+    plaza: bool,
+    nickname: str | None = None,
+    tag: str | None = None,
+    respect_preferences: bool = True,
+) -> tuple[dict[str, Any], bool, CandidatePage]:
+    viewer = await _viewer_context(db, viewer_id)
+    viewer_is_vip = await _is_vip(db, viewer_id)
+    snapshot = _candidate_snapshot(
+        viewer_id=viewer_id,
+        viewer=viewer,
+        viewer_is_vip=viewer_is_vip,
+        filters=filters,
+        plaza=plaza,
+        nickname=nickname,
+        tag=tag,
+        respect_preferences=respect_preferences,
+    )
+    try:
+        page = await candidate_query_service.fetch_page(
+            db,
+            snapshot,
+            cursor=filters.cursor,
+            page_size=filters.page_size,
+        )
+    except InvalidCandidateCursor as exc:
+        raise HTTPException(400, detail="INVALID_CANDIDATE_CURSOR") from exc
+    return viewer, viewer_is_vip, page
+
+
 async def _fetch_rows(
     db: AsyncSession,
     viewer_id: int,
@@ -268,82 +491,56 @@ async def _fetch_rows(
     tag: str | None = None,
     respect_preferences: bool = True,
 ) -> list[dict[str, Any]]:
-    viewer = await _viewer_context(db, viewer_id)
-    viewer_is_vip = await _is_vip(db, viewer_id)
-    params: dict[str, Any] = {
-        "viewer_id": viewer_id,
-        "viewer_is_vip": int(viewer_is_vip),
-        "candidate_limit": min(500, filters.page * filters.page_size + 1),
-    }
-    clauses = [
-        "u.id <> :viewer_id", "u.status = 1", "COALESCE(c.score, 0) >= 100",
-        "NOT EXISTS (SELECT 1 FROM user_restriction ban WHERE ban.user_id = u.id AND ban.restriction_type = 'TOTAL_BAN' AND ban.status = 1 AND ban.starts_at <= UTC_TIMESTAMP() AND (ban.ends_at IS NULL OR ban.ends_at > UTC_TIMESTAMP()))",
-        "COALESCE(pr.show_profile, 1) = 1",
-        "COALESCE(pr.who_can_see_me, 1) <> 4", "COALESCE(pr.match_status, 1) = 1",
-        "(:viewer_is_vip = 1 OR COALESCE(pr.who_can_see_me, 1) <> 3)",
-        "NOT EXISTS (SELECT 1 FROM user_media pending_media WHERE pending_media.user_id = u.id AND pending_media.deleted_at IS NULL AND pending_media.review_status IN (0, 2, 3))",
-        "NOT EXISTS (SELECT 1 FROM user_block bl WHERE (bl.user_id = :viewer_id AND bl.target_user_id = u.id) OR (bl.user_id = u.id AND bl.target_user_id = :viewer_id))",
-    ]
-    if nickname:
-        clauses.append("u.nickname LIKE CONCAT('%', :search_nickname, '%') ESCAPE '!' ")
-        params["search_nickname"] = _escape_like(nickname)
-    if tag:
-        clauses.append("""(
-            JSON_CONTAINS(p.interest_tags, JSON_QUOTE(:search_tag))
-            OR JSON_CONTAINS(p.personality_tags, JSON_QUOTE(:search_tag))
-            OR JSON_SEARCH(p.tags, 'one', :search_tag) IS NOT NULL
-        )""")
-        params["search_tag"] = tag
-    if viewer.get("gender") in (1, 2):
-        clauses.append("u.gender <> :opposite_gender")
-        params["opposite_gender"] = viewer["gender"]
-    if respect_preferences:
-        clauses.extend([
-            "(vp.age_min IS NULL OR TIMESTAMPDIFF(YEAR, u.birthday, CURDATE()) >= vp.age_min)",
-            "(vp.age_max IS NULL OR TIMESTAMPDIFF(YEAR, u.birthday, CURDATE()) <= vp.age_max)",
-            "(vp.height_min IS NULL OR p.height >= vp.height_min)",
-            "(vp.height_max IS NULL OR p.height <= vp.height_max)",
-            "(vp.education_min IS NULL OR p.education_level >= vp.education_min)",
-            "(vp.income_min IS NULL OR p.income >= vp.income_min)",
-            "(vp.marriage_status IS NULL OR vp.marriage_status = 0 OR u.is_married = vp.marriage_status)",
-            "(vp.preferred_province_code IS NULL OR p.residence_province_code = vp.preferred_province_code)",
-            "(vp.preferred_city_codes IS NULL OR JSON_LENGTH(vp.preferred_city_codes) = 0 OR JSON_CONTAINS(vp.preferred_city_codes, JSON_QUOTE(p.residence_city_code)))",
-        ])
-    if not plaza:
-        clauses.extend([
-            "NOT EXISTS (SELECT 1 FROM user_browse_history bh WHERE bh.user_id = :viewer_id AND bh.target_user_id = u.id)",
-            "NOT EXISTS (SELECT 1 FROM user_swipe_record sw WHERE sw.user_id = :viewer_id AND sw.target_user_id = u.id AND sw.action = 2)",
-            "NOT EXISTS (SELECT 1 FROM match_apply ma WHERE ((ma.from_user_id = :viewer_id AND ma.to_user_id = u.id) OR (ma.from_user_id = u.id AND ma.to_user_id = :viewer_id)) AND ma.status IN (0, 1))",
-        ])
-    clauses.extend(_filter_sql(filters, params))
-    sql = CARD_SELECT + " WHERE " + " AND ".join(clauses) + " LIMIT " + str(params.pop("candidate_limit"))
-    result = await db.execute(text(sql), params)
-    return [dict(row) for row in result.mappings().all()]
+    """Compatibility wrapper for callers that still need a candidate list."""
+    _, _, page = await _candidate_query_page(
+        db,
+        viewer_id,
+        filters,
+        plaza=plaza,
+        nickname=nickname,
+        tag=tag,
+        respect_preferences=respect_preferences,
+    )
+    return page.items
 
 
 async def get_discovery_page(db: AsyncSession, viewer_id: int, filters: DiscoveryFilters, *, plaza: bool) -> DiscoveryPage:
     viewer = await _viewer_context(db, viewer_id)
     if viewer["completion_score"] < 100:
         raise HTTPException(403, detail="请先完善资料后再进入推荐")
-    rows = await _fetch_rows(db, viewer_id, filters, plaza=plaza)
-    scored = [(_candidate_score(viewer, row), row) for row in rows]
-    scored.sort(key=lambda item: (bool(item[1].get("is_boosted")), item[0][0], item[1].get("last_active_at") or datetime.min), reverse=True)
-    start = (filters.page - 1) * filters.page_size
-    selected = scored[start:start + filters.page_size]
-    viewer_is_vip = await _is_vip(db, viewer_id)
+    _, viewer_is_vip, candidate_page = await _candidate_query_page(
+        db, viewer_id, filters, plaza=plaza
+    )
     items = [
-        _card(row, score, reason, detail_locked=bool(row.get("only_vip_can_see_detail")) and not viewer_is_vip)
-        for (score, reason), row in selected
+        _card(
+            row,
+            *_candidate_score(viewer, row),
+            detail_locked=bool(row.get("only_vip_can_see_detail")) and not viewer_is_vip,
+        )
+        for row in candidate_page.items
     ]
-    return DiscoveryPage(items=items, page=filters.page, page_size=filters.page_size, total=len(scored), has_more=start + filters.page_size < len(scored))
+    return DiscoveryPage(
+        items=items,
+        page=candidate_page.page,
+        page_size=candidate_page.page_size,
+        total=candidate_page.total,
+        has_more=candidate_page.has_more,
+        next_cursor=candidate_page.next_cursor,
+        sort_version=candidate_page.sort_version,
+        total_is_estimate=candidate_page.total_is_estimate,
+    )
 
 
 async def search_discovery(db: AsyncSession, viewer_id: int, query: DiscoverySearch) -> DiscoveryPage:
-    filters = DiscoveryFilters(page=query.page, page_size=query.page_size)
+    filters = DiscoveryFilters(
+        cursor=query.cursor,
+        page=query.page,
+        page_size=query.page_size,
+    )
     viewer = await _viewer_context(db, viewer_id)
     if viewer["completion_score"] < 100:
         raise HTTPException(403, detail="请先完善资料后再搜索用户")
-    rows = await _fetch_rows(
+    _, viewer_is_vip, candidate_page = await _candidate_query_page(
         db,
         viewer_id,
         filters,
@@ -352,21 +549,23 @@ async def search_discovery(db: AsyncSession, viewer_id: int, query: DiscoverySea
         tag=query.tag,
         respect_preferences=False,
     )
-    scored = [(_candidate_score(viewer, row), row) for row in rows]
-    scored.sort(key=lambda item: (item[0][0], item[1].get("last_active_at") or datetime.min), reverse=True)
-    start = (query.page - 1) * query.page_size
-    selected = scored[start:start + query.page_size]
-    viewer_is_vip = await _is_vip(db, viewer_id)
     items = [
-        _card(row, score, reason, detail_locked=bool(row.get("only_vip_can_see_detail")) and not viewer_is_vip)
-        for (score, reason), row in selected
+        _card(
+            row,
+            *_candidate_score(viewer, row),
+            detail_locked=bool(row.get("only_vip_can_see_detail")) and not viewer_is_vip,
+        )
+        for row in candidate_page.items
     ]
     return DiscoveryPage(
         items=items,
-        page=query.page,
-        page_size=query.page_size,
-        total=len(scored),
-        has_more=start + query.page_size < len(scored),
+        page=candidate_page.page,
+        page_size=candidate_page.page_size,
+        total=candidate_page.total,
+        has_more=candidate_page.has_more,
+        next_cursor=candidate_page.next_cursor,
+        sort_version=candidate_page.sort_version,
+        total_is_estimate=candidate_page.total_is_estimate,
     )
 
 
@@ -469,8 +668,6 @@ async def view_profile(db: AsyncSession, viewer_id: int, target_id: int) -> Publ
     viewer = await _viewer_context(db, viewer_id)
     score, reason = _candidate_score(viewer, row)
     vip = await _is_vip(db, viewer_id)
-    if row.get("who_can_see_me") == 3 and not vip:
-        raise HTTPException(404, detail="用户不存在或当前不可见")
     privacy_locked = bool(row.get("only_vip_can_see_detail")) and not vip
     quota = None if privacy_locked else await _consume_browse(db, viewer_id, score, vip, target_id)
     full = vip or (not privacy_locked and quota is not None)
@@ -493,49 +690,47 @@ async def _target_rows(db: AsyncSession, viewer_id: int, target_ids: list[int]) 
     if not target_ids:
         return {}
     placeholders = ", ".join(f":target_{index}" for index in range(len(target_ids)))
+    viewer = await _viewer_context(db, viewer_id)
+    visibility = _visibility_predicate(
+        viewer_id,
+        viewer,
+        await _is_vip(db, viewer_id),
+        VisibilityScene.PROFILE,
+    )
     params = {
         "viewer_id": viewer_id,
-        "viewer_is_vip": int(await _is_vip(db, viewer_id)),
         **{f"target_{index}": value for index, value in enumerate(target_ids)},
     }
+    params.update(visibility.params)
     result = await db.execute(
-        text(CARD_SELECT + f""" WHERE u.id IN ({placeholders}) AND u.status = 1
-                 AND COALESCE(pr.who_can_see_me, 1) <> 4
-                 AND NOT EXISTS (SELECT 1 FROM user_restriction ban WHERE ban.user_id = u.id AND ban.restriction_type = 'TOTAL_BAN' AND ban.status = 1 AND ban.starts_at <= UTC_TIMESTAMP() AND (ban.ends_at IS NULL OR ban.ends_at > UTC_TIMESTAMP()))
-                 AND COALESCE(pr.match_status, 1) = 1
-                 AND NOT EXISTS (SELECT 1 FROM user_media pending_media
-                     WHERE pending_media.user_id = u.id AND pending_media.deleted_at IS NULL
-                       AND pending_media.review_status IN (0, 2, 3))
-                 AND (:viewer_is_vip = 1 OR COALESCE(pr.who_can_see_me, 1) <> 3)"""),
+        text(CARD_SELECT + CARD_FROM + f""" WHERE u.id IN ({placeholders})
+                 AND {visibility.clause}"""),
         params,
     )
     return {int(row["user_id"]): dict(row) for row in result.mappings().all()}
 
 
 async def browse_history(db: AsyncSession, viewer_id: int, page: int, page_size: int) -> BrowseHistoryPage:
-    vip = await _is_vip(db, viewer_id)
+    viewer, vip, predicate = await _scene_visibility(
+        db, viewer_id, VisibilityScene.HISTORY
+    )
     offset = (page - 1) * page_size
-    visibility = "" if vip else " AND h.created_at >= CURDATE()"
-    visible = """ AND u.status = 1
-        AND COALESCE(pr.show_profile, 1) = 1
-        AND COALESCE(pr.who_can_see_me, 1) <> 4
-        AND COALESCE(pr.match_status, 1) = 1
-        AND (:viewer_is_vip = 1 OR COALESCE(pr.who_can_see_me, 1) <> 3)
-        AND NOT EXISTS (SELECT 1 FROM user_media pending_media
-                        WHERE pending_media.user_id = u.id AND pending_media.deleted_at IS NULL
-                          AND pending_media.review_status IN (0, 2, 3))
-        AND NOT EXISTS (SELECT 1 FROM user_block bl
-                        WHERE (bl.user_id = :user_id AND bl.target_user_id = u.id)
-                           OR (bl.user_id = u.id AND bl.target_user_id = :user_id))"""
-    params = {"user_id": viewer_id, "viewer_is_vip": int(vip), "limit": page_size, "offset": offset}
+    history_window = "" if vip else " AND h.created_at >= CURDATE()"
+    visible = " AND " + predicate.clause
+    params = {
+        "user_id": viewer_id,
+        **predicate.params,
+        "limit": page_size,
+        "offset": offset,
+    }
     result = await db.execute(text(f"""SELECT h.target_user_id, MAX(h.created_at) AS viewed_at
         FROM user_browse_history h JOIN users u ON u.id = h.target_user_id
         LEFT JOIN user_privacy pr ON pr.user_id = u.id
-        WHERE h.user_id = :user_id{visibility}{visible}
+        LEFT JOIN user_profile_completion c ON c.user_id = u.id
+        WHERE h.user_id = :user_id{history_window}{visible}
         GROUP BY h.target_user_id ORDER BY viewed_at DESC LIMIT :limit OFFSET :offset"""), params)
     rows = list(result.mappings().all())
     targets = await _target_rows(db, viewer_id, [int(row["target_user_id"]) for row in rows])
-    viewer = await _viewer_context(db, viewer_id)
     items = []
     for row in rows:
         target = targets.get(int(row["target_user_id"]))
@@ -545,38 +740,37 @@ async def browse_history(db: AsyncSession, viewer_id: int, page: int, page_size:
     count = await db.execute(text(f"""SELECT COUNT(DISTINCT h.target_user_id)
         FROM user_browse_history h JOIN users u ON u.id = h.target_user_id
         LEFT JOIN user_privacy pr ON pr.user_id = u.id
-        WHERE h.user_id = :user_id{visibility}{visible}"""), {"user_id": viewer_id, "viewer_is_vip": int(vip)})
+        LEFT JOIN user_profile_completion c ON c.user_id = u.id
+        WHERE h.user_id = :user_id{history_window}{visible}"""), params)
     return BrowseHistoryPage(items=items, page=page, page_size=page_size, total=int(count.scalar() or 0))
 
 
 async def visitors(db: AsyncSession, viewer_id: int, page: int, page_size: int) -> VisitorPage:
-    vip = await _is_vip(db, viewer_id)
-    visible = """ AND u.status = 1
-        AND COALESCE(pr.show_profile, 1) = 1
-        AND COALESCE(pr.who_can_see_me, 1) <> 4
-        AND COALESCE(pr.match_status, 1) = 1
-        AND (:viewer_is_vip = 1 OR COALESCE(pr.who_can_see_me, 1) <> 3)
-        AND NOT EXISTS (SELECT 1 FROM user_media pending_media
-                        WHERE pending_media.user_id = u.id AND pending_media.deleted_at IS NULL
-                          AND pending_media.review_status IN (0, 2, 3))
-        AND NOT EXISTS (SELECT 1 FROM user_block bl
-                        WHERE (bl.user_id = :viewer_id AND bl.target_user_id = u.id)
-                           OR (bl.user_id = u.id AND bl.target_user_id = :viewer_id))"""
+    viewer, vip, predicate = await _scene_visibility(
+        db, viewer_id, VisibilityScene.VISITORS
+    )
+    visible = " AND " + predicate.clause
+    params = {"viewer_id": viewer_id, "user_id": viewer_id, **predicate.params}
     count_result = await db.execute(text(f"""SELECT COUNT(DISTINCT h.user_id)
         FROM user_browse_history h JOIN users u ON u.id = h.user_id
         LEFT JOIN user_privacy pr ON pr.user_id = u.id
-        WHERE h.target_user_id = :viewer_id{visible}"""), {"viewer_id": viewer_id, "user_id": viewer_id, "viewer_is_vip": int(vip)})
+        LEFT JOIN user_profile_completion c ON c.user_id = u.id
+        WHERE h.target_user_id = :viewer_id{visible}"""), params)
     count = int(count_result.scalar() or 0)
     if not vip:
         return VisitorPage(can_view_details=False, count=count, items=[], page=page, page_size=page_size, has_more=False)
     result = await db.execute(text(f"""SELECT h.user_id, MAX(h.created_at) AS viewed_at
         FROM user_browse_history h JOIN users u ON u.id = h.user_id
         LEFT JOIN user_privacy pr ON pr.user_id = u.id
+        LEFT JOIN user_profile_completion c ON c.user_id = u.id
         WHERE h.target_user_id = :viewer_id{visible}
-        GROUP BY h.user_id ORDER BY viewed_at DESC LIMIT :limit OFFSET :offset"""), {"viewer_id": viewer_id, "user_id": viewer_id, "viewer_is_vip": 1, "limit": page_size, "offset": (page - 1) * page_size})
+        GROUP BY h.user_id ORDER BY viewed_at DESC LIMIT :limit OFFSET :offset"""), {
+            **params,
+            "limit": page_size,
+            "offset": (page - 1) * page_size,
+        })
     rows = list(result.mappings().all())
     targets = await _target_rows(db, viewer_id, [int(row["user_id"]) for row in rows])
-    viewer = await _viewer_context(db, viewer_id)
     items = [
         BrowseHistoryItem(
             target=_card(
@@ -595,19 +789,8 @@ async def visitors(db: AsyncSession, viewer_id: int, page: int, page_size: int) 
 async def _ensure_target(db: AsyncSession, viewer_id: int, target_id: int) -> None:
     if viewer_id == target_id:
         raise HTTPException(422, detail="不能对自己执行此操作")
-    result = await db.execute(text("""SELECT u.id, COALESCE(pr.who_can_see_me, 1) AS who_can_see_me,
-                COALESCE(pr.match_status, 1) AS match_status,
-                COALESCE(pr.show_profile, 1) AS show_profile
-                FROM users u LEFT JOIN user_privacy pr ON pr.user_id = u.id
-                WHERE u.id = :id AND u.status = 1 FOR UPDATE"""), {"id": target_id})
-    row = result.mappings().first()
-    if not row or row["show_profile"] != 1 or row["who_can_see_me"] == 4 or row["match_status"] != 1:
-        raise HTTPException(404, detail="目标用户不存在")
-    if row["who_can_see_me"] == 3 and not await _is_vip(db, viewer_id):
-        raise HTTPException(404, detail="目标用户不存在")
-    blocked = await db.execute(text("SELECT 1 FROM user_block WHERE (user_id = :viewer_id AND target_user_id = :target_id) OR (user_id = :target_id AND target_user_id = :viewer_id)"), {"viewer_id": viewer_id, "target_id": target_id})
-    if blocked.scalar():
-        raise HTTPException(403, detail="当前用户关系不可操作")
+    if target_id not in await _target_rows(db, viewer_id, [target_id]):
+        raise HTTPException(404, detail="目标用户不存在或当前不可见")
 
 
 async def _lock_user_pair(db: AsyncSession, first_id: int, second_id: int) -> None:
@@ -630,30 +813,28 @@ async def set_favorite(db: AsyncSession, viewer_id: int, target_id: int, enabled
 
 
 async def list_favorites(db: AsyncSession, viewer_id: int, page: int, page_size: int) -> FavoritePage:
-    vip = await _is_vip(db, viewer_id)
-    visible = """ AND u.status = 1
-        AND COALESCE(pr.show_profile, 1) = 1
-        AND COALESCE(pr.who_can_see_me, 1) <> 4
-        AND COALESCE(pr.match_status, 1) = 1
-        AND (:viewer_is_vip = 1 OR COALESCE(pr.who_can_see_me, 1) <> 3)
-        AND NOT EXISTS (SELECT 1 FROM user_media pending_media
-                        WHERE pending_media.user_id = u.id AND pending_media.deleted_at IS NULL
-                          AND pending_media.review_status IN (0, 2, 3))
-        AND NOT EXISTS (SELECT 1 FROM user_block bl
-                        WHERE (bl.user_id = :user_id AND bl.target_user_id = u.id)
-                           OR (bl.user_id = u.id AND bl.target_user_id = :user_id))"""
-    params = {"user_id": viewer_id, "viewer_is_vip": int(vip), "limit": page_size, "offset": (page - 1) * page_size}
+    viewer, vip, predicate = await _scene_visibility(
+        db, viewer_id, VisibilityScene.FAVORITES
+    )
+    visible = " AND " + predicate.clause
+    params = {
+        "user_id": viewer_id,
+        **predicate.params,
+        "limit": page_size,
+        "offset": (page - 1) * page_size,
+    }
     total = int((await db.execute(text(f"""SELECT COUNT(*)
         FROM user_favorite f JOIN users u ON u.id = f.target_user_id
         LEFT JOIN user_privacy pr ON pr.user_id = u.id
+        LEFT JOIN user_profile_completion c ON c.user_id = u.id
         WHERE f.user_id = :user_id AND f.type = 2{visible}"""), params)).scalar() or 0)
     result = await db.execute(text(f"""SELECT f.target_user_id
         FROM user_favorite f JOIN users u ON u.id = f.target_user_id
         LEFT JOIN user_privacy pr ON pr.user_id = u.id
+        LEFT JOIN user_profile_completion c ON c.user_id = u.id
         WHERE f.user_id = :user_id AND f.type = 2{visible}
         ORDER BY f.created_at DESC, f.id DESC LIMIT :limit OFFSET :offset"""), params)
     targets = await _target_rows(db, viewer_id, [int(row[0]) for row in result])
-    viewer = await _viewer_context(db, viewer_id)
     items = [
         _card(
             targets[target_id],
@@ -667,23 +848,27 @@ async def list_favorites(db: AsyncSession, viewer_id: int, page: int, page_size:
 
 async def list_received_favorites(db: AsyncSession, viewer_id: int, page: int, page_size: int) -> FavoriteReceivedPage:
     """Return users who saved the viewer, while applying the same privacy rules as cards."""
-    visible = """ AND u.status = 1
-        AND COALESCE(pr.show_profile, 1) = 1
-        AND COALESCE(pr.who_can_see_me, 1) <> 4
-        AND COALESCE(pr.match_status, 1) = 1
-        AND NOT EXISTS (SELECT 1 FROM user_block bl
-                        WHERE (bl.user_id = :user_id AND bl.target_user_id = u.id)
-                           OR (bl.user_id = u.id AND bl.target_user_id = :user_id))"""
-    params = {"user_id": viewer_id, "limit": page_size, "offset": (page - 1) * page_size}
+    _, _, predicate = await _scene_visibility(
+        db, viewer_id, VisibilityScene.FAVORITES
+    )
+    visible = " AND " + predicate.clause
+    params = {
+        "user_id": viewer_id,
+        **predicate.params,
+        "limit": page_size,
+        "offset": (page - 1) * page_size,
+    }
     total = int((await db.execute(text(f"""SELECT COUNT(*)
         FROM user_favorite f JOIN users u ON u.id = f.user_id
         LEFT JOIN user_privacy pr ON pr.user_id = u.id
+        LEFT JOIN user_profile_completion c ON c.user_id = u.id
         WHERE f.target_user_id = :user_id AND f.type = 2{visible}"""), params)).scalar() or 0)
     result = await db.execute(text(f"""SELECT f.id, f.user_id, u.nickname, u.avatar, u.birthday,
         p.residence_city_code, f.created_at
         FROM user_favorite f JOIN users u ON u.id = f.user_id
         LEFT JOIN user_profile p ON p.user_id = u.id
         LEFT JOIN user_privacy pr ON pr.user_id = u.id
+        LEFT JOIN user_profile_completion c ON c.user_id = u.id
         WHERE f.target_user_id = :user_id AND f.type = 2{visible}
         ORDER BY f.created_at DESC, f.id DESC LIMIT :limit OFFSET :offset"""), params)
     items = [
@@ -779,15 +964,47 @@ async def create_application(db: AsyncSession, viewer_id: int, target_id: int, r
 async def list_applications(db: AsyncSession, viewer_id: int, incoming: bool, page: int, page_size: int) -> ApplicationPage:
     await _expire_pending_applications(db)
     field = "to_user_id" if incoming else "from_user_id"
-    params = {"user_id": viewer_id, "limit": page_size, "offset": (page - 1) * page_size}
-    total = int((await db.execute(text(f"SELECT COUNT(*) FROM match_apply WHERE {field} = :user_id"), params)).scalar() or 0)
+    candidate_alias = "fu" if incoming else "tu"
+    privacy_alias = "fpr" if incoming else "tpr"
+    completion_alias = "fc" if incoming else "tc"
+    _, _, predicate = await _scene_visibility(
+        db,
+        viewer_id,
+        VisibilityScene.INTERACTION,
+        candidate_alias=candidate_alias,
+        privacy_alias=privacy_alias,
+        completion_alias=completion_alias,
+    )
+    visible = " AND " + predicate.clause
+    params = {
+        "user_id": viewer_id,
+        **predicate.params,
+        "limit": page_size,
+        "offset": (page - 1) * page_size,
+    }
+    total = int((await db.execute(text(f"""SELECT COUNT(*)
+        FROM match_apply a
+        JOIN users fu ON fu.id = a.from_user_id
+        LEFT JOIN user_privacy fpr ON fpr.user_id = fu.id
+        LEFT JOIN user_profile_completion fc ON fc.user_id = fu.id
+        JOIN users tu ON tu.id = a.to_user_id
+        LEFT JOIN user_privacy tpr ON tpr.user_id = tu.id
+        LEFT JOIN user_profile_completion tc ON tc.user_id = tu.id
+        WHERE a.{field} = :user_id{visible}"""), params)).scalar() or 0)
     result = await db.execute(text(f"""SELECT a.id, a.from_user_id, a.to_user_id, a.message, a.status, a.expire_at, a.created_at,
         fu.nickname AS from_nickname, fu.avatar AS from_avatar, fu.birthday AS from_birthday, fp.residence_city_code AS from_city_code,
         tu.nickname AS to_nickname, tu.avatar AS to_avatar, tu.birthday AS to_birthday, tp.residence_city_code AS to_city_code
         FROM match_apply a
-        JOIN users fu ON fu.id = a.from_user_id LEFT JOIN user_profile fp ON fp.user_id = fu.id
-        JOIN users tu ON tu.id = a.to_user_id LEFT JOIN user_profile tp ON tp.user_id = tu.id
-        WHERE a.{field} = :user_id ORDER BY a.created_at DESC, a.id DESC LIMIT :limit OFFSET :offset"""), params)
+        JOIN users fu ON fu.id = a.from_user_id
+        LEFT JOIN user_profile fp ON fp.user_id = fu.id
+        LEFT JOIN user_privacy fpr ON fpr.user_id = fu.id
+        LEFT JOIN user_profile_completion fc ON fc.user_id = fu.id
+        JOIN users tu ON tu.id = a.to_user_id
+        LEFT JOIN user_profile tp ON tp.user_id = tu.id
+        LEFT JOIN user_privacy tpr ON tpr.user_id = tu.id
+        LEFT JOIN user_profile_completion tc ON tc.user_id = tu.id
+        WHERE a.{field} = :user_id{visible}
+        ORDER BY a.created_at DESC, a.id DESC LIMIT :limit OFFSET :offset"""), params)
     items = []
     for row in result.mappings().all():
         data = dict(row)
@@ -805,6 +1022,7 @@ async def respond_application(db: AsyncSession, viewer_id: int, application_id: 
         raise HTTPException(404, detail="认识申请不存在")
     if row["status"] != 0:
         raise HTTPException(409, detail="当前申请已处理")
+    await _ensure_target(db, viewer_id, int(row["from_user_id"]))
     status = 1 if accepted else 2
     await db.execute(text("UPDATE match_apply SET status = :status, responded_at = UTC_TIMESTAMP(), updated_at = UTC_TIMESTAMP() WHERE id = :id"), {"status": status, "id": application_id})
     if accepted:
@@ -891,16 +1109,20 @@ async def list_superlikes(db: AsyncSession, viewer_id: int, direction: str, page
         raise ValueError("invalid superlike direction")
     owner_field = "b.user_id" if direction == "sent" else "b.target_user_id"
     other_field = "b.target_user_id" if direction == "sent" else "b.user_id"
-    params = {"user_id": viewer_id, "limit": page_size, "offset": (page - 1) * page_size}
-    where = f"""{owner_field} = :user_id AND u.status = 1
-        AND COALESCE(pr.show_profile, 1) = 1
-        AND COALESCE(pr.match_status, 1) = 1
-        AND NOT EXISTS (SELECT 1 FROM user_block bl
-                        WHERE (bl.user_id = :user_id AND bl.target_user_id = u.id)
-                           OR (bl.user_id = u.id AND bl.target_user_id = :user_id))"""
+    _, _, predicate = await _scene_visibility(
+        db, viewer_id, VisibilityScene.FAVORITES
+    )
+    params = {
+        "user_id": viewer_id,
+        **predicate.params,
+        "limit": page_size,
+        "offset": (page - 1) * page_size,
+    }
+    where = f"{owner_field} = :user_id AND {predicate.clause}"
     total = int((await db.execute(text(f"""SELECT COUNT(*) FROM user_boost b
         JOIN users u ON u.id = {other_field}
         LEFT JOIN user_privacy pr ON pr.user_id = u.id
+        LEFT JOIN user_profile_completion c ON c.user_id = u.id
         WHERE {where}"""), params)).scalar() or 0)
     result = await db.execute(text(f"""SELECT b.id, b.order_no, b.created_at, b.status,
         u.id AS other_id, u.nickname, u.avatar, u.birthday, p.residence_city_code,
@@ -908,6 +1130,7 @@ async def list_superlikes(db: AsyncSession, viewer_id: int, direction: str, page
         FROM user_boost b JOIN users u ON u.id = {other_field}
         LEFT JOIN user_profile p ON p.user_id = u.id
         LEFT JOIN user_privacy pr ON pr.user_id = u.id
+        LEFT JOIN user_profile_completion c ON c.user_id = u.id
         WHERE {where} ORDER BY b.created_at DESC, b.id DESC LIMIT :limit OFFSET :offset"""), params)
     items = [
         SuperLikeItem(

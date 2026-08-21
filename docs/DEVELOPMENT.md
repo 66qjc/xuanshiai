@@ -171,6 +171,34 @@ $env:DOCS_ENABLED = "false"
 uv run uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
+### 10.6 AI 一期真实依赖验收环境（Task 1）
+
+`compose.ai-test.yml` 只用于一期集成测试，不连接本地开发库。它启动 MySQL 8、Redis 7 以及两个独立的 AI Worker 进程：
+
+```powershell
+docker compose -f compose.ai-test.yml up -d mysql redis worker-a worker-b
+docker compose -f compose.ai-test.yml ps
+```
+
+默认映射到 `127.0.0.1:3307`（MySQL）和 `127.0.0.1:6380`（Redis），数据库为 `xuanshiai_ai_test`，root 空密码只在这个临时测试服务中启用。可以用 `AI_TEST_MYSQL_DATABASE`、`AI_TEST_MYSQL_PORT` 和 `AI_TEST_REDIS_PORT` 覆盖默认值。
+
+启动服务后，测试 fixture 会运行现有 `database_setup_marriage.initialize_database()`，然后从真实 MySQL 读取 `information_schema` 并启动真实子进程：
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests/integration/ai/test_ai_schema_real_db.py -q
+.\.venv\Scripts\python.exe -m pytest tests/integration/ai/test_ai_worker_real_db.py -q
+```
+
+测试不在依赖不可用时跳过；连接失败、bootstrap 失败和真实 schema/Worker 合约失败都必须显式暴露。Task 1 的初始 P0 已在 Task 2 收口：补齐 `ai_profile_turn`、`ai_search_result`、projection/session 生命周期字段，active-session 历史唯一约束已兼容；真实 bootstrap、schema、迁移和双 Worker 验收由 `tests/integration/ai/` 覆盖。
+
+停止并清理这组专用服务和测试卷：
+
+```powershell
+docker compose -f compose.ai-test.yml down -v --remove-orphans
+```
+
+如果服务停在 `Created` 或健康检查异常，先执行 `docker compose -f compose.ai-test.yml ps --all` 和 `docker compose -f compose.ai-test.yml logs mysql redis worker-a worker-b`；确认只涉及 `xuanshiai-ai-test-*` 后，再执行上面的 `down -v` 重新建立干净的测试卷。
+
 ## 五、测试与代码检查
 
 运行全部测试：
@@ -262,3 +290,150 @@ logs/        本地日志目录
 使用 Codex 或 Claude Code 修改代码前，必须先阅读项目根目录的 `AGENTS.md` 或 `CLAUDE.md`，并遵守其中引用的 `PROJECT_RULES.md`。
 
 规则正文预留在 `PROJECT_RULES.md`，由项目负责人持续补充。
+
+## 十、AI 功能（画像/搜索/匹配度）运行说明
+
+AI 功能一期全部默认关闭。开发/测试环境可通过 `.env` 打开开关并使用 `mock` Provider；生产环境在 `ai_policy_approved`、`ai_provider_approved`、`ai_retention_policy_version` 未全部满足且 Provider 非 mock 之前，应用配置校验会失败，对外恒返回 `503 AI_FEATURE_DISABLED`（retryable=false），普通资料编辑与手工筛选不受影响。
+
+### 10.1 开关与批准门禁
+
+| 配置项 | 用途 | 默认值 |
+| --- | --- | --- |
+| `AI_MASTER_ENABLED` | AI 总开关 | `false` |
+| `AI_PROFILE_ENABLED` | AI 画像模块开关 | `false` |
+| `AI_SEARCH_ENABLED` | AI 搜索模块开关 | `false` |
+| `AI_COMPATIBILITY_SHADOW_ENABLED` | 匹配度 shadow 模块开关 | `false` |
+| `AI_POLICY_APPROVED` | 合规批准标记（生产启用前置） | `false` |
+| `AI_PROVIDER_APPROVED` | Provider 批准标记（生产启用前置） | `false` |
+| `AI_RETENTION_POLICY_VERSION` | 保留期策略版本（生产启用前置） | 空 |
+| `AI_PROVIDER` | 一期唯一 Provider | `mock` |
+| `AI_AUDIT_ENABLED` | `ai_generation_audit` 审计写入开关 | `true` |
+| `AI_METRICS_BACKLOG_WARN_THRESHOLD` | outbox/purge 积压指标告警阈值 | `1000` |
+
+生产环境启用任一 AI 开关必须同时满足三个批准项且 Provider 不是 mock，否则 `Settings` 校验失败（fail-closed）。`evaluate_ai_release_gate` 在运行期再次校验同一门禁，任何 blocker 都返回 `AI_FEATURE_DISABLED`。
+
+### 10.2 启动 Worker
+
+```powershell
+# 单轮运行（安全空转预览，不访问数据库、不写任何数据）
+uv run python -m app.workers.ai_worker --once --dry-run
+
+# 单轮真实运行（reap 过期租约 → claim → start → 分发已注册 handler）
+uv run python -m app.workers.ai_worker --once
+
+# 常驻循环（默认每 5 秒一轮，可 --idle-seconds 调整）
+uv run python -m app.workers.ai_worker
+
+# 指定每轮领取/回收上限
+uv run python -m app.workers.ai_worker --batch-size 20
+```
+
+- 业务 handler 在导入时全部显式注册：`profile_extract` / `search_parse` /
+  `search_execute` / `compatibility` / `profile_projection`（发布后投影重建）/
+  `cleanup`（删除/撤回物理清理）。独立 `python -m app.workers.ai_worker`
+  进程即可处理全部 `ai_task` 业务任务，不依赖路由导入的副作用注册。
+- 没有已注册业务 handler 时 Worker 绝不触碰数据库（`--once` 非 dry-run 也是纯只读空转）。
+- 任务恢复：Worker 崩溃后过期租约由 reaper 回收转 `retry_wait`，下一轮重新领取；进行中的 handler 由心跳续租保护。
+
+#### 10.2.1 清理消费者（derivation-outbox）
+
+删除/撤回的异步传播（投影失效 + 派生 search/compat 结果标 stale）由
+`derivation_outbox` 消费者循环执行，调度入口在同一个 Worker 进程：
+
+```powershell
+# 单轮安全空转预览（不访问数据库、不写任何数据）
+uv run python -m app.workers.ai_worker --consumers --once --dry-run
+
+# 单轮真实运行（claim 未消费的 outbox 删除事件 → 分发已注册清理 handler）
+uv run python -m app.workers.ai_worker --consumers --once
+
+# 常驻消费循环（默认每 5 秒一轮，可 --idle-seconds 调整）
+uv run python -m app.workers.ai_worker --consumers
+
+# 与业务任务 Worker 并跑时建议各自独立进程（业务任务与清理消费者分开调度）
+uv run python -m app.workers.ai_worker --consumers --idle-seconds 10
+```
+
+- 重复消费由 `derivation_consumer_receipt` 拦截；旧事件（版本落后）写
+  `superseded` 收据，不覆盖新投影。
+- 单轮输出 `claimed=... applied=... superseded=... duplicate=... skipped=...`。
+
+### 10.3 Mock Provider 与测试
+
+```powershell
+$env:ENVIRONMENT = "testing"
+uv run pytest tests/test_ai_release_gates.py -v
+```
+
+- `MockAIProvider` 实现 `structured_extract` / `parse_search_query` / `moderate_text`，并支持 `failures=["timeout","http_429","schema_invalid","policy_blocked"]` 注入失败。
+- 生产环境启用 Mock Provider 会被 `Settings` 校验拒绝；测试库建表使用幂等 `CREATE TABLE IF NOT EXISTS`。
+
+### 10.4 发布验证（不改变生产开关）
+
+```powershell
+uv run python scripts/verify_ai_release.py --environment testing --report artifacts/ai-release-evidence.json
+```
+
+脚本聚合配置门禁、数据库 16 AI + 3 derivation 表、OpenAPI 四路径、隐私矩阵、mock 失败注入、删除回放、shadow 报告和回滚演练证据；任何一项缺失输出稳定 blocker、`release_gate=disabled-until-approved` 且退出码 2，绝不误报通过，也不修改任何开关。
+
+### 10.5 生产禁用运行
+
+```powershell
+$env:ENVIRONMENT = "production"
+$env:DEBUG = "false"
+$env:AUTO_INIT_DB = "false"
+uv run uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+生产 `AUTO_INIT_DB` 必须为 `false`；未批准条件保持 `AI_FEATURE_DISABLED`。回滚：先关闭 `AI_MASTER_ENABLED` 和各模块开关，停止 Worker/消费者，旧 `/discovery/*` 接口与 `legacy-rule-v1` 字段保持可用。
+
+## 11. G5 证据链脚手架（Task 10，2026-08-17 证据治理分支）
+
+> 本节登记 `codex/ai-g5-g7-20260817` 分支的证据链脚手架状态。本轮硬约束：禁止运行 pytest/ruff/python 脚本来验证，禁止构建/容器/微信/稳定性观察。所有"已完成"仅指结构/代码已写，运行验证 NOT_RUN。
+
+### 11.1 证据 schema 与 builder
+
+- `artifacts/schemas/ai-evidence-v1.schema.json`：G0-G7 gates、commandEvidence、hashMap、reviewer、result enum 完整。
+- `scripts/build_ai_evidence.py`：command allowlist、git state、redact、load_command_evidence、validate_evidence_shape、build_evidence、CLI 完整。
+- `tests/test_build_ai_evidence.py`（Task10 Step1）：TDD 失败测试，覆盖 required fields、反例（空 JSON/旧 SHA/未知命令/非零 exit/result≠PASS）、validate_evidence_shape、redact、production+mock blocker、PENDING review blocker。写但不跑。
+
+### 11.2 发布验证 verifier 改造（Task10 Step3）
+
+```powershell
+uv run python scripts/verify_ai_release.py --target internal --report artifacts/ai-internal-readiness.json
+```
+
+- `--target internal|production`（required）；`--environment` 保留为 deprecated 兼容期，`--target` 优先。
+- `target=production` 强制 `environment=production` + provider≠mock + review_status=REVIEWED + result=PASS。
+- `target=internal` 时 environment=development/testing，禁止 production。
+- 新增 evidence bundle 聚合：读取 `artifacts/ai-evidence-bundle.json`（build_ai_evidence 产物），校验 schema、SHA、hash、时效（72h）、所有 Gate（G0-G7）、production approvals。
+- 任何证据缺失 → exit 2 + `disabled-until-approved`，绝不误报 GO。
+- `--environment` 旧用法保留兼容期：`--target production --environment testing` 会强制 production；`--target internal --environment production` 会降级到 testing。
+
+### 11.3 质量集扩充（Task10 Step4）
+
+- `artifacts/ai-profile-quality.json`、`ai-search-quality.json`、`ai-compatibility-shadow-quality.json` 替换为带 `provenance`、`use_limitation`、`reviewed`、`allow_expansion` 的版本化结构。
+- compatibility 保持 `allow_expansion=false`（未过 expansion 阈值）。
+- metrics 全部 null（NOT_RUN），结构占位，不填真实评测数据。
+
+### 11.4 Ruff 修复状态（Task10 Step5）
+
+- 2026-08-19 G5 清零：pyproject 显式钉住经典默认规则集 `select = ["E4", "E7", "E9", "F"]`（ruff 0.16 扩大了默认规则集，全仓出现 818 项新规则告警，其中 655 项 B008 是 FastAPI `Depends` 惯用法；历史契约是经典默认集，钉住以避免随 ruff 版本漂移，不采用 blanket ignore）。钉住集内修复：`profile.py` F402×3（`dataclasses.field` 别名 `dc_field`）、TRY004×2（类型校验改抛 `TypeError`）、E701/E702×22（admin 路由单行多语句拆分）、`test_ai_search_real_db.py` F841×1。
+- `ruff check app tests scripts` → All checks passed。
+
+### 11.5 migration rollback 演练（Task10 Step6 / Task11 Step7）
+
+- `docs/ai/AI_MIGRATION_ROLLBACK.md`：快照/备份引用、每 DDL step 记录、迁移矩阵、中途失败补偿、down 丢列前数据损失范围说明。
+- 2026-08-19 在 disposable DB `xuanshiai_ai_drill`（mysql 127.0.0.1:3307）执行真实演练：fresh up → verify current → repeated up（幂等）→ 注入数据依赖 DDL 故障（重复 `(snapshot_id, rank_position)` 行触发 1062 on `uk_ai_search_result_rank`，历史记 `rollback_failed`）→ 删除重复行恢复 down → verify previous（probe 数据可读）→ restore up → verify current（turn_id 回填 legacy-turn-<id>、generation 复位 1，与 down SQL 注释的损失范围一致）。
+- 快照引用 `/tmp/ai-drill-snapshot-6f8f09c.sql`（sha256 `a5f69feb...`）与全步骤记录在 `artifacts/ai-rollback-drill.json`（result=PASS、blockers=[]、6 步全 PASS）。
+
+### 11.6 G7 稳定性/回滚占位（Task 13）
+
+- `artifacts/ai-stability-report.json`：NOT_RUN 占位，`result: NOT_RUN`，blockers 列出"3-5天观察未开始"等。
+- `artifacts/ai-rollback-drill.json`：2026-08-19 已由真实演练填充（见 §11.5），不再是占位。
+- 3-5 天稳定性观察未开始。production 恒 NO-GO。
+
+### 11.7 Graphify 更新
+
+- 本轮代码/文档变更后需从工作区根 `graphify update .`；本轮硬约束不执行。
+- 登记在 `docs/待完成事项.md` §六。
