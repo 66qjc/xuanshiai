@@ -19,10 +19,10 @@ from app.schemas.ai_profile import ProfileSubject
 
 # 维度定义（personal 和 ideal_partner 共用同一套维度卡片）
 _DIMENSIONS = {
-    "relationship": ("♡", "感情观"),
-    "personality": ("☀", "性格"),
-    "lifestyle": ("⌂", "生活方式"),
-    "future": ("↗", "人生规划"),
+    "relationship": ("relationship", "感情观"),
+    "personality": ("personality", "性格"),
+    "lifestyle": ("lifestyle", "生活方式"),
+    "future": ("future", "人生规划"),
 }
 
 # ideal_partner 期望权重维度
@@ -63,7 +63,11 @@ _SYSTEM_HEADER = (
     "而是「愿意陪你走完一条山线、也会停下来认真拍照的人」。\n"
     "5. 温暖克制：不评判、不制造焦虑、不承诺关系结果；不确定的推断轻描淡写，"
     "不要连用「可能/或许」。\n"
-    "6. 不得编造用户未提供的信息。输出必须是 JSON 格式，不要输出任何 JSON 之外的内容。"
+    "6. 不得编造用户未提供的信息。输出必须是 JSON 格式，不要输出任何 JSON 之外的内容。\n"
+    "7. 成稿必须能被读者指认到本次已确认字段。标题、洞察、标签、结论都要点出"
+    "至少两个具体字段内容（兴趣、城市、职业、生活方式等），禁止写成放之四海而皆准的套话。\n"
+    "8. 某个维度如果本次字段覆盖不到，summary 必须明确写「这一稿还没写到……」，"
+    "不要用性格/生活态度去填空。"
 )
 
 _JSON_FORMAT_INSTRUCTION = (
@@ -73,13 +77,13 @@ _JSON_FORMAT_INSTRUCTION = (
     '  "persona_tags": ["标签1", "标签2", "标签3"],\n'
     '  "insight": "一段50-150字的AI洞察，综合描述这个人",\n'
     '  "dimensions": [\n'
-    '    {"key": "relationship", "icon": "♡", "title": "感情观", '
+    '    {"key": "relationship", "icon": "relationship", "title": "感情观", '
     '"summary": "20-60字的维度解读"},\n'
-    '    {"key": "personality", "icon": "☀", "title": "性格", '
+    '    {"key": "personality", "icon": "personality", "title": "性格", '
     '"summary": "..."},\n'
-    '    {"key": "lifestyle", "icon": "⌂", "title": "生活方式", '
+    '    {"key": "lifestyle", "icon": "lifestyle", "title": "生活方式", '
     '"summary": "..."},\n'
-    '    {"key": "future", "icon": "↗", "title": "人生规划", '
+    '    {"key": "future", "icon": "future", "title": "人生规划", '
     '"summary": "..."}\n'
     "  ],\n"
     '  "ideal_weights": [],\n'
@@ -99,7 +103,9 @@ _JSON_FORMAT_INSTRUCTION = (
     "聊得来、走得动、遇事不慌，这些对你比数字重要得多。」\n"
     "- dimensions：固定4个维度（感情观/性格/生活方式/人生规划），每个维度"
     "20-60字。结合具体字段写成生活化的句子，写到「你」身上或「你期待的那个人」"
-    "身上，不要泛泛而谈。\n"
+    "身上，不要泛泛而谈。"
+    "icon 必须原样使用示例中的四个 token（relationship、personality、lifestyle、future），"
+    "禁止改写成 emoji、HTML/XML 标签或其它英文单词。\n"
     "- ideal_weights：仅当抽取目标为「理想型画像」时填写，"
     "按 5 个维度给出 0-100 的整数，表示你更看重什么。"
     "权重要反映真实侧重：最看重的维度应明显领先（例如 45），"

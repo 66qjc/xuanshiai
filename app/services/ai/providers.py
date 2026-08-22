@@ -150,19 +150,19 @@ _NARRATIVE_FIXTURE_PERSONAL = NarrativeResult(
     insight="你看起来并不依赖高频陪伴,但对于重要的人,你希望彼此能够真正回应。",
     dimensions=(
         NarrativeDimension(
-            key="relationship", icon="♡", title="感情观",
+            key="relationship", icon="relationship", title="感情观",
             summary="希望建立稳定、长期,但彼此保留个人空间的关系。",
         ),
         NarrativeDimension(
-            key="personality", icon="☀", title="性格",
+            key="personality", icon="personality", title="性格",
             summary="慢热,熟悉以后表达欲明显增加。",
         ),
         NarrativeDimension(
-            key="lifestyle", icon="⌂", title="生活方式",
+            key="lifestyle", icon="lifestyle", title="生活方式",
             summary="喜欢相对规律、安静、有自己节奏的生活。",
         ),
         NarrativeDimension(
-            key="future", icon="↗", title="人生规划",
+            key="future", icon="future", title="人生规划",
             summary="对未来有比较明确的方向,希望另一半也拥有自己的目标。",
         ),
     ),
@@ -188,19 +188,19 @@ _NARRATIVE_FIXTURE_IDEAL_PARTNER = NarrativeResult(
     insight="你更看重对方在重要时刻的回应,而不是日常的高频陪伴。",
     dimensions=(
         NarrativeDimension(
-            key="relationship", icon="♡", title="感情观",
+            key="relationship", icon="relationship", title="感情观",
             summary="希望建立稳定、长期,但彼此保留个人空间的关系。",
         ),
         NarrativeDimension(
-            key="personality", icon="☀", title="性格",
+            key="personality", icon="personality", title="性格",
             summary="期待对方情绪稳定,熟悉以后愿意表达。",
         ),
         NarrativeDimension(
-            key="lifestyle", icon="⌂", title="生活方式",
+            key="lifestyle", icon="lifestyle", title="生活方式",
             summary="希望对方有相对规律、安静、有自己节奏的生活。",
         ),
         NarrativeDimension(
-            key="future", icon="↗", title="人生规划",
+            key="future", icon="future", title="人生规划",
             summary="希望另一半也拥有自己的目标与方向。",
         ),
     ),
@@ -470,6 +470,41 @@ _IDEAL_WEIGHT_KEY_BY_LABEL = {
     "外在条件": "appearance",
 }
 
+# 叙事维度 icon 白名单。dots 实测会把 ⌂ 写成 "<Vertex" 这类伪标签，
+# 小程序 rich-text/text 会把它当 HTML 起始标签，页面叠字。
+_NARRATIVE_DIMENSION_ICON_BY_KEY = {
+    "relationship": "relationship",
+    "personality": "personality",
+    "lifestyle": "lifestyle",
+    "future": "future",
+}
+_NARRATIVE_DIMENSION_ICON_ALIASES = {
+    "♡": "relationship",
+    "☀": "personality",
+    "⌂": "lifestyle",
+    "↗": "future",
+    "relationship": "relationship",
+    "personality": "personality",
+    "lifestyle": "lifestyle",
+    "future": "future",
+}
+
+
+def sanitize_narrative_dimension_icon(key: str, icon: Any) -> str:
+    """把模型输出的 emoji / 伪标签归一为维度 token 名，供前端映射 iconfont。"""
+    fallback = _NARRATIVE_DIMENSION_ICON_BY_KEY.get(str(key) or "", "·")
+    if not isinstance(icon, str):
+        return fallback
+    text = icon.strip()
+    if not text or "<" in text or ">" in text or "/" in text:
+        return fallback
+    mapped = _NARRATIVE_DIMENSION_ICON_ALIASES.get(text)
+    if mapped is not None:
+        return mapped
+    if text in _NARRATIVE_DIMENSION_ICON_BY_KEY:
+        return text
+    return fallback
+
 
 def _normalize_narrative_payload(data: Any) -> Any:
     """把模型对叙事 JSON 的常见漂移写法归一为 schema 期望的形状。
@@ -486,12 +521,13 @@ def _normalize_narrative_payload(data: Any) -> Any:
     dims = data.get("dimensions")
     if isinstance(dims, list):
         for item in dims:
-            if (
-                isinstance(item, dict)
-                and "summary" not in item
-                and isinstance(item.get("string"), str)
-            ):
+            if not isinstance(item, dict):
+                continue
+            if "summary" not in item and isinstance(item.get("string"), str):
                 item["summary"] = item.pop("string")
+            item["icon"] = sanitize_narrative_dimension_icon(
+                str(item.get("key") or ""), item.get("icon")
+            )
     if isinstance(data.get("recent_change"), str):
         # 无 direction 的纯文本变化描述无法满足 up|down 约束，按无变化处理。
         data["recent_change"] = None
@@ -646,7 +682,9 @@ class _OpenAICompatProvider:
         self, request: StructuredExtractRequest
     ) -> StructuredExtractResult:
         prompt = build_profile_extract_prompt(
-            request.subject, request.turn_texts
+            request.subject,
+            request.turn_texts,
+            target_field_key=request.target_field_key,
         )
         data = await self._chat_json(prompt)
         fields_data = data.get("fields", []) if isinstance(data, dict) else []

@@ -5,6 +5,7 @@
 - ``POST /profile-sessions``：201 创建/复用会话（要求 profile_text_extract 授权）
 - ``GET /profile-sessions/{session_id}``：200 仅本人
 - ``POST /profile-sessions/{session_id}/turns``：202 turn+task
+- ``POST /profile-sessions/{session_id}/skip-question``：200 跳过当前问题（不确认字段）
 - ``POST /profile-sessions/{session_id}/pause`` / ``resume``：200 会话状态
 - ``DELETE /profile-sessions/{session_id}``：202 cleanup task（软删除幂等）
 - ``GET /profile-drafts/{draft_id}``：200 字段草稿（仅本人）
@@ -42,11 +43,13 @@ from app.schemas.ai_profile import (
     ProfileRevisionPage,
     ProfileSessionCreateRequest,
     ProfileSessionRead,
+    ProfileSkipQuestionRequest,
     ProfileSubject,
     ProfileTurnCreateRequest,
     ProfileTurnSubmissionRead,
 )
 from app.services.ai.flags import AiFeature, AiFeatureDisabledError, require_ai_feature
+from app.services.ai.providers import sanitize_narrative_dimension_icon
 from app.services.ai.profile import (
     AIConsentRequired,
     AIInputError,
@@ -72,6 +75,7 @@ from app.services.ai.profile import (
     publish_profile_draft,
     restore_profile_revision,
     resume_profile_session,
+    skip_profile_question,
     submit_profile_turn,
 )
 from app.services.ai.tasks import TaskError
@@ -296,6 +300,38 @@ async def submit_profile_turn_route(
         poll_after_ms=submission.poll_after_ms,
         expires_at=submission.expires_at,
     )
+
+
+@router.post(
+    "/profile-sessions/{session_id}/skip-question",
+    response_model=ProfileSessionRead,
+    status_code=status.HTTP_200_OK,
+    summary="跳过当前画像问题，不确认该字段",
+)
+async def skip_profile_question_route(
+    session_id: str = Path(..., min_length=1, max_length=64, pattern=r"^[a-z0-9_]+$"),
+    body: ProfileSkipQuestionRequest = Body(...),
+    current: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> ProfileSessionRead:
+    """Skip the current question; progress is unchanged and the field is not asked again."""
+    _require_profile_feature()
+    _check_idempotency_key(idempotency_key)
+    try:
+        session = await skip_profile_question(
+            db, session_id, current.id, body.field_key, idempotency_key or ""
+        )
+    except AIInputError as exc:
+        raise _error_response(exc.code, exc.message, exc.status_code) from exc
+    except ProfileSessionNotFound as exc:
+        raise _error_response(exc.code, exc.message, exc.status_code) from exc
+    except ProfileSessionStale as exc:
+        raise _error_response(exc.code, exc.message, exc.status_code) from exc
+    except AIConsentRequired as exc:
+        raise _error_response(exc.code, exc.message, exc.status_code) from exc
+    await db.commit()
+    return _to_session_read(session)
 
 
 @router.post(
@@ -653,13 +689,23 @@ async def get_profile_narrative_route(
             status="pending",
         )
     data: dict = narrative["data"]
+    raw_dimensions = list(data.get("dimensions") or [])
+    dimensions = []
+    for item in raw_dimensions:
+        if not isinstance(item, dict):
+            continue
+        cleaned = dict(item)
+        cleaned["icon"] = sanitize_narrative_dimension_icon(
+            str(cleaned.get("key") or ""), cleaned.get("icon")
+        )
+        dimensions.append(cleaned)
     return ProfileNarrativeRead(
         subject=subject.value,
         status=str(narrative.get("status") or "published"),
         persona_title=str(data.get("persona_title") or ""),
         persona_tags=list(data.get("persona_tags") or []),
         insight=str(data.get("insight") or ""),
-        dimensions=list(data.get("dimensions") or []),
+        dimensions=dimensions,
         ideal_weights=list(data.get("ideal_weights") or []),
         recent_change=data.get("recent_change"),
         history_observations=list(data.get("history_observations") or []),

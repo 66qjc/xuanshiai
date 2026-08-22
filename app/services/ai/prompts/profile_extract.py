@@ -68,6 +68,7 @@ _JSON_FORMAT_INSTRUCTION = (
 def build_profile_extract_prompt(
     subject: str,
     turn_texts: tuple[str, ...],
+    target_field_key: str | None = None,
 ) -> str:
     """构造画像抽取的完整 prompt（system + user 拼接为单段文本）。
 
@@ -90,10 +91,20 @@ def build_profile_extract_prompt(
     if not turn_block:
         turn_block = "（用户尚未提供回答）"
 
+    target_block = ""
+    if target_field_key and target_field_key in field_guide:
+        target_block = (
+            f"本轮用户正在回答字段 {target_field_key}"
+            f"（{field_guide[target_field_key]}）。"
+            "优先抽取该字段；用户用口语、生活细节或短句作答时，"
+            "也要把能对应到该字段的信息写进 fields，不要因为不够正式就输出空数组。\n\n"
+        )
+
     return (
         f"{_SYSTEM_HEADER}\n\n"
         f"当前抽取目标：{subject_label}。\n"
         f"可抽取的字段及其值格式：\n{field_lines}\n\n"
+        f"{target_block}"
         f"{_JSON_FORMAT_INSTRUCTION}\n\n"
         f"以下是用户的会话回答：\n{turn_block}"
     )

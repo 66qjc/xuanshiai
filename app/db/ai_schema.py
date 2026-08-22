@@ -107,6 +107,7 @@ AI_TABLES = {
             `consent_version` varchar(32) NOT NULL,
             `policy_revision` varchar(64) NOT NULL,
             `current_question_id` varchar(64) DEFAULT NULL,
+            `skipped_field_keys` json DEFAULT NULL COMMENT '用户跳过、本次不再追问的字段',
             `profile_revision` int unsigned NOT NULL DEFAULT '0',
             `preference_revision` int unsigned NOT NULL DEFAULT '0',
             `expires_at` datetime DEFAULT NULL,
@@ -502,6 +503,9 @@ def ensure_ai_projection_columns(cursor: Any) -> None:
 AI_LEGACY_REQUIRED_COLUMNS: dict[str, dict[str, str]] = {
     "ai_consent_grant": {
         "updated_at": "`updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP",
+    },
+    "ai_profile_session": {
+        "skipped_field_keys": "`skipped_field_keys` json DEFAULT NULL COMMENT '用户跳过、本次不再追问的字段'",
     },
     "ai_profile_turn": {
         "turn_id": "`turn_id` varchar(128) NULL COMMENT '稳定的服务端 turn ID'",

@@ -35,6 +35,7 @@ class StructuredExtractRequest:
     policy_revision: str
     allowlist: frozenset[str] = AI_FIELD_ALLOWLIST
     locale: str | None = None
+    target_field_key: str | None = None
 
 
 class ExtractedField(BaseModel):
@@ -153,7 +154,7 @@ class NarrativeDimension(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     key: str = Field(..., min_length=1, max_length=64)
-    icon: str = Field(..., max_length=8)
+    icon: str = Field(..., max_length=16)
     title: str = Field(..., min_length=1, max_length=32)
     summary: str = Field(..., min_length=1, max_length=200)
 

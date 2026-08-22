@@ -52,6 +52,12 @@ from tests.test_ai_profile_sessions import (
     ProfileStore as Task7ProfileStore,
 )
 
+_PUBLISHABLE_CONFIRMED_FIELDS = [
+    {"field_key": "interest_tags", "value": ["看展"], "status": "confirmed"},
+    {"field_key": "city_code", "value": "330100", "status": "confirmed"},
+    {"field_key": "occupation_group", "value": "technology", "status": "confirmed"},
+]
+
 
 class _OneMappingResult(_MappingResult):
     """Adds ``one()``/``one_or_none()`` for ``increment_revision_and_enqueue``."""
@@ -747,20 +753,26 @@ async def test_publish_writes_confirmed_fields_only(profile_store) -> None:
     draft = await profile_store.seed_draft(
         owner_user_id=10,
         subject="personal",
-        fields=[
-            {"field_key": "interest_tags", "value": ["看展"], "status": "confirmed"},
+        fields=_PUBLISHABLE_CONFIRMED_FIELDS + [
             {"field_key": "income", "value": "high", "status": "suggested"},
         ],
         revision=3,
     )
     await profile_store.publish(draft["draft_id"], owner_user_id=10, expected_revision=3)
-    assert await profile_store.published_field_keys(10, "personal") == ["interest_tags"]
+    assert await profile_store.published_field_keys(10, "personal") == [
+        "interest_tags",
+        "city_code",
+        "occupation_group",
+    ]
 
 
 @pytest.mark.asyncio
 async def test_ideal_partner_never_updates_personal_profile(profile_store) -> None:
     draft = await profile_store.seed_draft(
-        owner_user_id=10, subject="ideal_partner", revision=1
+        owner_user_id=10,
+        subject="ideal_partner",
+        fields=_PUBLISHABLE_CONFIRMED_FIELDS,
+        revision=1,
     )
     await profile_store.confirm_all(draft["draft_id"], owner_user_id=10, expected_revision=1)
     await profile_store.publish(draft["draft_id"], owner_user_id=10, expected_revision=2)
@@ -906,7 +918,11 @@ async def test_editable_draft_confirm_and_publish_are_unaffected(profile_store) 
     draft = await profile_store.seed_draft(
         owner_user_id=10,
         subject="personal",
-        fields=[{"field_key": "interest_tags", "value": ["看展"], "status": "suggested"}],
+        fields=[
+            {"field_key": "interest_tags", "value": ["看展"], "status": "suggested"},
+            {"field_key": "city_code", "value": "330100", "status": "suggested"},
+            {"field_key": "occupation_group", "value": "technology", "status": "suggested"},
+        ],
         revision=1,
     )
     updated = await confirm_profile_draft(
@@ -918,7 +934,17 @@ async def test_editable_draft_confirm_and_publish_are_unaffected(profile_store) 
                 field_key="interest_tags",
                 action=ProfileFieldPatchAction.CONFIRM,
                 expected_revision=1,
-            )
+            ),
+            ProfileDraftFieldPatchRequest(
+                field_key="city_code",
+                action=ProfileFieldPatchAction.CONFIRM,
+                expected_revision=1,
+            ),
+            ProfileDraftFieldPatchRequest(
+                field_key="occupation_group",
+                action=ProfileFieldPatchAction.CONFIRM,
+                expected_revision=1,
+            ),
         ],
         expected_revision=1,
     )
@@ -927,7 +953,11 @@ async def test_editable_draft_confirm_and_publish_are_unaffected(profile_store) 
         draft["draft_id"], owner_user_id=10, expected_revision=2
     )
     assert submission.replayed is False
-    assert await profile_store.published_field_keys(10, "personal") == ["interest_tags"]
+    assert await profile_store.published_field_keys(10, "personal") == [
+        "interest_tags",
+        "city_code",
+        "occupation_group",
+    ]
 
 
 @pytest.mark.asyncio
@@ -1029,11 +1059,29 @@ async def test_publish_requires_at_least_one_confirmed_field(profile_store) -> N
 
 
 @pytest.mark.asyncio
+async def test_publish_requires_at_least_three_confirmed_fields(profile_store) -> None:
+    draft = await profile_store.seed_draft(
+        owner_user_id=10,
+        subject="personal",
+        fields=[
+            {"field_key": "interest_tags", "value": ["看展"], "status": "confirmed"},
+            {"field_key": "city_code", "value": "330100", "status": "confirmed"},
+        ],
+        revision=1,
+    )
+    with pytest.raises(AIInputError) as excinfo:
+        await profile_store.publish(draft["draft_id"], owner_user_id=10, expected_revision=1)
+    assert excinfo.value.code == "AI_INPUT_INVALID"
+    assert "3 confirmed" in excinfo.value.message
+    assert await profile_store.published_field_keys(10, "personal") == []
+
+
+@pytest.mark.asyncio
 async def test_publish_same_key_replays_same_task_without_second_revision(profile_store) -> None:
     draft = await profile_store.seed_draft(
         owner_user_id=10,
         subject="personal",
-        fields=[{"field_key": "interest_tags", "value": ["看展"], "status": "confirmed"}],
+        fields=list(_PUBLISHABLE_CONFIRMED_FIELDS),
         revision=1,
     )
     first = await profile_store.publish(
@@ -1048,7 +1096,11 @@ async def test_publish_same_key_replays_same_task_without_second_revision(profil
     assert first.revision is not None
     assert second.revision is None
     assert profile_store.count_revisions(10) == 1
-    assert await profile_store.published_field_keys(10, "personal") == ["interest_tags"]
+    assert await profile_store.published_field_keys(10, "personal") == [
+        "interest_tags",
+        "city_code",
+        "occupation_group",
+    ]
 
 
 @pytest.mark.asyncio
@@ -1056,7 +1108,7 @@ async def test_publish_increments_only_the_subjects_revision(profile_store) -> N
     draft = await profile_store.seed_draft(
         owner_user_id=10,
         subject="personal",
-        fields=[{"field_key": "interest_tags", "value": ["看展"], "status": "confirmed"}],
+        fields=list(_PUBLISHABLE_CONFIRMED_FIELDS),
         revision=1,
     )
     before = dict(profile_store.revision_rows[10])
@@ -1073,7 +1125,7 @@ async def test_publish_pins_revision_consent_and_published_revision_on_projectio
     draft = await profile_store.seed_draft(
         owner_user_id=10,
         subject="personal",
-        fields=[{"field_key": "interest_tags", "value": ["看展"], "status": "confirmed"}],
+        fields=list(_PUBLISHABLE_CONFIRMED_FIELDS),
         revision=1,
     )
     profile_store.drafts_by_id[draft["draft_id"]]["consent_snapshot_json"] = {
@@ -1258,14 +1310,14 @@ async def test_history_lists_only_own_published_revisions(profile_store) -> None
     draft = await profile_store.seed_draft(
         owner_user_id=10,
         subject="personal",
-        fields=[{"field_key": "interest_tags", "value": ["看展"], "status": "confirmed"}],
+        fields=list(_PUBLISHABLE_CONFIRMED_FIELDS),
         revision=1,
     )
     await profile_store.publish(draft["draft_id"], owner_user_id=10, expected_revision=1)
     page = await list_profile_revisions(profile_store.db, 10)
     assert page.total == 1
     assert page.items[0].revision_no == 1
-    assert page.items[0].field_count == 1
+    assert page.items[0].field_count == 3
     foreign = await list_profile_revisions(profile_store.db, 11)
     assert foreign.total == 0
     assert foreign.items == []
@@ -1276,7 +1328,7 @@ async def test_restore_creates_new_draft_without_touching_old_revision(profile_s
     draft = await profile_store.seed_draft(
         owner_user_id=10,
         subject="personal",
-        fields=[{"field_key": "interest_tags", "value": ["看展"], "status": "confirmed"}],
+        fields=list(_PUBLISHABLE_CONFIRMED_FIELDS),
         revision=1,
     )
     submission = await profile_store.publish(

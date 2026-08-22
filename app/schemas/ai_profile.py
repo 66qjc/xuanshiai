@@ -218,6 +218,12 @@ class ProfileTurnCreateRequest(BaseModel):
     answer_text: str = Field(..., min_length=1, max_length=2000)
 
 
+class ProfileSkipQuestionRequest(BaseModel):
+    """Skip the current interview question without confirming a field."""
+
+    field_key: str = Field(..., min_length=1, max_length=64)
+
+
 class ProfileSessionRead(BaseModel):
     session_id: str
     subject: ProfileSubject

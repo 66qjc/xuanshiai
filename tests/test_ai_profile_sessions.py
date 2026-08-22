@@ -48,6 +48,7 @@ from app.services.ai.profile import (
     ProfileSessionStatus,
     create_profile_session,
     extract_profile_turn,
+    load_owned_session,
     next_profile_question,
     normalize_profile_answer,
     progress_value,
@@ -434,6 +435,14 @@ class FakeProfileSession:
                 candidates.sort(key=lambda d: d["updated_at"], reverse=True)
                 return _MappingResult([{"draft_id": candidates[0]["draft_id"]}])
             return _MappingResult([])
+        if "FROM ai_profile_draft_field" in sql and "WHERE draft_id = :draft_id" in sql:
+            rows = []
+            for field in self._store.fields_for_draft(str(values["draft_id"])):
+                row = dict(field)
+                if "value_json" not in row:
+                    row["value_json"] = json.dumps(field.get("value"), ensure_ascii=False)
+                rows.append(row)
+            return _MappingResult(rows)
         if "FROM ai_profile_draft_field" in sql:
             return _MappingResult(self._store.field_keys(str(values["session_id"])))
         raise AssertionError(f"unhandled sql: {sql}")
@@ -515,6 +524,7 @@ class ProfileStore:
             "consent_version": consent_version,
             "policy_revision": "ai-policy-2026-08-07-v1",
             "current_question_id": None,
+            "skipped_field_keys": None,
             "profile_revision": int(profile_revision),
             "preference_revision": int(preference_revision),
             "expires_at": expires_at or now + timedelta(days=7),
@@ -579,6 +589,7 @@ class ProfileStore:
             "consent_version": str(params["consent_version"]),
             "policy_revision": str(params["policy_revision"]),
             "current_question_id": None,
+            "skipped_field_keys": params.get("skipped_field_keys"),
             "profile_revision": int(params["profile_revision"]),
             "preference_revision": int(params["preference_revision"]),
             "expires_at": params.get("expires_at"),
@@ -683,6 +694,8 @@ class ProfileStore:
             row["ended_at"] = _now()
         elif "SET status = :status" in sql:
             row["status"] = str(params["status"])
+        elif "skipped_field_keys = :skipped_field_keys" in sql:
+            row["skipped_field_keys"] = params.get("skipped_field_keys")
         else:
             raise AssertionError(f"unhandled session update: {sql}")
         row["updated_at"] = _now()
@@ -1229,6 +1242,223 @@ async def test_extraction_rejects_forged_result_schema_version_at_worker_boundar
     assert result["task"]["error_code"] == "AI_INPUT_INVALID"
     assert profile_store.drafts == []
     assert profile_store.draft_fields == []
+
+
+async def _seed_extract_task(
+    profile_store: ProfileStore,
+    *,
+    session: dict[str, Any],
+    turn: dict[str, Any],
+    idempotency_key: str,
+) -> AiTaskRecord:
+    return await profile_store.task_store.seed(
+        status="running",
+        lease_owner="worker-1",
+        lease_until=_now() + timedelta(seconds=60),
+        task_type="profile_extract",
+        idempotency_key=idempotency_key,
+        request_digest=idempotency_key,
+        consent_snapshot_json={
+            "scope": "profile_text_extract",
+            "version": "profile-text-v1",
+            "policy_revision": "ai-policy-2026-08-07-v1",
+        },
+        source_revision_json={
+            "profile": 1,
+            "preference": 0,
+            "privacy": 0,
+            "relationship": 0,
+            "policy": 0,
+        },
+        payload_summary={
+            "session_id": session["session_id"],
+            "turn_id": turn["turn_id"],
+            "client_turn_id": turn["client_turn_id"],
+            "subject": "personal",
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_empty_extraction_falls_back_to_asked_tag_field(
+    profile_store, monkeypatch
+) -> None:
+    """口语化回答抽不出字段时，把本轮所问的标签字段写成 suggested，避免同一题死循环。"""
+    session = await profile_store.seed_session(
+        owner_user_id=10, subject="personal", status="extracting"
+    )
+    turn = await profile_store.seed_turn(session["session_id"], "turn-001", "吃饭睡觉")
+    task = await _seed_extract_task(
+        profile_store, session=session, turn=turn, idempotency_key="extract-empty-tags"
+    )
+    monkeypatch.setattr(
+        profile_mod,
+        "AIGateway",
+        _stub_gateway(
+            InvokeOutcome(
+                result=StructuredExtractResult(
+                    schema_version="profile-extract-v1", fields=()
+                )
+            )
+        ),
+    )
+    result_ref, _revisions = await extract_profile_turn(
+        profile_store.db, task, "worker-1"
+    )
+    assert result_ref.startswith("profile-draft:")
+    keys = {field["field_key"] for field in profile_store.draft_fields}
+    assert keys == {"interest_tags"}
+    stored = profile_store.draft_fields[0]
+    assert stored["confirmation_status"] == "suggested"
+    assert stored["value"] == ["吃饭睡觉"]
+    loaded = await load_owned_session(profile_store.db, session["session_id"], 10)
+    assert loaded.current_question is not None
+    assert loaded.current_question.field_key != "interest_tags"
+
+
+@pytest.mark.asyncio
+async def test_empty_extraction_for_non_tag_field_does_not_write_draft(
+    profile_store, monkeypatch
+) -> None:
+    """非标签题抽空时不得写空草稿，否则下一问仍停在同一题。"""
+    session = await profile_store.seed_session(
+        owner_user_id=10, subject="personal", status="extracting"
+    )
+    profile_store.insert_draft(
+        {
+            "draft_id": "dr_existing",
+            "user_id": 10,
+            "subject": "personal",
+            "session_id": session["session_id"],
+            "consent_snapshot_json": "{}",
+            "policy_revision": "ai-policy-2026-08-07-v1",
+            "prompt_version": "profile-extract-prompt-v1",
+            "schema_version": "profile-extract-v1",
+        }
+    )
+    profile_store.insert_draft_field(
+        {
+            "draft_id": "dr_existing",
+            "field_key": "interest_tags",
+            "subject": "personal",
+            "value_json": json.dumps(["旅行"], ensure_ascii=False),
+            "display_value": "旅行",
+            "source_turn_ids": json.dumps(["turn-0"], ensure_ascii=False),
+            "source_span": "旅行",
+            "confidence": 0.9,
+            "visibility": "self",
+            "consent_scope": "profile_text_extract",
+            "schema_version": "profile-extract-v1",
+            "prompt_version": "profile-extract-prompt-v1",
+            "content_hash": "hash",
+            "confirmation_status": "suggested",
+        }
+    )
+    turn = await profile_store.seed_turn(session["session_id"], "turn-city", "还没想好")
+    task = await _seed_extract_task(
+        profile_store, session=session, turn=turn, idempotency_key="extract-empty-city"
+    )
+    monkeypatch.setattr(
+        profile_mod,
+        "AIGateway",
+        _stub_gateway(
+            InvokeOutcome(
+                result=StructuredExtractResult(
+                    schema_version="profile-extract-v1", fields=()
+                )
+            )
+        ),
+    )
+    result = await extract_profile_turn(profile_store.db, task, "worker-1")
+    assert result is None
+    final = await profile_store.task_store.get(task.task_id)
+    assert final is not None
+    assert final["status"] == "failed"
+    assert final["error_code"] == "AI_INPUT_INVALID"
+    assert {field["field_key"] for field in profile_store.draft_fields} == {"interest_tags"}
+    loaded = await load_owned_session(profile_store.db, session["session_id"], 10)
+    assert loaded.current_question is not None
+    assert loaded.current_question.field_key == "city_code"
+
+
+@pytest.mark.asyncio
+async def test_extraction_accumulates_fields_on_latest_draft(
+    profile_store, monkeypatch
+) -> None:
+    """后一轮抽取必须带上本会话已有字段，确认/成稿不能只看到最新一题。"""
+    session = await profile_store.seed_session(
+        owner_user_id=10, subject="personal", status="extracting"
+    )
+    first_turn = await profile_store.seed_turn(
+        session["session_id"], "turn-001", "喜欢旅行"
+    )
+    first_task = await _seed_extract_task(
+        profile_store, session=session, turn=first_turn, idempotency_key="extract-key-001"
+    )
+    first_field = ExtractedField(
+        field_key="interest_tags",
+        subject=ProfileSubject.PERSONAL,
+        value=["旅行"],
+        source_quote="喜欢旅行",
+        confirmation_status="suggested",
+    )
+    monkeypatch.setattr(
+        profile_mod,
+        "AIGateway",
+        _stub_gateway(
+            InvokeOutcome(
+                result=StructuredExtractResult(
+                    schema_version="profile-extract-v1", fields=(first_field,)
+                )
+            )
+        ),
+    )
+    first_ref, _first_revisions = await extract_profile_turn(
+        profile_store.db, first_task, "worker-1"
+    )
+    assert first_ref.startswith("profile-draft:")
+    session_row = profile_store.sessions[session["session_id"]]
+    session_row["status"] = "extracting"
+    second_turn = await profile_store.seed_turn(
+        session["session_id"], "turn-002", "我在杭州"
+    )
+    second_task = await _seed_extract_task(
+        profile_store,
+        session=session,
+        turn=second_turn,
+        idempotency_key="extract-key-002",
+    )
+    city_field = ExtractedField(
+        field_key="city_code",
+        subject=ProfileSubject.PERSONAL,
+        value="330100",
+        source_quote="我在杭州",
+        confirmation_status="suggested",
+    )
+    monkeypatch.setattr(
+        profile_mod,
+        "AIGateway",
+        _stub_gateway(
+            InvokeOutcome(
+                result=StructuredExtractResult(
+                    schema_version="profile-extract-v1", fields=(city_field,)
+                )
+            )
+        ),
+    )
+    second_ref, _second_revisions = await extract_profile_turn(
+        profile_store.db, second_task, "worker-1"
+    )
+    assert second_ref.startswith("profile-draft:")
+    latest = max(profile_store.drafts, key=lambda row: row["updated_at"])
+    keys = {
+        field["field_key"]
+        for field in profile_store.fields_for_draft(latest["draft_id"])
+    }
+    assert keys == {"interest_tags", "city_code"}
+    loaded = await load_owned_session(profile_store.db, session["session_id"], 10)
+    assert loaded.current_question is not None
+    assert loaded.current_question.field_key not in {"interest_tags", "city_code"}
 
 
 @pytest.mark.asyncio

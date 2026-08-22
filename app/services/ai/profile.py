@@ -61,7 +61,12 @@ from app.schemas.ai_profile import (
     ProfileSubject,
     normalize_profile_extracted_value,
 )
-from app.services.ai.base import AITaskContext, NarrativeRequest, StructuredExtractRequest
+from app.services.ai.base import (
+    AITaskContext,
+    ExtractedField,
+    NarrativeRequest,
+    StructuredExtractRequest,
+)
 from app.services.ai.features import (
     ProjectionBuildError,
     _load_latest_revision,
@@ -215,7 +220,7 @@ _PROFILE_QUESTION_BANK: dict[str, ProfileQuestion] = {
 
 _SESSION_COLUMNS = (
     "session_id, user_id, subject, input_mode, status, active_status, "
-    "consent_version, policy_revision, current_question_id, "
+    "consent_version, policy_revision, current_question_id, skipped_field_keys, "
     "profile_revision, preference_revision, expires_at, ended_at, "
     "created_at, updated_at"
 )
@@ -407,6 +412,8 @@ class ProfileSession:
     # 由 ``_load_active_draft_id_for_session`` 在装配 session 时回填，路由层
     # 透传到 ``ProfileSessionRead.draft_id``。
     draft_id: str | None = None
+    # 用户点「不想答」跳过的字段。不计入 confirmed，也不再作为下一问。
+    skipped_keys: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -633,13 +640,15 @@ def assert_session_transition(source: ProfileSessionStatus, target: ProfileSessi
 
 
 def next_profile_question(session: ProfileSession) -> ProfileQuestion | None:
-    """Return the first missing-field question; never repeats confirmed fields.
+    """Return the first missing-field question; never repeats confirmed or skipped fields.
 
     The question bank is ordered and fixed; the result is real coverage of the
-    frozen allowlist, never a timer-based fake progress.
+    frozen allowlist, never a timer-based fake progress. Skipped fields stay
+    unanswered (progress unchanged) and are not asked again in this session.
     """
+    skipped = session.skipped_keys
     for field_key, question in _PROFILE_QUESTION_BANK.items():
-        if field_key not in session.field_keys:
+        if field_key not in session.field_keys and field_key not in skipped:
             return question
     return None
 
@@ -802,6 +811,20 @@ def _subject(value: Any) -> ProfileSubject:
     return ProfileSubject(str(value))
 
 
+def _parse_skipped_keys(value: Any) -> frozenset[str]:
+    """Parse session.skipped_field_keys JSON into an allowlisted frozenset."""
+    parsed = _maybe_json(value)
+    if parsed is None:
+        return frozenset()
+    if isinstance(parsed, str):
+        parsed = [parsed]
+    if not isinstance(parsed, list):
+        return frozenset()
+    return frozenset(
+        str(item) for item in parsed if str(item) in AI_FIELD_ALLOWLIST
+    )
+
+
 def _session_from_row(
     row: dict[str, Any],
     *,
@@ -830,6 +853,7 @@ def _session_from_row(
         created_at=row.get("created_at"),
         updated_at=row.get("updated_at"),
         draft_id=draft_id,
+        skipped_keys=_parse_skipped_keys(row.get("skipped_field_keys")),
     )
     object.__setattr__(session, "current_question", next_profile_question(session))
     return session
@@ -1259,6 +1283,84 @@ def _content_hash(field_key: str, subject: str, value: Any, source_turn_ids: tup
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
+def _incoming_extract_fields(result: Any) -> tuple[Any, ...]:
+    return tuple(getattr(result, "fields", ()) or ())
+
+
+def _fallback_tag_field(session: ProfileSession, turn: ProfileTurn) -> ExtractedField | None:
+    """口语化回答抽不出字段时，把本轮所问的标签字段写成 suggested。"""
+    question = session.current_question
+    if question is None or question.field_key not in _TAG_LIST_FIELDS:
+        return None
+    answer = (turn.answer_text or "").strip()
+    if not answer:
+        return None
+    return ExtractedField(
+        field_key=question.field_key,
+        subject=session.subject,
+        value=(answer,),
+        source_quote=answer,
+        source_span=answer,
+        confidence=0.4,
+        needs_confirmation=True,
+        confirmation_status=ProfileFieldConfirmationStatus.SUGGESTED.value,
+        schema_version=PROFILE_SCHEMA_VERSION,
+        prompt_version=PROFILE_PROMPT_VERSION,
+        policy_revision=session.policy_revision or PROFILE_POLICY_REVISION,
+    )
+
+
+async def _copy_unreplaced_draft_fields(
+    db: AsyncSession,
+    *,
+    source_draft_id: str,
+    target_draft_id: str,
+    replaced_keys: set[str],
+) -> None:
+    rows = await _load_draft_field_rows(db, source_draft_id)
+    for row in rows:
+        field_key = str(row["field_key"])
+        if field_key in replaced_keys:
+            continue
+        await db.execute(
+            text(
+                "INSERT INTO ai_profile_draft_field "
+                "(draft_id, field_key, subject, value_json, display_value, source_type, "
+                " source_turn_ids, source_span, confidence, visibility, consent_scope, schema_version, "
+                " prompt_version, content_hash, confirmation_status, created_at, updated_at) "
+                "VALUES (:draft_id, :field_key, :subject, :value_json, :display_value, "
+                " :source_type, :source_turn_ids, :source_span, :confidence, :visibility, "
+                " :consent_scope, :schema_version, :prompt_version, :content_hash, "
+                " :confirmation_status, UTC_TIMESTAMP(), UTC_TIMESTAMP())"
+            ),
+            {
+                "draft_id": target_draft_id,
+                "field_key": field_key,
+                "subject": row.get("subject"),
+                "value_json": (
+                    row.get("value_json")
+                    if isinstance(row.get("value_json"), str)
+                    else json.dumps(row.get("value_json") or row.get("value"), ensure_ascii=False)
+                ),
+                "display_value": row.get("display_value"),
+                "source_type": row.get("source_type") or "user_answer",
+                "source_turn_ids": (
+                    row.get("source_turn_ids")
+                    if isinstance(row.get("source_turn_ids"), str)
+                    else json.dumps(list(row.get("source_turn_ids") or []), ensure_ascii=False)
+                ),
+                "source_span": row.get("source_span"),
+                "confidence": float(row.get("confidence") or 0.0),
+                "visibility": row.get("visibility") or "self",
+                "consent_scope": row.get("consent_scope") or PROFILE_CONSENT_SCOPE,
+                "schema_version": row.get("schema_version") or PROFILE_SCHEMA_VERSION,
+                "prompt_version": row.get("prompt_version") or PROFILE_PROMPT_VERSION,
+                "content_hash": row.get("content_hash"),
+                "confirmation_status": row.get("confirmation_status") or "suggested",
+            },
+        )
+
+
 async def _write_draft(
     db: AsyncSession,
     session: ProfileSession,
@@ -1291,7 +1393,8 @@ async def _write_draft(
     )
     source_turn_ids = (turn.turn_id,)
     consent_scope = consent_snapshot.get("scope") or PROFILE_CONSENT_SCOPE
-    for field in result.fields:
+    written_keys: set[str] = set()
+    for field in _incoming_extract_fields(result):
         value = getattr(field, "value", None)
         # 主体隔离在字段标签层强制：写草稿字段一律以会话 subject 为准，忽略
         # provider 返回的 subject（mock provider 恒返回 personal，若信任它，
@@ -1338,6 +1441,15 @@ async def _write_draft(
                 "prompt_version": PROFILE_PROMPT_VERSION,
                 "content_hash": _content_hash(field.field_key, subject, value, source_turn_ids),
             },
+        )
+        written_keys.add(field.field_key)
+    previous_draft_id = session.draft_id
+    if previous_draft_id:
+        await _copy_unreplaced_draft_fields(
+            db,
+            source_draft_id=previous_draft_id,
+            target_draft_id=draft_id,
+            replaced_keys=written_keys,
         )
     return draft_id
 
@@ -1394,6 +1506,9 @@ async def extract_profile_turn(
         turn_texts=(turn.answer_text,),
         consent_version=session.consent_version,
         policy_revision=session.policy_revision or PROFILE_POLICY_REVISION,
+        target_field_key=(
+            session.current_question.field_key if session.current_question else None
+        ),
     )
     gateway = AIGateway(timeout_seconds=settings.ai_gateway_timeout_seconds)
     outcome = await gateway.structured_extract(context, request)
@@ -1448,6 +1563,14 @@ async def extract_profile_turn(
                 raise ValueError("provider confirmation status is not suggested")
             if not field.needs_confirmation:
                 raise ValueError("provider field does not require confirmation")
+        if not fields:
+            fallback = _fallback_tag_field(session, turn)
+            if fallback is None:
+                raise ValueError("provider returned no extractable fields")
+            fields = (fallback,)
+            extract_result = outcome.result.model_copy(update={"fields": fields})
+        else:
+            extract_result = outcome.result
     except (AttributeError, TypeError, ValueError):
         # Provider provenance must describe this exact session.  Do not rewrite
         # a foreign subject or accept fabricated version evidence into a draft.
@@ -1457,7 +1580,7 @@ async def extract_profile_turn(
         )
         return None
 
-    draft_id = await _write_draft(db, session, turn, outcome.result)
+    draft_id = await _write_draft(db, session, turn, extract_result)
     if session.status is ProfileSessionStatus.EXTRACTING:
         assert_session_transition(
             session.status, ProfileSessionStatus.AWAITING_CONFIRMATION
@@ -1471,6 +1594,42 @@ async def extract_profile_turn(
 # ----------------------------------------------------------------------
 # 暂停 / 恢复 / 软删除
 # ----------------------------------------------------------------------
+
+
+async def skip_profile_question(
+    db: AsyncSession,
+    session_id: str,
+    owner_user_id: int,
+    field_key: str,
+    idempotency_key: str,
+) -> ProfileSession:
+    """Skip the current interview question without confirming a field.
+
+    跳过不写草稿、不计入 confirmed 覆盖度；同一会话内该字段不再追问。
+    重复跳过当前已跳过字段时幂等返回当前会话。不 commit。
+    """
+    del idempotency_key
+    session = await load_owned_active_session(db, session_id, owner_user_id)
+    if session.current_question is None:
+        raise AIInputError("当前没有可跳过的问题")
+    if field_key not in AI_FIELD_ALLOWLIST:
+        raise AIInputError("field_key 不在允许的画像字段内")
+    if session.current_question.field_key != field_key:
+        raise AIInputError("只能跳过当前问题")
+    if field_key in session.skipped_keys:
+        return session
+    skipped = sorted(session.skipped_keys | {field_key})
+    await db.execute(
+        text(
+            "UPDATE ai_profile_session SET skipped_field_keys = :skipped_field_keys, "
+            "updated_at = UTC_TIMESTAMP() WHERE session_id = :session_id"
+        ),
+        {
+            "session_id": session_id,
+            "skipped_field_keys": json.dumps(skipped, ensure_ascii=False),
+        },
+    )
+    return await load_owned_session(db, session_id, owner_user_id)
 
 
 async def pause_profile_session(
@@ -1585,6 +1744,8 @@ def ensure_revision(current: int, expected: int) -> None:
 # 可编辑/可发布草稿状态白名单。deleted/published/cancelled 等终态草稿只读
 # （文档 §7「已发布/已删除草稿只读」），不允许再 PATCH 或 publish。
 _DRAFT_EDITABLE_STATUSES = frozenset({"draft", "awaiting_confirmation"})
+# 成稿最低确认字段数：一题一字段，至少 3 笔才够写一篇不空转的叙事。
+MIN_CONFIRMED_FIELDS_TO_PUBLISH = 3
 
 
 def ensure_draft_editable(draft: ProfileDraft, operation: str) -> None:
@@ -2329,8 +2490,10 @@ async def publish_profile_draft(
     ensure_draft_editable(draft, "发布")
     ensure_revision(draft.revision, expected_revision)
     fields = confirmed_fields(draft)
-    if not fields:
-        raise AIInputError("at least one confirmed field is required")
+    if len(fields) < MIN_CONFIRMED_FIELDS_TO_PUBLISH:
+        raise AIInputError(
+            f"at least {MIN_CONFIRMED_FIELDS_TO_PUBLISH} confirmed fields are required"
+        )
     current_revision = await _load_revision_vector(db, owner_user_id)
     # Reserve the unique task key before mutating the immutable revision. The
     # unique owner/type/key constraint plus the draft lock makes the whole

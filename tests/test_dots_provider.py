@@ -25,6 +25,7 @@ from app.services.ai.providers import (
     AIProviderRegistry,
     DotsAIProvider,
     get_provider,
+    sanitize_narrative_dimension_icon,
 )
 from openai import RateLimitError
 
@@ -271,6 +272,34 @@ def _narrative_payload_with_drifts() -> str:
         '  {"revision_id": "version2", "keywords": ["年龄", "城市"],'
         '   "observation": "在版本2中，用户画像确认为杭州居民，追求稳定生活。"}]}'
     )
+
+
+@pytest.mark.asyncio
+async def test_narrative_invalid_dimension_icon_normalized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """dots 把 ⌂ 写成 <Vertex 时回落到约定符号，避免小程序当 HTML 标签渲染。"""
+    payload = _narrative_payload_with_drifts().replace(
+        '{"key": "lifestyle", "icon": "⌂", "title": "生活方式",',
+        '{"key": "lifestyle", "icon": "<Vertex", "title": "生活方式",',
+    )
+    settings = _settings_with_dots_key()
+    monkeypatch.setattr("app.services.ai.providers.settings", settings)
+    provider = DotsAIProvider(client=_make_mock_client(payload))
+    result = await provider.generate_narrative(_narrative_request())
+    lifestyle = [d for d in result.dimensions if d.key == "lifestyle"][0]
+    assert lifestyle.icon == "lifestyle"
+
+
+def test_sanitize_narrative_dimension_icon_emits_tokens_not_emoji() -> None:
+    """成稿维度 icon 契约：只回 token 名，emoji / 伪标签一律归一。"""
+    assert sanitize_narrative_dimension_icon("lifestyle", "<Vertex") == "lifestyle"
+    assert sanitize_narrative_dimension_icon("lifestyle", "⌂") == "lifestyle"
+    assert sanitize_narrative_dimension_icon("relationship", "♡") == "relationship"
+    assert sanitize_narrative_dimension_icon("personality", "☀") == "personality"
+    assert sanitize_narrative_dimension_icon("future", "↗") == "future"
+    assert sanitize_narrative_dimension_icon("relationship", "relationship") == "relationship"
+    assert sanitize_narrative_dimension_icon("unknown", "♥") == "·"
 
 
 @pytest.mark.asyncio
