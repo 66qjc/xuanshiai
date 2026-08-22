@@ -72,11 +72,19 @@ from openai import (  # noqa: E402
 )
 
 
-def _build_openai_compat_client(api_key: Any, base_url: str) -> AsyncOpenAI:
-    """构造 OpenAI 兼容 API 的异步客户端（DeepSeek / Dots 共用）。"""
+def _build_openai_compat_client(
+    api_key: Any, base_url: str, *, timeout: float = 30.0
+) -> AsyncOpenAI:
+    """构造 OpenAI 兼容 API 的异步客户端（DeepSeek / Dots 共用）。
+
+    timeout 必须显式传入——SDK 默认 600s，配合 worker 心跳续租会形成
+    "合法死锁"（挂起调用占住 worker 10 分钟）。由 settings.ai_gateway_timeout_seconds
+    提供（默认 30.0，范围 0-120）。
+    """
     return AsyncOpenAI(
         api_key=api_key.get_secret_value() if hasattr(api_key, "get_secret_value") else api_key,
         base_url=base_url,
+        timeout=timeout,
     )
 
 # Deterministic fixture field values for profile extraction. Keys are the
@@ -444,7 +452,11 @@ def _safe_confidence(value: Any) -> float:
 
 
 def _parse_json_response(content: str) -> Any:
-    """解析 OpenAI 兼容 provider 返回的 JSON 内容，空内容或格式错误转为 ProviderError。"""
+    """解析 OpenAI 兼容 provider 返回的 JSON 内容。
+
+    空内容视为 provider 未生成有效输出(NON_RETRYABLE,配置问题);
+    非合法 JSON 视为偶发输出漂移(RETRYABLE,重试可能成功)。
+    """
     if not content or not content.strip():
         raise ProviderError(
             code="AI_INPUT_INVALID",
@@ -455,9 +467,9 @@ def _parse_json_response(content: str) -> Any:
         return json.loads(content)
     except (ValueError, TypeError) as exc:
         raise ProviderError(
-            code="AI_INPUT_INVALID",
+            code="AI_TEMPORARILY_UNAVAILABLE",
             message=f"provider 返回非合法 JSON: {exc}",
-            kind=ProviderErrorKind.NON_RETRYABLE,
+            kind=ProviderErrorKind.RETRYABLE,
         ) from exc
 
 
@@ -618,7 +630,9 @@ class _OpenAICompatProvider:
                 ),
                 kind=ProviderErrorKind.NON_RETRYABLE,
             )
-        self._client = _build_openai_compat_client(self._api_key, self._base_url)
+        self._client = _build_openai_compat_client(
+            self._api_key, self._base_url, timeout=settings.ai_gateway_timeout_seconds
+        )
         return self._client
 
     async def _chat_json(self, prompt: str) -> Any:

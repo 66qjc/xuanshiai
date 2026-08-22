@@ -290,3 +290,21 @@ def test_ai_error_response_shape_aligns_with_unified_plan() -> None:
         "retryable",
         "retry_after_ms",
     }
+
+
+# ----------------------------------------------------------------------
+# LLM timeout wiring（修复 SDK 默认 600s 的"合法死锁"）
+# ----------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_openai_compat_client_receives_timeout() -> None:
+    """_build_openai_compat_client 必须把 timeout 传给 AsyncOpenAI 客户端。"""
+    from app.services.ai.providers import _build_openai_compat_client
+    from pydantic import SecretStr
+
+    client = _build_openai_compat_client(
+        SecretStr("sk-test"), "https://api.example.com/v1", timeout=42.0
+    )
+    # AsyncOpenAI 把 timeout 存在 _client.timeout 或构造参数中
+    assert client.timeout == 42.0

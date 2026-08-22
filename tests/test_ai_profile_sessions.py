@@ -56,6 +56,7 @@ from app.services.ai.profile import (
 )
 from app.services.ai.providers import MockAIProvider
 from app.services.ai.tasks import AiTaskRecord, TaskError
+from app.services.content_filter import clear_sensitive_word_cache
 from app.workers import ai_worker as worker_mod
 
 client = TestClient(app)
@@ -445,6 +446,13 @@ class FakeProfileSession:
             return _MappingResult(rows)
         if "FROM ai_profile_draft_field" in sql:
             return _MappingResult(self._store.field_keys(str(values["session_id"])))
+        # ---- 敏感词库（Task 9 turn 前置审核）----
+        # 内存假库没有 config_sensitive_word 表:词库按"空"处理,moderate_text
+        # 本地规则放行——与 load_active_sensitive_words 对不可用词库的优雅
+        # 降级语义一致;需要验证 reject/replace 语义的测试直接 patch
+        # app.services.ai.profile.moderate_text。
+        if "FROM config_sensitive_word" in sql:
+            return _MappingResult([])
         raise AssertionError(f"unhandled sql: {sql}")
 
     async def commit(self) -> None:
@@ -692,6 +700,15 @@ class ProfileStore:
             row["status"] = "cancelled"
             row["active_status"] = 0
             row["ended_at"] = _now()
+        elif "status = 'failed'" in sql:
+            # ``_fail_extract_session`` 的终态失败自提交写入：字面量 SQL 带
+            # ``WHERE ... AND status = 'extracting'`` 幂等守卫——非 extracting
+            # 的会话不误伤（返回 rowcount=0 的 no-op）。
+            if "status = 'extracting'" in sql and row["status"] != "extracting":
+                return False
+            row["status"] = "failed"
+            row["active_status"] = 0
+            row["ended_at"] = _now()
         elif "SET status = :status" in sql:
             row["status"] = str(params["status"])
         elif "skipped_field_keys = :skipped_field_keys" in sql:
@@ -846,6 +863,10 @@ class ProfileStore:
 
 @pytest.fixture
 def profile_store() -> ProfileStore:
+    # 隔离 content_filter 的敏感词全局缓存（60s TTL）：进入时清掉其他测试
+    # 可能残留的词表（否则词库命中会让 submit 被误拒），退出时清掉本假库
+    # 加载的空词表（避免反向污染后续依赖真实词表的测试）。
+    clear_sensitive_word_cache()
     store = ProfileStore()
     prior = worker_mod.TASK_HANDLERS.get("profile_extract")
     worker_mod.TASK_HANDLERS["profile_extract"] = extract_profile_turn
@@ -854,6 +875,7 @@ def profile_store() -> ProfileStore:
         worker_mod.TASK_HANDLERS.pop("profile_extract", None)
     else:
         worker_mod.TASK_HANDLERS["profile_extract"] = prior
+    clear_sensitive_word_cache()
 
 
 # ----------------------------------------------------------------------
@@ -2224,3 +2246,338 @@ def test_submit_turn_api_same_idempotency_key_conflicts(monkeypatch, profile_sto
     assert first.status_code == 202
     assert second.status_code == 409
     assert second.json()["detail"]["code"] == "TASK_IDEMPOTENCY_CONFLICT"
+
+
+# ----------------------------------------------------------------------
+# Task 8: 抽取 JSON 失败可重试 + 会话终态失败置 FAILED
+# ----------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_extract_json_parse_failure_is_retryable() -> None:
+    """provider 返回非合法 JSON 时应分类为 RETRYABLE,而非一次判死。"""
+    from app.services.ai.providers import _parse_json_response, ProviderError, ProviderErrorKind
+
+    with pytest.raises(ProviderError) as exc_info:
+        _parse_json_response("not json at all")
+    assert exc_info.value.kind == ProviderErrorKind.RETRYABLE
+
+
+@pytest.mark.asyncio
+async def test_session_failed_transitions(profile_store) -> None:
+    """EXTRACTING→FAILED 合法(终态失败写入);FAILED 是终态,迁往任何状态非法。"""
+    from app.services.ai.profile import assert_session_transition
+
+    session = await profile_store.seed_session(status="extracting")
+    assert session["status"] == "extracting"
+    # EXTRACTING → FAILED 合法:Task 8 让不可重试终态失败能写入 FAILED,
+    # 否则前端会一直停留在"提取中"。
+    assert_session_transition(ProfileSessionStatus.EXTRACTING, ProfileSessionStatus.FAILED)
+    # FAILED 是终态:转移表为空集合,迁往任何状态(含自身)都非法。
+    for target in ProfileSessionStatus:
+        with pytest.raises(ValueError):
+            assert_session_transition(ProfileSessionStatus.FAILED, target)
+
+
+# ----------------------------------------------------------------------
+# Task 8 修复回合：终态失败的会话 FAILED 必须穿透 worker 回滚持久化
+# ----------------------------------------------------------------------
+
+
+class _ProviderSession(FakeProfileSession):
+    """适配 worker ``session_provider`` 协议的 FakeProfileSession。
+
+    生产 worker 用独立 session 运行 handler、由 ``finalize_handler(True/False)``
+    决定 commit/rollback。基类的 rollback 只在「曾 commit 过」时还原，但双会话
+    模式下每个 handler session 都是独立开启的——真实 DB 语义是「未 commit 的
+    写入在 rollback 时全部撤销，回到 session 开启时的库状态」。因此在
+    ``__aenter__`` 时先快照整个 store 作为回滚基线，rollback 无 commit 基线时
+    还原到该快照，忠实再现 ``finalize_handler(False)`` 丢弃 handler 未提交
+    写入的生产行为（否则 1c0e42a 的"FAILED 写入被回滚丢弃"缺陷会被假 store
+    掩盖）。
+    """
+
+    def __init__(self, store: ProfileStore) -> None:
+        super().__init__(store)
+        self._entry_snapshot: dict[str, Any] | None = None
+
+    async def __aenter__(self) -> _ProviderSession:
+        self._entry_snapshot = self._snapshot_store()
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        return None
+
+    async def rollback(self) -> None:
+        self.rollbacks += 1
+        if self._committed_snapshot is not None:
+            self._restore_store(self._committed_snapshot)
+        elif self._entry_snapshot is not None:
+            self._restore_store(self._entry_snapshot)
+
+
+async def _run_worker_isolated(
+    profile_store: ProfileStore,
+    monkeypatch: pytest.MonkeyPatch,
+    gateway_type: type,
+    *,
+    payload_turn_id: str | None = None,
+) -> dict[str, Any]:
+    """经 worker 的 ``session_provider`` 双会话模式跑一个 extracting 会话的抽取任务。
+
+    与 ``_run_worker`` 的区别：handler 在自己的独立 session 中运行，其写入由
+    ``_process`` 的 ``finalize_handler(commit/rollback)`` 裁决——即生产路径的
+    真实事务边界。``payload_turn_id`` 可覆写任务 payload 里的 turn_id（模拟
+    turn 定位失败的终态分支）。返回 outcome/task 行供断言。
+    """
+    session = await profile_store.seed_session(
+        owner_user_id=10, subject="personal", status="extracting"
+    )
+    turn = await profile_store.seed_turn(session["session_id"], "turn-001", "我喜欢旅行和看展")
+    task = await profile_store.task_store.seed(
+        status="leased",
+        lease_owner="worker-1",
+        lease_until=_now() + timedelta(seconds=60),
+        task_type="profile_extract",
+        idempotency_key="extract-key-001",
+        request_digest="digest",
+        consent_snapshot_json={
+            "scope": "profile_text_extract",
+            "version": "profile-text-v1",
+            "policy_revision": "ai-policy-2026-08-07-v1",
+        },
+        source_revision_json={
+            "profile": 1,
+            "preference": 0,
+            "privacy": 0,
+            "relationship": 0,
+            "policy": 0,
+        },
+        payload_summary={
+            "session_id": session["session_id"],
+            "turn_id": payload_turn_id or turn["turn_id"],
+            "client_turn_id": turn["client_turn_id"],
+            "subject": "personal",
+        },
+    )
+    monkeypatch.setattr(profile_mod, "AIGateway", gateway_type)
+    outcome = await worker_mod._process(
+        None, task, "worker-1", session_provider=lambda: _ProviderSession(profile_store)
+    )
+    final = await profile_store.task_store.get(task.task_id)
+    assert final is not None
+    return {"outcome": outcome, "task": final, "session": session["session_id"]}
+
+
+@pytest.mark.asyncio
+async def test_terminal_extract_failure_marks_session_failed_durably(
+    profile_store, monkeypatch
+) -> None:
+    """终态(不可重试)抽取失败：任务 failed 不进 retry_wait；会话 FAILED 持久化。
+
+    关键断言是用全新 session 读库：handler 内 ``_fail_extract_session`` 的自提交
+    必须让 FAILED 写入穿透 ``finalize_handler(False)`` 的回滚——这正是评审
+    Critical 指出的原缺陷（1c0e42a 在 handler 事务内写 FAILED 但无 commit，
+    worker 对返回 None 的 handler 无条件回滚，写入被丢弃，会话永远 extracting）。
+    同时 fail_task(retryable=False) 被同一次 commit 固化，worker 事后用硬编码
+    retryable=True 的重记撞终态守卫变 no-op，任务不进 retry_wait。
+    """
+    result = await _run_worker_isolated(
+        profile_store,
+        monkeypatch,
+        _stub_gateway(
+            InvokeOutcome(
+                error_code="AI_INPUT_INVALID",
+                error_message="provider 输出未通过 Schema 校验",
+                retryable=False,
+            )
+        ),
+    )
+    assert result["outcome"] == "failed"
+    task_row = result["task"]
+    assert task_row["status"] == "failed"
+    assert task_row["error_code"] == "AI_INPUT_INVALID"
+    # 未进 retry_wait：worker 的重记被 fail_task 的终态守卫挡下。
+    assert task_row["attempt_count"] == 0
+    # 用全新 session 查询，证明写穿过了 finalize_handler(False) 的回滚。
+    fresh = FakeProfileSession(profile_store)
+    read = await fresh.execute(
+        "SELECT session_id, status, active_status, ended_at FROM ai_profile_session "
+        "WHERE session_id = :session_id",
+        {"session_id": result["session"]},
+    )
+    row = read.mappings().first()
+    assert row is not None
+    assert row["status"] == "failed"
+    assert row["active_status"] == 0
+    assert row["ended_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_retryable_extract_failure_keeps_session_extracting(
+    profile_store, monkeypatch
+) -> None:
+    """可重试抽取失败：任务进 retry_wait，会话保持 extracting 等待重试。"""
+    result = await _run_worker_isolated(
+        profile_store,
+        monkeypatch,
+        _stub_gateway(
+            InvokeOutcome(
+                error_code="AI_TEMPORARILY_UNAVAILABLE",
+                error_message="AI 服务暂时不可用",
+                retryable=True,
+                retry_after_ms=2000,
+            )
+        ),
+    )
+    assert result["outcome"] == "failed"
+    task_row = result["task"]
+    assert task_row["status"] == "retry_wait"
+    assert task_row["error_code"] == "AI_TEMPORARILY_UNAVAILABLE"
+    # 可重试失败不改会话状态：worker 退避后重试，会话仍在 extracting。
+    fresh = FakeProfileSession(profile_store)
+    read = await fresh.execute(
+        "SELECT session_id, status, active_status, ended_at FROM ai_profile_session "
+        "WHERE session_id = :session_id",
+        {"session_id": result["session"]},
+    )
+    row = read.mappings().first()
+    assert row is not None
+    assert row["status"] == "extracting"
+    assert row["active_status"] == 1
+    assert row["ended_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_turn_mismatch_failure_marks_session_failed_durably(
+    profile_store, monkeypatch
+) -> None:
+    """payload/turn 不匹配的终态分支：任务 failed、会话 FAILED 同样持久化。"""
+    result = await _run_worker_isolated(
+        profile_store,
+        monkeypatch,
+        _stub_gateway(
+            InvokeOutcome(result=StructuredExtractResult(schema_version="profile-extract-v1", fields=()))
+        ),
+        payload_turn_id="turn-does-not-match",
+    )
+    assert result["outcome"] == "failed"
+    task_row = result["task"]
+    assert task_row["status"] == "failed"
+    assert task_row["error_code"] == "AI_INPUT_INVALID"
+    assert task_row["attempt_count"] == 0
+    fresh = FakeProfileSession(profile_store)
+    read = await fresh.execute(
+        "SELECT session_id, status, active_status FROM ai_profile_session "
+        "WHERE session_id = :session_id",
+        {"session_id": result["session"]},
+    )
+    row = read.mappings().first()
+    assert row is not None
+    assert row["status"] == "failed"
+    assert row["active_status"] == 0
+
+
+@pytest.mark.asyncio
+async def test_payload_missing_turn_id_marks_session_failed(profile_store) -> None:
+    """payload 缺 turn_id（session_id 仍在）的终态分支：会话 FAILED、任务 failed。"""
+    session = await profile_store.seed_session(
+        owner_user_id=10, subject="personal", status="extracting"
+    )
+    task = await profile_store.task_store.seed(
+        status="running",
+        lease_owner="worker-1",
+        lease_until=_now() + timedelta(seconds=60),
+        task_type="profile_extract",
+        idempotency_key="extract-key-payload",
+        payload_summary={"session_id": session["session_id"], "subject": "personal"},
+    )
+    result = await extract_profile_turn(profile_store.db, task, "worker-1")
+    assert result is None
+    final = await profile_store.task_store.get(task.task_id)
+    assert final is not None
+    assert final["status"] == "failed"
+    assert final["error_code"] == "AI_FEATURE_DISABLED"
+    row = profile_store.sessions[session["session_id"]]
+    assert row["status"] == "failed"
+    assert row["active_status"] == 0
+    assert row["ended_at"] is not None
+
+
+# ----------------------------------------------------------------------
+# Task 9: turn 提交前置内容审核（moderate_text）
+# ----------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_submit_turn_rejects_moderated_content(profile_store) -> None:
+    """turn 提交必须前置内容审核,违规文本拒绝入库。"""
+    from app.services.content_filter import ContentDecision
+    from unittest.mock import AsyncMock, patch
+
+    session = await profile_store.seed_session(owner_user_id=10, subject="personal")
+    with patch(
+        "app.services.ai.profile.moderate_text",
+        new_callable=AsyncMock,
+        return_value=ContentDecision(action="reject", display_content="违规内容"),
+    ):
+        with pytest.raises(AIInputError):
+            await submit_profile_turn(
+                profile_store.db, session["session_id"], 10, "turn-001", "违规内容", "key-001"
+            )
+    # reject 时 turn 未落库、task 未入队。
+    assert profile_store.turns == []
+    assert list(profile_store.task_store.tasks.values()) == []
+
+
+@pytest.mark.asyncio
+async def test_submit_turn_replace_uses_moderated_text(profile_store) -> None:
+    """replace 动作用审核后的脱敏文本替代原文落库并进入抽取链路。"""
+    from unittest.mock import AsyncMock, patch
+
+    from app.services.content_filter import ContentDecision
+
+    session = await profile_store.seed_session(owner_user_id=10, subject="personal")
+    with patch(
+        "app.services.ai.profile.moderate_text",
+        new_callable=AsyncMock,
+        return_value=ContentDecision(action="replace", display_content="周末喜欢去***"),
+    ):
+        submission = await submit_profile_turn(
+            profile_store.db, session["session_id"], 10, "turn-001", "周末喜欢去酒吧", "key-001"
+        )
+    # 落库与返回的 answer_text 都是脱敏文本,原文绝不进入 LLM prompt 链路。
+    assert submission.answer_text == "周末喜欢去***"
+    assert all(row["answer_text"] == "周末喜欢去***" for row in profile_store.turns)
+
+
+@pytest.mark.asyncio
+async def test_submit_turn_replay_skips_moderation(profile_store) -> None:
+    """幂等回放不重复审核:已落库 turn 的重放不因词库事后收紧被拒。"""
+    from unittest.mock import AsyncMock, patch
+
+    from app.services.content_filter import ContentDecision
+
+    session = await profile_store.seed_session(owner_user_id=10, subject="personal")
+    with patch(
+        "app.services.ai.profile.moderate_text",
+        new_callable=AsyncMock,
+        return_value=ContentDecision(action="allow", display_content="周末喜欢看展"),
+    ) as first_moderate:
+        first = await submit_profile_turn(
+            profile_store.db, session["session_id"], 10, "turn-001", "周末喜欢看展", "key-001"
+        )
+        first_moderate.assert_awaited_once()
+    # 提交后词库/外部审核收紧为 reject:同一 client_turn_id 必须原样回放,不再审核。
+    with patch(
+        "app.services.ai.profile.moderate_text",
+        new_callable=AsyncMock,
+        return_value=ContentDecision(action="reject", display_content="周末喜欢看展"),
+    ) as replay_moderate:
+        replay = await submit_profile_turn(
+            profile_store.db, session["session_id"], 10, "turn-001", "周末喜欢看展", "key-001"
+        )
+        replay_moderate.assert_not_called()
+    assert replay.turn_id == first.turn_id
+    assert replay.replayed is True
+    assert await profile_store.count_tasks(first.turn_id) == 1

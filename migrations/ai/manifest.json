@@ -55,6 +55,15 @@
         "up": "46f755f773ba39d522d2a3d13c206d91edb6f80e9d9b9b486155960803542015",
         "down": "fc958c4bbaff65e962d906e567b0092792a2be3d5807224e4cd8f4b1a06b4729"
       }
+    },
+    {
+      "version": "20260822_01_profile_indexes",
+      "up": "20260822_01_profile_indexes_up.sql",
+      "down": "20260822_01_profile_indexes_down.sql",
+      "sha256": {
+        "up": "fef0f6996f85f8856e8e52657e7442801e4e04922af2081be6973c1d9687250d",
+        "down": "ecad3acbaef28ab537011bbaebb594a920b00ba82e534a693f82f045bf405aaf"
+      }
     }
   ]
 }

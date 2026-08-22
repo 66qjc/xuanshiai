@@ -261,7 +261,7 @@ async def test_empty_content_raises_input_invalid(
 
 
 @pytest.mark.asyncio
-async def test_invalid_json_raises_input_invalid(
+async def test_invalid_json_raises_temporarily_unavailable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     settings = _settings_with_deepseek_key()
@@ -274,8 +274,8 @@ async def test_invalid_json_raises_input_invalid(
                 consent_version="v1", policy_revision="v1",
             )
         )
-    assert exc_info.value.code == "AI_INPUT_INVALID"
-    assert not exc_info.value.retryable
+    assert exc_info.value.code == "AI_TEMPORARILY_UNAVAILABLE"
+    assert exc_info.value.retryable
 
 
 @pytest.mark.asyncio

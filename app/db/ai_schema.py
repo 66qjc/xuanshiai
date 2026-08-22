@@ -164,7 +164,8 @@ AI_TABLES = {
             `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
             PRIMARY KEY (`id`),
             UNIQUE KEY `uk_ai_profile_draft_draft_id` (`draft_id`),
-            KEY `idx_ai_profile_draft_user_subject` (`user_id`, `subject`, `status`, `updated_at`)
+            KEY `idx_ai_profile_draft_user_subject` (`user_id`, `subject`, `status`, `updated_at`),
+            KEY `idx_ai_profile_draft_session` (`session_id`, `status`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='AI 画像可编辑草稿版本'
     """,
     "ai_profile_draft_field": """
@@ -244,7 +245,8 @@ AI_TABLES = {
             `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
             `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
             PRIMARY KEY (`id`),
-            KEY `idx_ai_profile_summary_revision_subject` (`revision_id`, `subject`)
+            KEY `idx_ai_profile_summary_revision_subject` (`revision_id`, `subject`),
+            KEY `idx_ai_profile_summary_user_subject` (`user_id`, `subject`, `created_at`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='AI 画像总结草稿/发布文本及引用'
     """,
     # ============ M03 搜索、投影与 M06 兼容度（§10.3）============

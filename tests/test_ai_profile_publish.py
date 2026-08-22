@@ -1267,6 +1267,112 @@ async def test_replace_rejects_blank_tag_list(profile_store) -> None:
 
 
 @pytest.mark.asyncio
+async def test_replace_rejects_invalid_enum_value(profile_store) -> None:
+    """REPLACE 必须复用抽取边界的枚举校验，拒绝非法 marriage_status 值。"""
+    draft = await profile_store.seed_draft(
+        owner_user_id=10,
+        subject="personal",
+        fields=[{"field_key": "marriage_status", "value": "single", "status": "suggested"}],
+        revision=1,
+    )
+    with pytest.raises(AIInputError):
+        await confirm_profile_draft(
+            profile_store.db,
+            draft["draft_id"],
+            10,
+            [
+                ProfileDraftFieldPatchRequest(
+                    field_key="marriage_status",
+                    action=ProfileFieldPatchAction.REPLACE,
+                    value="未婚",  # 中文标签不是合法枚举值
+                    expected_revision=1,
+                )
+            ],
+            expected_revision=1,
+        )
+
+
+@pytest.mark.asyncio
+async def test_replace_rejects_out_of_range_integer(profile_store) -> None:
+    """REPLACE 必须复用抽取边界的区间校验，拒绝越界 age。"""
+    draft = await profile_store.seed_draft(
+        owner_user_id=10,
+        subject="personal",
+        fields=[{"field_key": "age", "value": 25, "status": "suggested"}],
+        revision=1,
+    )
+    with pytest.raises(AIInputError):
+        await confirm_profile_draft(
+            profile_store.db,
+            draft["draft_id"],
+            10,
+            [
+                ProfileDraftFieldPatchRequest(
+                    field_key="age",
+                    action=ProfileFieldPatchAction.REPLACE,
+                    value=999,
+                    expected_revision=1,
+                )
+            ],
+            expected_revision=1,
+        )
+
+
+@pytest.mark.asyncio
+async def test_replace_rejects_non_integer_for_education_level(profile_store) -> None:
+    """education_level 契约类型是 integer，REPLACE 不接受字符串标签。"""
+    draft = await profile_store.seed_draft(
+        owner_user_id=10,
+        subject="personal",
+        fields=[{"field_key": "education_level", "value": 4, "status": "suggested"}],
+        revision=1,
+    )
+    with pytest.raises(AIInputError):
+        await confirm_profile_draft(
+            profile_store.db,
+            draft["draft_id"],
+            10,
+            [
+                ProfileDraftFieldPatchRequest(
+                    field_key="education_level",
+                    action=ProfileFieldPatchAction.REPLACE,
+                    value="本科",
+                    expected_revision=1,
+                )
+            ],
+            expected_revision=1,
+        )
+
+
+@pytest.mark.asyncio
+async def test_replace_accepts_valid_enum_value_and_normalizes(profile_store) -> None:
+    """合法枚举值通过校验且写入归一化后的值。"""
+    draft = await profile_store.seed_draft(
+        owner_user_id=10,
+        subject="personal",
+        fields=[{"field_key": "marriage_status", "value": "single", "status": "suggested"}],
+        revision=1,
+    )
+    updated = await confirm_profile_draft(
+        profile_store.db,
+        draft["draft_id"],
+        10,
+        [
+            ProfileDraftFieldPatchRequest(
+                field_key="marriage_status",
+                action=ProfileFieldPatchAction.REPLACE,
+                value="divorced",
+                expected_revision=1,
+            )
+        ],
+        expected_revision=1,
+    )
+    field = next(f for f in updated.fields if f.field_key == "marriage_status")
+    assert field.value == "divorced"
+    assert field.confirmation_status == "confirmed"
+
+
+@pytest.mark.asyncio
 async def test_delete_marks_field_invisible_and_reject_marks_rejected(profile_store) -> None:
     draft = await profile_store.seed_draft(
         owner_user_id=10,

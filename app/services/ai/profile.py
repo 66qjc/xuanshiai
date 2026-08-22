@@ -5,9 +5,10 @@
 - ``create_profile_session`` 只允许同一 ``user_id + subject`` 存在一个活动会话
   （已存在则回放/复用）；创建前校验 ``profile_text_extract`` 授权并快照当前
   revision 向量与授权信息。
-- ``submit_profile_turn`` 先把原文 turn 落库（抽取失败不删原文），再以
-  ``profile_extract`` 任务入队；同 ``client_turn_id`` 重复提交只回放原 turn，
-  不创建第二个任务。
+- ``submit_profile_turn`` 先过 ``moderate_text`` 内容审核（reject 拒绝入库、
+  replace 用脱敏文本；幂等回放不重复审核），再把（脱敏后）turn 落库（抽取失败
+  不删原文），以 ``profile_extract`` 任务入队；同 ``client_turn_id`` 重复提交
+  只回放原 turn，不创建第二个任务。
 - ``extract_profile_turn`` 是 Worker 注册的 ``profile_extract`` handler：只调用
   ``AIGateway.structured_extract``，结果只写成 ``suggested`` 状态的草稿字段，
   绝不产生已发布字段或认证字段；schema-invalid/timeout 只改变任务状态。
@@ -27,10 +28,13 @@
   Task 9/10/11 的消费者实现（本任务只注册占位 handler）。
 
 与 Task 6 的任务状态机一致，本模块函数**不**调用 ``commit()``——调用方（路由
-或 Worker）控制事务；唯一例外是 ``_mark_stale``：它必须在抛出
+或 Worker）控制事务；自提交例外有二：``_mark_stale`` 必须在抛出
 ``PROFILE_SESSION_STALE`` 前自行提交 stale 状态变更（异常路径下 get_db 上下文
 退出会回滚未提交事务，不提交则 stale 永不落库，同 user+subject 将无法重新创建
-会话）。原回答与密钥永不进入日志或错误响应。
+会话）；``_fail_extract_session`` 在 extract handler 终态失败时自行提交会话
+FAILED + fail_task（worker 对返回 None 的 handler 会回滚其事务，不提交则
+FAILED 落不了库，会话将永远停留在 extracting）。原回答与密钥永不进入日志或
+错误响应。
 """
 
 from __future__ import annotations
@@ -76,6 +80,7 @@ from app.services.ai.features import (
 from app.services.ai.gateway import AIGateway
 from app.services.ai.prompts.profile_narrative import serialize_fields_for_prompt
 from app.services.ai.tasks import AiTaskRecord, TaskError, enqueue_task, fail_task
+from app.services.content_filter import moderate_text
 from app.services.derivation_outbox import purge_ai_resources, run_cleanup_for_user
 from app.services.revisions import (
     RevisionKind,
@@ -143,6 +148,7 @@ _SESSION_TRANSITIONS: dict[ProfileSessionStatus, set[ProfileSessionStatus]] = {
         ProfileSessionStatus.PAUSED,
         ProfileSessionStatus.CANCELLED,
         ProfileSessionStatus.STALE,
+        ProfileSessionStatus.FAILED,
     },
     ProfileSessionStatus.AWAITING_CONFIRMATION: {
         ProfileSessionStatus.EXTRACTING,
@@ -908,6 +914,31 @@ async def _mark_stale(db: AsyncSession, session_id: str) -> None:
     await db.commit()
 
 
+async def _fail_extract_session(db: AsyncSession, session_id: str) -> None:
+    """Mark a session failed after a terminal extraction failure and commit.
+
+    与 ``_mark_stale`` 同款自提交例外（第二个）：extract handler 终态失败时，
+    会话状态必须立即固化——worker 对返回 None 的 handler 会回滚其事务
+    （``_process`` 的 ``finalize_handler(False)``），若不在此处 commit，FAILED
+    写入会被丢弃，会话将永远停留在 extracting。``WHERE status='extracting'``
+    保证幂等：会话已因新 turn 回到 extracting 时不误伤，已 failed 时重复调用
+    为 no-op。同事务内的 ``fail_task(retryable=False)`` 一并被固化，使 worker
+    的重记撞状态守卫成为 no-op，避免不可重试失败被硬编码 ``retryable=True``
+    推入重试循环。``active_status=0`` + ``ended_at`` 与 ``_mark_stale`` 的终态
+    语义一致：失败会话释放 active 唯一槽，用户下次 ensureSession 建新会话。
+    """
+    await db.execute(
+        text(
+            "UPDATE ai_profile_session SET status = 'failed', "
+            "active_status = 0, ended_at = UTC_TIMESTAMP(), "
+            "updated_at = UTC_TIMESTAMP() "
+            "WHERE session_id = :session_id AND status = 'extracting'"
+        ),
+        {"session_id": session_id},
+    )
+    await db.commit()
+
+
 async def _reuse_active_session(
     db: AsyncSession,
     row: dict[str, Any],
@@ -1204,6 +1235,17 @@ async def submit_profile_turn(
     if existing is not None:
         return TurnSubmission.replay(existing)
 
+    # 前置内容审核（Task 9）:违规文本不落库、不进 LLM prompt（与 community
+    # 模块一致）。置于幂等回放分支之后——已落库 turn 的重放不因词库事后收紧
+    # 被拒,回放语义优先;审核在首次落库前完成,replace 用审核后的脱敏文本
+    # 替代原文,后续 hash_request/抽取 prompt 使用的均为脱敏文本。
+    # ``manual_review`` 不拦截（与 community 一致,走人工审核队列）。
+    moderation = await moderate_text(db, normalized, field="画像回答")
+    if moderation.action == "reject":
+        raise AIInputError("回答内容包含违规信息,请修改后重试")
+    if moderation.action == "replace" and moderation.display_content:
+        normalized = moderation.display_content
+
     try:
         turn = await _insert_turn(db, session_id, owner_user_id, client_turn_id, normalized)
     except IntegrityError:
@@ -1480,6 +1522,11 @@ async def extract_profile_turn(
             db, task.task_id, worker_id,
             error_code="AI_FEATURE_DISABLED", retryable=False,
         )
+        # payload 残缺是终态失败：session_id 可定位时同样自提交置 FAILED，
+        # 否则该会话将永远停在 extracting（payload 完全没有 session_id 时
+        # 无会话可标记，跳过）。
+        if session_id:
+            await _fail_extract_session(db, str(session_id))
         return None
 
     session = await load_owned_session(db, str(session_id), task.owner_user_id)
@@ -1489,6 +1536,8 @@ async def extract_profile_turn(
             db, task.task_id, worker_id,
             error_code="AI_INPUT_INVALID", retryable=False,
         )
+        # turn 定位失败同样是终态失败：自提交置 FAILED，避免会话卡在 extracting。
+        await _fail_extract_session(db, session.session_id)
         return None
 
     context = AITaskContext(
@@ -1513,13 +1562,20 @@ async def extract_profile_turn(
     gateway = AIGateway(timeout_seconds=settings.ai_gateway_timeout_seconds)
     outcome = await gateway.structured_extract(context, request)
     if outcome.result is None:
-        # 只改任务状态（fail_task/retry_wait），不产生草稿字段；返回 None 时
-        # Worker 会再走一次 fail_task，但状态守卫使其成为无操作。
+        # 只改任务状态（fail_task/retry_wait），不产生草稿字段。
         await fail_task(
             db, task.task_id, worker_id,
             error_code=outcome.error_code or "AI_TEMPORARILY_UNAVAILABLE",
             retryable=outcome.retryable,
         )
+        # 不可重试的终态失败：自提交把会话从 extracting 推进到 failed，并连同
+        # 上面的 fail_task(retryable=False) 一起固化——worker 对返回 None 的
+        # handler 会回滚其事务，不在此处 commit 则 FAILED 永远落不了库，前端
+        # 会一直显示"提取中"；fail_task 不固化则 worker 的重记（硬编码
+        # retryable=True）会把它推进重试循环。可重试的失败由 worker 退避后
+        # 重试，会话状态不动。extracting 守卫由 helper 的 WHERE 条件承担。
+        if not outcome.retryable:
+            await _fail_extract_session(db, session.session_id)
         return None
 
     expected_subject = session.subject
@@ -1578,6 +1634,8 @@ async def extract_profile_turn(
             db, task.task_id, worker_id,
             error_code="AI_INPUT_INVALID", retryable=False,
         )
+        # 伪造来源/版本证据是终态失败：自提交置 FAILED 并固化 fail_task。
+        await _fail_extract_session(db, session.session_id)
         return None
 
     draft_id = await _write_draft(db, session, turn, extract_result)
@@ -1884,23 +1942,22 @@ def _replay_or_conflict(
     return existing
 
 
-def _validate_field_value(field_key: str, value: Any) -> None:
-    """Domain check for ``replace`` (统一方案 §6.2 值域/长度/枚举).
+def _validate_and_normalize_replace_value(
+    subject: ProfileSubject, field_key: str, value: Any
+) -> Any:
+    """Validate and normalize a ``replace`` value using the same frozen
+    subject contract as extraction (统一方案 §6.2 值域/长度/枚举).
 
-    标签类字段要求非空字符串数组；其余 allowlist 字段要求非空标量。来源引用在
-    replace 时保留（只改 value_json/content_hash，不动 source_turn_ids）。
+    标签类字段要求非空字符串数组；其余 allowlist 字段要求非空标量。
+    枚举/区间/类型约束与抽取边界 ``normalize_profile_extracted_value`` 完全
+    一致——用户手改路径不得绕过机器生成路径的校验，否则脏值可直达不可变
+    revision 与搜索投影。来源引用在 replace 时保留（只改 value_json/
+    content_hash，不动 source_turn_ids）。
     """
-    if value is None:
-        raise AIInputError(f"field {field_key} 的 value 不能为空")
-    if field_key in _TAG_LIST_FIELDS:
-        if (
-            not isinstance(value, list)
-            or not value
-            or any(not isinstance(item, str) or not item.strip() for item in value)
-        ):
-            raise AIInputError(f"field {field_key} 必须是「非空字符串数组」")
-    elif not isinstance(value, (str, int, float)):
-        raise AIInputError(f"field {field_key} 的 value 必须是标量（字符串或数字）")
+    try:
+        return normalize_profile_extracted_value(subject, field_key, value)
+    except ValueError as exc:
+        raise AIInputError(str(exc)) from exc
 
 
 async def _load_draft_row(
@@ -2145,10 +2202,12 @@ async def confirm_profile_draft(
             )
             applied += 1
         elif action.action is ProfileFieldPatchAction.REPLACE:
-            _validate_field_value(action.field_key, action.value)
+            normalized_value = _validate_and_normalize_replace_value(
+                draft.subject, action.field_key, action.value
+            )
             existing = next(f for f in draft.fields if f.field_key == action.field_key)
             new_hash = _content_hash(
-                action.field_key, draft.subject, action.value, existing.source_turn_ids
+                action.field_key, draft.subject, normalized_value, existing.source_turn_ids
             )
             await db.execute(
                 text(
@@ -2159,8 +2218,8 @@ async def confirm_profile_draft(
                     "WHERE draft_id = :draft_id AND field_key = :field_key"
                 ),
                 {
-                    "value_json": json.dumps(action.value, ensure_ascii=False),
-                    "display_value": _display_value(action.value),
+                    "value_json": json.dumps(normalized_value, ensure_ascii=False),
+                    "display_value": _display_value(normalized_value),
                     "content_hash": new_hash,
                     "draft_id": draft_id,
                     "field_key": action.field_key,
