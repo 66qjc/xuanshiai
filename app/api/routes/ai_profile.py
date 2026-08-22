@@ -663,4 +663,5 @@ async def get_profile_narrative_route(
         ideal_weights=list(data.get("ideal_weights") or []),
         recent_change=data.get("recent_change"),
         history_observations=list(data.get("history_observations") or []),
+        conclusion=str(data.get("conclusion") or ""),
     )

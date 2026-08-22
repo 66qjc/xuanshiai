@@ -87,11 +87,6 @@ class VoiceGateway:
     ) -> None:
         provider_name = settings.ai_voice_provider
         self._provider = provider or get_voice_provider(provider_name)
-        if settings.environment == "production" and provider_name == "mock":
-            logger.warning(
-                "voice_gateway_mock_provider_in_production "
-                "VoiceGateway 在生产环境使用 mock provider，请配置真实语音 provider"
-            )
         self._timeout_seconds = timeout_seconds
 
     def set_provider(self, provider: VoiceProvider) -> None:
@@ -115,11 +110,11 @@ class VoiceGateway:
         try:
             handler = getattr(self._provider, method)
             raw_result = await handler(*args)
-            # MockVoiceProvider schema_invalid 注入返回 None：让 Gateway 拒收。
+            # provider 返回 None 表示异常（schema 违例或内部错误），让 Gateway 拒收。
             if raw_result is None:
                 raise ProviderError(
                     code=_SCHEMA_VIOLATION_CODE,
-                    message="voice provider 返回 None（schema_invalid 注入）",
+                    message="voice provider 返回 None（内部错误或 schema 违例）",
                     kind=ProviderErrorKind.NON_RETRYABLE,
                 )
             record = self._record(

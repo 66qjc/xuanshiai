@@ -33,7 +33,7 @@ def _settings_dev(**overrides: Any) -> Settings:
         "_env_file": None,
         "environment": "development",
         "ai_provider": "mock",
-        "ai_voice_provider": "mock",
+        "ai_voice_provider": "aliyun",
     }
     base.update(overrides)
     return Settings(**base)
@@ -42,8 +42,16 @@ def _settings_dev(**overrides: Any) -> Settings:
 def _make_mock_ai_gateway(
     extract_result: StructuredExtractResult | None = None,
     extract_error: ProviderError | None = None,
+    reply_text: str | None = None,
+    reply_error: Exception | None = None,
 ) -> MagicMock:
-    """构造 mock AIGateway，structured_extract 返回可控结果。"""
+    """构造 mock AIGateway，structured_extract / generate_reply 返回可控结果。
+
+    ``reply_text`` 为 None 且无 ``reply_error`` 时，generate_reply 返回空结果
+    （模拟 LLM 未配置或返回空），编排器降级到模板回复。
+    """
+    from app.services.ai.base import ReplyResult
+
     gateway = MagicMock()
     if extract_error is not None:
         outcome = InvokeOutcome(
@@ -54,6 +62,15 @@ def _make_mock_ai_gateway(
     else:
         outcome = InvokeOutcome(result=extract_result)
     gateway.structured_extract = AsyncMock(return_value=outcome)
+
+    if reply_error is not None:
+        gateway.generate_reply = AsyncMock(side_effect=reply_error)
+    elif reply_text is not None:
+        reply_outcome = InvokeOutcome(result=ReplyResult(reply_text=reply_text))
+        gateway.generate_reply = AsyncMock(return_value=reply_outcome)
+    else:
+        # 未配置 reply：返回空 outcome，降级模板。
+        gateway.generate_reply = AsyncMock(return_value=InvokeOutcome())
     return gateway
 
 
@@ -254,3 +271,83 @@ async def test_custom_reply_builder(monkeypatch: pytest.MonkeyPatch) -> None:
     orch.start_listening(session_id="s1")
     result = await orch.process_transcript("28岁", user_id=1)
     assert result.ai_reply == custom_reply
+
+
+# ----------------------------------------------------------------------
+# LLM 回复生成（generate_reply 真接）
+# ----------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_llm_reply_used_when_gateway_returns_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AIGateway.generate_reply 返回非空文本时，编排器使用 LLM 回复。"""
+    settings = _settings_dev()
+    monkeypatch.setattr("app.services.voice.conversation.settings", settings)
+    extract = _make_extract_result(field_key="age")
+    synth = SynthesizeResult(
+        audio_url="/tts.mp3", audio_format="mp3", duration_ms=1000
+    )
+    llm_reply = "收到，28岁啦。你平时喜欢做什么呀？"
+    orch = VoiceConversationOrchestrator(
+        ai_gateway=_make_mock_ai_gateway(
+            extract_result=extract, reply_text=llm_reply
+        ),
+        voice_gateway=_make_mock_voice_gateway(synth_result=synth),
+    )
+    orch.start_listening(session_id="s1", field_key="age")
+    result = await orch.process_transcript("我今年28岁", user_id=1)
+    assert result.ai_reply == llm_reply
+    # generate_reply 被调用，参数含本轮转写文本。
+    call_kwargs = orch.ai_gateway.generate_reply.await_args.args[1]
+    assert call_kwargs.transcript == "我今年28岁"
+    assert call_kwargs.field_key == "age"
+
+
+@pytest.mark.asyncio
+async def test_llm_reply_empty_falls_back_to_template(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """generate_reply 返回空文本时，降级到模板回复。"""
+    settings = _settings_dev()
+    monkeypatch.setattr("app.services.voice.conversation.settings", settings)
+    extract = _make_extract_result(field_key="age")
+    synth = SynthesizeResult(
+        audio_url="/tts.mp3", audio_format="mp3", duration_ms=1000
+    )
+    orch = VoiceConversationOrchestrator(
+        ai_gateway=_make_mock_ai_gateway(
+            extract_result=extract, reply_text=None
+        ),
+        voice_gateway=_make_mock_voice_gateway(synth_result=synth),
+    )
+    orch.start_listening(session_id="s1", field_key="age")
+    result = await orch.process_transcript("28岁", user_id=1)
+    # 降级模板包含 field_key。
+    assert result.ai_reply == "好的，已记录你的信息。请继续告诉我你的age。"
+
+
+@pytest.mark.asyncio
+async def test_llm_reply_exception_falls_back_to_template(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """generate_reply 抛异常时，降级到模板回复，对话不中断。"""
+    settings = _settings_dev()
+    monkeypatch.setattr("app.services.voice.conversation.settings", settings)
+    extract = _make_extract_result(field_key="age")
+    synth = SynthesizeResult(
+        audio_url="/tts.mp3", audio_format="mp3", duration_ms=1000
+    )
+    orch = VoiceConversationOrchestrator(
+        ai_gateway=_make_mock_ai_gateway(
+            extract_result=extract,
+            reply_error=RuntimeError("LLM down"),
+        ),
+        voice_gateway=_make_mock_voice_gateway(synth_result=synth),
+    )
+    orch.start_listening(session_id="s1", field_key="age")
+    result = await orch.process_transcript("28岁", user_id=1)
+    assert result.ai_reply  # 非空：降级模板
+    assert result.error_code is None  # 回复失败被吞，不阻断流程
+    assert result.tts_audio_url == "/tts.mp3"

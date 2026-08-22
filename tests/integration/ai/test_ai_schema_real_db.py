@@ -13,10 +13,13 @@ from tests.integration.ai.conftest import TEST_DATABASE_NAME
 
 
 async def _table_names(db: AsyncSession) -> set[str]:
+    # AI tables are prefixed ``ai_``, but ``voice_transcript`` (registered in
+    # AI_TABLES for the voice-transcribe task) carries a ``voice_`` prefix.
     result = await db.execute(
         text(
             "SELECT table_name FROM information_schema.tables "
-            "WHERE table_schema = :schema AND table_name LIKE 'ai\\_%'"
+            "WHERE table_schema = :schema "
+            "AND (table_name LIKE 'ai\\_%' OR table_name = 'voice_transcript')"
         ),
         {"schema": TEST_DATABASE_NAME},
     )

@@ -30,6 +30,7 @@ from app.services.ai.base import (
     NarrativeResult,
     ProviderError,
     ProviderErrorKind,
+    ReplyResult,
     SearchParseResult,
     StructuredExtractResult,
 )
@@ -349,4 +350,17 @@ class AIGateway:
         return await self.invoke(
             context, "generate_narrative", request,
             response_type=NarrativeResult,
+        )
+
+    async def generate_reply(
+        self, context: AITaskContext, request: Any
+    ) -> InvokeOutcome[ReplyResult]:
+        """生成一轮语音对话回复（确认信息 + 自然追问）。
+
+        供 :class:`VoiceConversationOrchestrator` 在画像抽取后调用，
+        用用户本轮转写文本 + 已知字段生成口语化回复，经 TTS 播放。
+        """
+        return await self.invoke(
+            context, "generate_reply", request,
+            response_type=ReplyResult,
         )

@@ -21,7 +21,11 @@ from enum import Enum
 from typing import Any
 
 from app.core.config import settings
-from app.services.ai.base import AITaskContext, StructuredExtractRequest
+from app.services.ai.base import (
+    AITaskContext,
+    ReplyRequest,
+    StructuredExtractRequest,
+)
 from app.services.ai.gateway import AIGateway
 from app.services.ai.base import StructuredExtractResult
 from app.services.voice.base import (
@@ -192,15 +196,48 @@ class VoiceConversationOrchestrator:
     ) -> str:
         """生成回复文本。
 
-        默认实现：若注入了 ``reply_builder`` 则委托它；否则返回固定确认 + 下一个
-        问题的模板回复（开发档足够联调，生产替换为 LLM 对话生成）。
+        优先使用注入的 ``reply_builder``；否则调用 AIGateway.generate_reply
+        用 LLM 生成口语化回复（确认 + 追问）。LLM 失败时降级到模板回复，
+        保证对话不中断。
         """
         if self.reply_builder is not None:
             value = self.reply_builder(transcript, extracted, request_id)
             if hasattr(value, "__await__"):
                 return await value  # type: ignore[no-any-return]
             return value  # type: ignore[no-any-return]
-        # 内置模板：确认 + 追问下一个字段（开发档简单联调用）。
+
+        # LLM 回复生成：用本轮转写文本 + 已抽取字段生成口语化回复。
+        known_fields = tuple(
+            {"field_key": f.field_key, "value": f.value}
+            for f in extracted.fields
+        )
+        reply_context = AITaskContext(
+            task_id=uuid.uuid4().hex,
+            request_id=request_id or uuid.uuid4().hex,
+            scene="voice_conversation_reply",
+            provider=settings.ai_provider,
+            model=settings.ai_model_name,
+            schema_version="voice-reply-v1",
+        )
+        reply_request = ReplyRequest(
+            transcript=transcript,
+            field_key=self._field_key,
+            known_fields=known_fields,
+        )
+        try:
+            outcome = await self.ai_gateway.generate_reply(
+                reply_context, reply_request
+            )
+            if outcome.result is not None and outcome.result.reply_text:
+                return outcome.result.reply_text
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "conversation_reply_failed session=%s request_id=%s, "
+                "降级模板回复",
+                self._session_id,
+                request_id,
+            )
+        # 降级模板：确认 + 追问下一个字段。
         if extracted.fields:
             field = extracted.fields[0]
             return f"好的，已记录你的信息。请继续告诉我你的{field.field_key}。"

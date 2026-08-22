@@ -31,14 +31,15 @@ from app.core.config import settings
 from app.core.logging import request_id_context
 from app.db.session import get_db
 from app.schemas.ai_common import AiErrorResponse, AiTaskStatus
+from app.services.ai.base import AITaskContext
 from app.services.ai.flags import AiFeature, AiFeatureDisabledError, require_ai_feature
 from app.services.ai.tasks import TaskError, enqueue_task
 from app.services.voice.base import (
     MAX_TTS_TEXT_LENGTH,
     SynthesizeRequest,
+    TranscribeRequest,
 )
 from app.services.voice.gateway import VoiceGateway
-from app.services.ai.base import AITaskContext
 
 router = APIRouter()
 
@@ -75,7 +76,7 @@ class SynthesizeRequestSchema(BaseModel):
 
     text: str = Field(..., min_length=1, max_length=MAX_TTS_TEXT_LENGTH)
     locale: str | None = None
-    voice: str = "default"
+    voice: str = "xiaoyun"
     speed: float = Field(default=1.0, ge=0.5, le=2.0)
 
 
@@ -188,18 +189,21 @@ async def transcribe_audio(
     current: CurrentUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> TranscribeAccepted:
-    """上传音频文件，创建异步转写任务。
+    """上传音频文件，同步转写后创建任务写表。
 
     音频约束：mp3/wav/m4a，≤5MB，≤60s（前端 ``VoiceRecorder`` 录制参数）。
-    返回 ``task_id`` 后通过 ``GET /ai/tasks/{task_id}`` 轮询；转写文本通过
-    任务的 ``result_payload.transcript`` 字段返回。
+    转写在路由层同步完成（阿里云一句话识别，≤60s 直接 POST 二进制返回），
+    随后入队轻量任务把结果写入 ``voice_transcript`` 表。返回 ``task_id`` 后
+    通过 ``GET /ai/tasks/{task_id}`` 轮询；转写文本通过任务的
+    ``result_payload.transcript`` 字段返回。
 
-    开发/测试环境可用 mock provider；生产启用需满足 AI 审批门禁。
+    音频不落盘：一句话识别直接 POST 原始 bytes，无需文件存储引用。
+    生产启用需满足 AI 审批门禁（三道审批 + AccessKey fail-closed）。
     """
     _require_voice_feature()
     _check_idempotency_key(idempotency_key)
 
-    # 读取并校验音频（File 已解析为 bytes，此处做大小校验）。
+    # 校验音频（File 已解析为 bytes，此处做大小校验）。
     if not audio:
         raise _error_response(
             "AI_INPUT_INVALID",
@@ -213,19 +217,39 @@ async def transcribe_audio(
             status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
         )
 
-    # 存储音频到本地临时目录（复用 upload_dir 存储层）。
-    audio_ref = f"voice/asr/{uuid.uuid4().hex}.mp3"
-    # 实际写入由 services 层负责；此处仅生成引用键。
-    # TODO: 接入存储服务写入音频文件（复用 media.py 存储能力）。
+    # 同步调阿里云一句话识别（≤60s 音频，直接 POST 二进制）。
+    context = AITaskContext(
+        task_id=uuid.uuid4().hex,
+        request_id=_request_id(),
+        scene="voice_transcribe",
+        provider=settings.ai_voice_provider,
+        model=settings.ai_voice_model_name,
+        schema_version="voice-transcribe-v1",
+    )
+    request = TranscribeRequest(
+        audio_bytes=audio,
+        audio_format="mp3",
+        sample_rate=16000,
+        max_duration_seconds=settings.ai_asr_max_duration_seconds,
+    )
+    gateway = VoiceGateway(timeout_seconds=settings.ai_gateway_timeout_seconds)
+    outcome = await gateway.transcribe(context, request)
+    if outcome.result is None:
+        raise _error_response(
+            outcome.error_code or "AI_TEMPORARILY_UNAVAILABLE",
+            outcome.error_message or "语音转写失败",
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            retryable=outcome.retryable,
+        )
 
-    # 构造请求摘要 hash（幂等校验用）。
+    # 构造请求摘要 hash（��等校验用）。
     import hashlib
 
     request_hash = hashlib.sha256(
-        f"{current.id}:{question_field_key}:{audio_ref}".encode()
+        f"{current.id}:{question_field_key}:{len(audio)}".encode()
     ).hexdigest()
 
-    # 入队异步转写任务。
+    # 入队轻量任务：worker handler 只负责写 voice_transcript 表。
     try:
         task = await enqueue_task(
             db=db,
@@ -242,7 +266,7 @@ async def transcribe_audio(
             retryable=exc.retryable,
         ) from exc
 
-    # payload_summary 存储定位信息，不含音频原文。
+    # payload_summary 存转写结果，worker handler 读取后写 voice_transcript 表。
     await db.execute(
         text(
             "UPDATE ai_task SET payload_summary = :payload_summary, "
@@ -251,9 +275,11 @@ async def transcribe_audio(
         {
             "payload_summary": json.dumps(
                 {
-                    "audio_ref": audio_ref,
+                    "transcript": outcome.result.text,
+                    "confidence": outcome.result.confidence,
+                    "duration_ms": outcome.result.duration_ms,
+                    "detected_language": outcome.result.detected_language,
                     "question_field_key": question_field_key,
-                    "audio_size": len(audio),
                 },
                 ensure_ascii=False,
             ),

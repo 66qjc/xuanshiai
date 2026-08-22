@@ -41,6 +41,9 @@ Thumbs.db
 .superpowers/
 graphify-out/
 inspiration_linker.db
+# Binary audio smoke-test outputs (not source-controlled)
+artifacts/tts_smoke.mp3
+artifacts/tts_smoke.wav
 docs/后端功能模块划分汇总.md
 docs/后端功能清单评估.md
 docs/首页和我的页面后端任务划分.md

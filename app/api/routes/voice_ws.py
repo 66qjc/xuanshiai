@@ -33,7 +33,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import inspect
 import json
 import logging
 import uuid
@@ -217,7 +216,7 @@ async def voice_conversation(
                         ws, "AI_INPUT_INVALID", "未先发送 session_start"
                     )
                     continue
-                # 创建 ASR client（mock 或真实 aliyun）。
+                # 创建 ASR client（阿里云实时流式 ASR）。
                 voice_provider = get_voice_provider(
                     settings.ai_voice_provider
                 )
@@ -228,52 +227,33 @@ async def voice_conversation(
                     model=settings.ai_aliyun_voice_asr_model,
                     field_key=field_key,
                 )
-                # mock provider 返回 async generator；aliyun 返回 client 实例。
-                # mock stream_transcribe 是 async generator function（含 yield），
-                # 调用时返回 async generator，不能 await。Aliyun provider 是普通
-                # coroutine（含 return），需 await。用 inspect 判断。
-                raw_result = voice_provider.stream_transcribe(
+                asr_result = await voice_provider.stream_transcribe(
                     stream_request, on_partial=None
                 )
-                if inspect.isasyncgen(raw_result):
-                    # mock: async generator — 直接交给 drain task 消费。
-                    asr_client = None
-                    partial_task = asyncio.create_task(
-                        _drain_mock_partials(ws, raw_result)
+                asr_client = asr_result
+                try:
+                    await asr_client.connect(
+                        app_key=stream_request.app_key,
+                        model=stream_request.model,
                     )
-                else:
-                    asr_result = await raw_result
-                    if hasattr(asr_result, "connect"):
-                        # 真实 aliyun client：需要显式 connect。
-                        asr_client = asr_result
-                        try:
-                            await asr_client.connect(
-                                app_key=stream_request.app_key,
-                                model=stream_request.model,
-                            )
-                        except _AliyunVoiceError as exc:
-                            await _send_error(
-                                ws,
-                                "AI_TEMPORARILY_UNAVAILABLE",
-                                "语音识别连接失败",
-                            )
-                            logger.warning(
-                                "voice_ws_asr_connect_failed request_id=%s "
-                                "err=%s",
-                                request_id,
-                                type(exc).__name__,
-                            )
-                            asr_client = None
-                            continue
-                        # 启动 partial_results 后台消费。
-                        partial_task = asyncio.create_task(
-                            _drain_partials(ws, asr_client)
-                        )
-                    else:
-                        # 非预期返回类型：按 mock generator 处理。
-                        partial_task = asyncio.create_task(
-                            _drain_mock_partials(ws, asr_result)
-                        )
+                except _AliyunVoiceError as exc:
+                    await _send_error(
+                        ws,
+                        "AI_TEMPORARILY_UNAVAILABLE",
+                        "语音识别连接失败",
+                    )
+                    logger.warning(
+                        "voice_ws_asr_connect_failed request_id=%s "
+                        "err=%s",
+                        request_id,
+                        type(exc).__name__,
+                    )
+                    asr_client = None
+                    continue
+                # 启动 partial_results 后台消费。
+                partial_task = asyncio.create_task(
+                    _drain_partials(ws, asr_client)
+                )
                 orchestrator.start_listening(
                     session_id=session_id,
                     field_key=field_key,
@@ -282,7 +262,6 @@ async def voice_conversation(
 
             elif msg_type == "audio_chunk":
                 if asr_client is None:
-                    # mock 模式：audio_chunk 无操作（generator 自驱）。
                     continue
                 data_b64 = message.get("data", "")
                 try:
@@ -322,13 +301,6 @@ async def voice_conversation(
                         )
                         asr_client = None
                         continue
-                else:
-                    # mock generator：partial_task 完成后最终文本由 drain 收集。
-                    if partial_task is not None:
-                        await partial_task
-                        partial_task = None
-                    final_transcript = _mock_final_store.get("text", "")
-                    _mock_final_store.pop("text", None)
                 if final_transcript:
                     await _send_json(
                         ws,
@@ -438,39 +410,6 @@ async def _drain_partials(ws: WebSocket, asr_client: Any) -> None:
         logger.debug(
             "voice_ws_partial_drain_error err=%s", type(exc).__name__
         )
-
-
-async def _drain_mock_partials(
-    ws: WebSocket, generator: Any
-) -> None:
-    """后台消费 mock async generator 的部分结果，推送给前端。
-
-    mock generator 的最终结果（``is_final=True``）由 audio_end 通过
-    orchestrator.process_transcript 路径处理；这里只推送 ``is_final=False``
-    的部分结果。最终转写文本由 mock 内部状态推导。
-    """
-    try:
-        async for transcript in generator:
-            if hasattr(transcript, "is_final") and transcript.is_final:
-                # 最终结果：暂存，由 audio_end 路径读取。这里不推送 final。
-                _mock_final_store["text"] = transcript.text
-                continue
-            text = (
-                transcript.text
-                if hasattr(transcript, "text")
-                else str(transcript)
-            )
-            await _send_json(
-                ws, {"type": "partial_transcript", "text": text}
-            )
-    except Exception as exc:  # noqa: BLE001
-        logger.debug(
-            "voice_ws_mock_drain_error err=%s", type(exc).__name__
-        )
-
-
-# mock 最终文本暂存（单轮对话，非并发安全；mock 联调用）。
-_mock_final_store: dict[str, str] = {}
 
 
 __all__ = ["router"]

@@ -48,12 +48,15 @@ _TOKEN_TTL_SECONDS = 86400
 # Token 提前刷新阈值（秒）：过期前 5 分钟刷新，避免边界竞态。
 _TOKEN_REFRESH_MARGIN_SECONDS = 300
 
-# 协议消息 header.action / header.name 枚举。
+# 协议消息 header.action / header.name 枚举（真实协议事件名，经抓包确认）。
 _ACTION_START_TRANSCRIPTION = "StartTranscription"
 _ACTION_STOP_TRANSCRIPTION = "StopTranscription"
-_NAME_SENTENCE_RESULT = "SentenceResult"
-_NAME_TRANSCRIPTION_RESULT = "TranscriptionResult"
 _NAME_TRANSCRIPTION_STARTED = "TranscriptionStarted"
+_NAME_SENTENCE_BEGIN = "SentenceBegin"
+# 部分识别结果（边说边出字的中间文本）。
+_NAME_TRANSCRIPTION_RESULT_CHANGED = "TranscriptionResultChanged"
+# 句子定稿（payload.result 为该句最终文本；整轮最终文本由各句累积）。
+_NAME_SENTENCE_END = "SentenceEnd"
 _NAME_TRANSCRIPTION_COMPLETED = "TranscriptionCompleted"
 _NAME_TASK_FAILED = "TaskFailed"
 
@@ -97,9 +100,13 @@ class AliyunStreamASRClient:
         self._connection: ClientConnection | None = None
         self._task_id = uuid.uuid4().hex
         self._connected = False
+        # connect 时记录，StopTranscription 等后续控制帧的 header 需要。
+        self._app_key = ""
         # partial_results 的结果队列与后台 drain task。
         self._result_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         self._drain_task: asyncio.Task[None] | None = None
+        # TranscriptionStarted 握手事件：收到服务端确认后才允许发音频。
+        self._started_event: asyncio.Event | None = None
         self._final_text = ""
         self._completed = False
         # Token 缓存：(token, expire_timestamp)。
@@ -141,25 +148,34 @@ class AliyunStreamASRClient:
         app_key: str,
         model: str = "paraformer-realtime-v2",
         token: str | None = None,
+        sample_rate: int = 16000,
     ) -> None:
         """建立 NLS WebSocket 连接并发送 ``StartTranscription`` 配置帧。
 
         ``token`` 为 None 时自动调用 :meth:`get_token` 获取。连接成功后
         启动后台 drain task 持续接收服务端推送的识别结果。
+
+        ``sample_rate`` 必须与控制台项目"实时语音识别"功能绑定的模型
+        采样率一致（8000 或 16000），不匹配时服务端收不到任何识别结果、
+        最终以 IDLE_TIMEOUT 失败。
         """
         if self._connected:
             raise _AliyunAPIError("ASR client 已连接，不可重复 connect")
         nls_token = token or await self.get_token()
         if not app_key:
             raise _AliyunAuthError("实时 ASR 缺少 AppKey 配置")
+        self._app_key = app_key
 
         connect_fn = self._ws_connect or _default_ws_connect
+        # token 必须拼在 URL query 上：仅放 header 时网关能握手、
+        # 控制帧正常，但引擎不接收音频流（表现为 IDLE_TIMEOUT 无结果）。
+        sep = "&" if "?" in self._ws_url else "?"
+        connect_url = f"{self._ws_url}{sep}token={nls_token}"
         try:
             self._connection = await connect_fn(
-                self._ws_url,
+                connect_url,
                 additional_headers={
                     "X-NLS-Token": nls_token,
-                    "Authorization": f"Bearer {nls_token}",
                 },
             )
         except _AliyunVoiceError:
@@ -178,6 +194,8 @@ class AliyunStreamASRClient:
             ) from exc
 
         # 发送 StartTranscription 控制帧（阿里云 NLS 实时 ASR JSON 协议）。
+        # 注意：payload 只发协议支持的参数——模型由控制台项目配置绑定，
+        # 发 "model" 等未知字段会被服务端以 40000002 invalid message 拒绝。
         start_frame = {
             "header": {
                 "message_id": uuid.uuid4().hex,
@@ -188,20 +206,25 @@ class AliyunStreamASRClient:
             },
             "payload": {
                 "format": "pcm",
-                "sample_rate": 16000,
+                "sample_rate": sample_rate,
                 "enable_intermediate_result": True,
                 "enable_punctuation_prediction": True,
                 "enable_inverse_text_normalization": True,
-                "model": model,
-            },
-            "context": {
-                "sdk": {"name": "xuanshiai-asr", "version": "1.0.0"},
             },
         }
         await self._send_json(start_frame)
-        self._connected = True
-        # 启动后台 drain task 接收识别结果。
+        # 等服务端 TranscriptionStarted 确认后才算连接就绪——
+        # 握手完成前发二进制音频会被以 40000002（state ROUTING）拒绝。
+        self._started_event = asyncio.Event()
         self._drain_task = asyncio.create_task(self._drain_results())
+        try:
+            await asyncio.wait_for(self._started_event.wait(), timeout=10.0)
+        except asyncio.TimeoutError as exc:
+            await self._close()
+            raise _AliyunTimeoutError(
+                "等待 NLS TranscriptionStarted 超时"
+            ) from exc
+        self._connected = True
         logger.info(
             "asr_stream_connected task_id=%s model=%s",
             self._task_id,
@@ -237,17 +260,21 @@ class AliyunStreamASRClient:
         阻塞直到收到 ``TranscriptionCompleted`` 或 drain task 结束。返回
         本轮对话的最终转写文本（不含原始音频）。
         """
-        if not self._connected or self._connection is None:
-            raise _AliyunAPIError("ASR client 未连接，无法 finish")
         if self._completed:
             return self._final_text
-        # 发送 StopTranscription 控制帧。
+        if not self._connected or self._connection is None:
+            # 连接已被服务端关闭（如已提前收到 TranscriptionCompleted）：
+            # 返回已累积的文本而非抛错，finish 语义是"取走最终结果"。
+            self._completed = True
+            return self._final_text
+        # 发送 StopTranscription 控制帧（阿里云要求每个控制帧 header 都带 appkey）。
         stop_frame = {
             "header": {
                 "message_id": uuid.uuid4().hex,
                 "task_id": self._task_id,
                 "namespace": "SpeechTranscriber",
                 "name": _ACTION_STOP_TRANSCRIPTION,
+                "appkey": self._app_key,
             },
             "payload": {},
         }
@@ -326,26 +353,28 @@ class AliyunStreamASRClient:
         header = frame.get("header", {})
         name = header.get("name")
         payload = frame.get("payload", {})
-        if name == _NAME_SENTENCE_RESULT:
-            is_final = bool(payload.get("is_sentence_end", False))
+        if name == _NAME_TRANSCRIPTION_STARTED:
+            # 握手确认：connect() 的等待在此解除。
+            if self._started_event is not None:
+                self._started_event.set()
+        elif name == _NAME_TRANSCRIPTION_RESULT_CHANGED:
+            # 部分识别结果（边说边出字的中间文本）。
             text = str(payload.get("result", "")).strip()
             if text:
-                if is_final:
-                    # 句子结束也是部分结果，但不是整轮最终文本。
-                    await self._result_queue.put(
-                        {"text": text, "is_final": False}
-                    )
-                else:
-                    await self._result_queue.put(
-                        {"text": text, "is_final": False}
-                    )
-        elif name == _NAME_TRANSCRIPTION_RESULT:
+                await self._result_queue.put(
+                    {"text": text, "is_final": False}
+                )
+        elif name == _NAME_SENTENCE_END:
+            # 句子定稿：payload.result 是该句最终文本，累积为整轮最终文本；
+            # 同时入队推送（前端可见句子级定稿）。
             text = str(payload.get("result", "")).strip()
             if text:
-                # 最终文本：直接设置 _final_text，同时入队供 partial_results
-                # 生成器感知结束（is_final=True 的项会被生成器跳过）。
-                self._final_text = text
-                await self._result_queue.put({"text": text, "is_final": True})
+                self._final_text = (
+                    f"{self._final_text}{text}" if self._final_text else text
+                )
+                await self._result_queue.put(
+                    {"text": text, "is_final": False}
+                )
         elif name == _NAME_TASK_FAILED:
             error_msg = payload.get("error_message") or header.get(
                 "status_text", "NLS 任务失败"
@@ -353,13 +382,15 @@ class AliyunStreamASRClient:
             logger.warning(
                 "asr_stream_task_failed task_id=%s msg=%s",
                 self._task_id,
-                type(error_msg).__name__,
+                str(error_msg)[:200],
             )
         elif name == _NAME_TRANSCRIPTION_COMPLETED:
-            # 服务端确认结束：drain 循环会在连接关闭后退出。
+            # 服务端确认结束：主动关连接让 drain 循环退出，
+            # 否则服务端等待客户端关闭会以 IDLE_TIMEOUT 收尾。
             logger.info(
                 "asr_stream_completed task_id=%s", self._task_id
             )
+            await self._close()
 
     async def _send_json(self, frame: dict[str, Any]) -> None:
         """发送一个 JSON 控制帧到 NLS WebSocket。"""
@@ -399,11 +430,17 @@ async def _default_ws_connect(
     """默认 WebSocket 连接工厂：用 ``websockets`` v16 asyncio client。
 
     与 :class:`AliyunStreamASRClient` 解耦，便于测试注入 mock 连接工厂。
+
+    ``compression=None`` 禁用 permessage-deflate：NLS 网关对压缩二进制
+    音频帧会静默丢弃（表现为收不到任何识别结果、最终 IDLE_TIMEOUT），
+    官方 SDK 基于 websocket-client 默认也不启用压缩。
     """
     import websockets
 
     # websockets v16 的 connect 接受 additional_headers 传递鉴权 header。
-    return await websockets.connect(url, additional_headers=additional_headers)
+    return await websockets.connect(
+        url, additional_headers=additional_headers, compression=None
+    )
 
 
 def _sign_nls_request(

@@ -49,20 +49,16 @@ STREAM_CHUNK_MAX_BYTES = 10 * 1024
 class TranscribeRequest:
     """Minimal input for speech-to-text.
 
-    ``audio_ref`` is a storage reference (relative path or object key) to the
-    uploaded audio file; never raw bytes or a public URL.  The Gateway and
-    provider resolve it to the actual storage location.
-
-    ``question_field_key`` carries the profile field key (e.g. ``"age"``)
-    for mock fixture matching; real providers ignore it.
+    ``audio_bytes`` is the raw audio binary content POSTed directly to the
+    Aliyun one-sentence ASR REST API.  The route layer passes the uploaded
+    bytes straight through — no local file storage, no ``audio_ref`` indirection.
     """
 
-    audio_ref: str
+    audio_bytes: bytes
     audio_format: str = "mp3"
     sample_rate: int = DEFAULT_SAMPLE_RATE
     max_duration_seconds: int = MAX_AUDIO_DURATION_SECONDS
     locale: str | None = None
-    question_field_key: str = ""
 
 
 class TranscribeResult(BaseModel):
@@ -87,7 +83,7 @@ class SynthesizeRequest:
     """
 
     text: str
-    voice: str = "default"
+    voice: str = "xiaoyun"
     locale: str | None = None
     speed: float = 1.0
     audio_format: str = "mp3"

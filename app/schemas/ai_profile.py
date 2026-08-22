@@ -429,3 +429,5 @@ class ProfileNarrativeRead(BaseModel):
     ideal_weights: list[ProfileNarrativeIdealWeight] = []
     recent_change: ProfileNarrativeRecentChange | None = None
     history_observations: list[ProfileNarrativeHistoryObservation] = []
+    # 写在最后：整份画像的概括性收束（旧画像无此字段时为空串）。
+    conclusion: str = ""

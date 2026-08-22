@@ -88,7 +88,7 @@ PROFILE_CONSENT_SCOPE = "profile_text_extract"
 
 # 画像叙事层（narrative）版本常量——发布后生成人格画像解读成品。
 NARRATIVE_SCHEMA_VERSION = "profile-narrative-v1"
-NARRATIVE_PROMPT_VERSION = "profile-narrative-prompt-v1"
+NARRATIVE_PROMPT_VERSION = "profile-narrative-prompt-v4"
 _NARRATIVE_TASK_TYPE = "profile_narrative"
 
 # 会话依赖的当前 revision 版本变化（profile/preference 任一）即视为 stale，

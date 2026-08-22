@@ -122,7 +122,8 @@ class Settings(BaseSettings):
     ai_compatibility_shadow_enabled: bool = False
     # 一期默认 mock；deepseek 为首个真 provider（开发/测试可用，生产启用需
     # 先满足 ai_policy_approved / ai_provider_approved / retention 三道门禁）。
-    ai_provider: Literal["mock", "deepseek"] = "mock"
+    # dots 为小红书 hi lab dots.llm 的 OpenAI 兼容 API provider。
+    ai_provider: Literal["mock", "deepseek", "dots"] = "mock"
     # 生产启用门禁（Task 1 冻结）：缺任一批准项则校验失败。
     ai_policy_approved: bool = False
     ai_provider_approved: bool = False
@@ -137,11 +138,20 @@ class Settings(BaseSettings):
     ai_deepseek_model: str = "deepseek-v4-flash"
     ai_deepseek_max_tokens: int = Field(default=2048, gt=0, le=8192)
 
+    # Dots provider 配置（小红书 hi lab dots.llm，OpenAI 兼容 API）。真实
+    # api_key 仅存于被忽略的 .env；.env.example 只放占位符。dots3-note-prev
+    # 是推理模型（返回 reasoning_content + content），max_tokens 需覆盖推理
+    # 消耗，默认给到 4096。
+    ai_dots_api_key: SecretStr | None = None
+    ai_dots_base_url: str = "https://note3-prev-api.askdiandian.com/v1"
+    ai_dots_model: str = "dots3-note-prev"
+    ai_dots_max_tokens: int = Field(default=4096, gt=0, le=8192)
+
     # ==================== 语音（STT/TTS）功能开关与配置 ====================
-    # P-04 / Phase 4。一期默认关闭、provider 为 mock。生产启用需满足三道
-    # 审批门禁且 voice provider 不为 mock（见 _validate_ai_feature_gates）。
+    # P-04 / Phase 4。默认关闭。生产启用需满足三道审批门禁 + AccessKey 配置
+    # （见 _validate_ai_feature_gates 的 fail-closed 检查）。
     ai_voice_enabled: bool = False
-    ai_voice_provider: Literal["mock", "aliyun"] = "mock"
+    ai_voice_provider: Literal["aliyun"] = "aliyun"
     # 阿里云智能语音交互（NLS）配置。api_key/app_key 仅存于被忽略的 .env，
     # 不进 .env.example；生产启用需先走语音 Provider 审批 + DPA / 数据出境审查。
     ai_aliyun_voice_api_key: SecretStr | None = None
@@ -158,8 +168,8 @@ class Settings(BaseSettings):
 
     # ==================== 实时半双工语音对话（P-04b）====================
     # 实时对话模式开关：默认关闭。生产环境 fail closed（见
-    # ``_validate_ai_feature_gates``）：需满足三道审批门禁且 voice provider
-    # 不为 mock。实时 ASR 鉴权需要 AccessKey ID/Secret（不只是 api_key/app_key），
+    # ``_validate_ai_feature_gates``）：需满足三道审批门禁 + AccessKey 配置。
+    # 实时 ASR 鉴权需要 AccessKey ID/Secret（不只是 api_key/app_key），
     # 用以换取 NLS Token；该凭据仅存于被忽略的 .env，不进 .env.example。
     ai_voice_conversation_enabled: bool = False
     ai_aliyun_voice_access_key_id: SecretStr | None = None
@@ -167,7 +177,11 @@ class Settings(BaseSettings):
     # 单次实时对话轮次最长音频时长（秒），与前端实时录音上限对齐。
     ai_voice_conversation_max_turn_seconds: int = Field(default=60, gt=0, le=300)
     # 实时 ASR WebSocket 接入点（阿里云 NLS 实时语音识别）。
-    ai_aliyun_voice_asr_ws_url: str = "wss://nls-gateway.cn-shanghai.aliyuncs.com/ws/v1"
+    # 注意必须是连字符域名 nls-gateway-cn-shanghai（官方文档标准）：
+    # 点分域名 nls-gateway.cn-shanghai 能握手但引擎不产出任何识别结果。
+    ai_aliyun_voice_asr_ws_url: str = (
+        "wss://nls-gateway-cn-shanghai.aliyuncs.com/ws/v1"
+    )
 
     # AI 任务/租约/重试/限流配置。
     ai_lease_seconds: int = Field(default=300, gt=0, le=3600)
@@ -203,6 +217,8 @@ class Settings(BaseSettings):
         """
         if self.ai_provider == "deepseek":
             return self.ai_deepseek_model
+        if self.ai_provider == "dots":
+            return self.ai_dots_model
         return "mock-model-v1"
 
     @property
@@ -210,11 +226,9 @@ class Settings(BaseSettings):
         """语音 provider 对应的模型名，用于语音任务审计元数据。
 
         STT 与 TTS 模型不同，这里返回 ASR 模型作为代表；TTS 审计由
-        VoiceGateway 场景区分。mock 时返回固定占位。
+        VoiceGateway 场景区分。
         """
-        if self.ai_voice_provider == "aliyun":
-            return self.ai_aliyun_voice_asr_model
-        return "mock-voice-v1"
+        return self.ai_aliyun_voice_asr_model
 
     @property
     def agreement_versions(self) -> dict[str, str]:
@@ -301,18 +315,12 @@ class Settings(BaseSettings):
             )
         if self.ai_provider == "mock":
             raise ValueError("生产环境禁止使用 mock AI Provider")
-        if self.ai_voice_enabled and self.ai_voice_provider == "mock":
-            raise ValueError("生产环境启用语音功能禁止使用 mock Voice Provider")
         if self.ai_voice_conversation_enabled:
-            # 实时对话模式同样需要三道审批门禁，且禁止 mock provider。
+            # 实时对话模式同样需要三道审批门禁。
             if not self.ai_approvals_complete():
                 raise ValueError(
                     "生产环境启用实时语音对话必须同时满足 ai_policy_approved、"
                     "ai_provider_approved 和 ai_retention_policy_version"
-                )
-            if self.ai_voice_provider == "mock":
-                raise ValueError(
-                    "生产环境启用实时语音对话禁止使用 mock Voice Provider"
                 )
             # 实时 ASR 需要 AccessKey 鉴权（换取 NLS Token），与 REST 模式的
             # api_key/app_key 不同：缺 AccessKey 直接 fail closed。

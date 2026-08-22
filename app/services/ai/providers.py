@@ -1,8 +1,9 @@
 """AI providers and the provider registry.
 
 ``MockAIProvider`` is the deterministic fixture provider with failure injection.
-``DeepSeekAIProvider`` is the first real provider, using DeepSeek's OpenAI-compatible
-API with JSON output mode for structured extraction and search parsing. It is
+Real providers share the ``_OpenAICompatProvider`` base (OpenAI-compatible chat
+API + JSON output mode): ``DeepSeekAIProvider`` was the first, and
+``DotsAIProvider``（小红书 hi lab dots.llm）follows the same pattern. They are
 intended for development/testing only — production enablement requires the full
 approval gate (``ai_policy_approved`` / ``ai_provider_approved`` / retention).
 """
@@ -11,8 +12,11 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from collections.abc import Callable, Iterable
 from typing import Any
+
+from pydantic import SecretStr, ValidationError
 
 from app.core.config import settings
 from app.schemas.ai_profile import ProfileSubject
@@ -29,6 +33,8 @@ from app.services.ai.base import (
     NarrativeResult,
     ProviderError,
     ProviderErrorKind,
+    ReplyRequest,
+    ReplyResult,
     SearchCondition,
     SearchParseRequest,
     SearchParseResult,
@@ -38,6 +44,7 @@ from app.services.ai.base import (
 from app.services.ai.prompts.profile_extract import build_profile_extract_prompt
 from app.services.ai.prompts.profile_narrative import build_profile_narrative_prompt
 from app.services.ai.prompts.search_parse import build_search_parse_prompt
+from app.services.ai.prompts.voice_reply import build_voice_reply_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -65,11 +72,11 @@ from openai import (  # noqa: E402
 )
 
 
-def _build_deepseek_client(api_key: Any) -> AsyncOpenAI:
-    """构造 DeepSeek 的 OpenAI 兼容异步客户端。"""
+def _build_openai_compat_client(api_key: Any, base_url: str) -> AsyncOpenAI:
+    """构造 OpenAI 兼容 API 的异步客户端（DeepSeek / Dots 共用）。"""
     return AsyncOpenAI(
         api_key=api_key.get_secret_value() if hasattr(api_key, "get_secret_value") else api_key,
-        base_url=settings.ai_deepseek_base_url,
+        base_url=base_url,
     )
 
 # Deterministic fixture field values for profile extraction. Keys are the
@@ -172,6 +179,7 @@ _NARRATIVE_FIXTURE_PERSONAL = NarrativeResult(
             observation="你现在比以前更加确定自己想要怎样的关系。",
         ),
     ),
+    conclusion="总的来说，你要的并不复杂——一份能彼此回应的关系，和一段能一起慢慢走远的路。",
 )
 
 _NARRATIVE_FIXTURE_IDEAL_PARTNER = NarrativeResult(
@@ -215,6 +223,7 @@ _NARRATIVE_FIXTURE_IDEAL_PARTNER = NarrativeResult(
             observation="你现在比以前更加确定自己想要怎样的关系。",
         ),
     ),
+    conclusion="总的来说，你要的并不复杂——一份能彼此回应的关系，和一段能一起慢慢走远的路。",
 )
 
 
@@ -287,6 +296,12 @@ class MockAIProvider:
         self._check_failure("generate_narrative")
         is_personal = request.subject == ProfileSubject.PERSONAL.value
         return _NARRATIVE_FIXTURE_PERSONAL if is_personal else _NARRATIVE_FIXTURE_IDEAL_PARTNER
+
+    async def generate_reply(
+        self, request: ReplyRequest
+    ) -> ReplyResult:
+        self._check_failure("generate_reply")
+        return ReplyResult(reply_text="好的，记下啦。那你现在生活在哪个城市呀？")
 
     # ------------------------------------------------------------------
     # Deterministic fixture accessor (used by the acceptance test)
@@ -400,7 +415,7 @@ class MockAIProvider:
         return tuple(fields)
 
 
-# ==================== DeepSeek provider ====================
+# ==================== OpenAI 兼容真 provider（DeepSeek / Dots） ====================
 
 # 版本常量与业务模块保持一致，确保审计元数据可追溯。
 _PROFILE_SCHEMA_VERSION = "profile-extract-v1"
@@ -429,7 +444,7 @@ def _safe_confidence(value: Any) -> float:
 
 
 def _parse_json_response(content: str) -> Any:
-    """解析 DeepSeek 返回的 JSON 内容，空内容或格式错误转为 ProviderError。"""
+    """解析 OpenAI 兼容 provider 返回的 JSON 内容，空内容或格式错误转为 ProviderError。"""
     if not content or not content.strip():
         raise ProviderError(
             code="AI_INPUT_INVALID",
@@ -446,27 +461,108 @@ def _parse_json_response(content: str) -> Any:
         ) from exc
 
 
-class DeepSeekAIProvider:
-    """DeepSeek 真 provider，通过 OpenAI 兼容 API 调用。
+# ideal_weights 维度中文名 → 稳定 key（与前端 mock / DESIGN 组件语言对齐）。
+_IDEAL_WEIGHT_KEY_BY_LABEL = {
+    "价值观": "values",
+    "沟通方式": "communication",
+    "情绪稳定": "emotion",
+    "生活节奏": "lifestyle",
+    "外在条件": "appearance",
+}
+
+
+def _normalize_narrative_payload(data: Any) -> Any:
+    """把模型对叙事 JSON 的常见漂移写法归一为 schema 期望的形状。
+
+    实测 dots3-note-prev（推理模型）偶发输出：
+    - ``ideal_weights`` 项用 ``{"dimension", "weight"}``；
+    - ``dimensions`` 项把 ``summary`` 写成 ``string``；
+    - ``recent_change`` 输出成纯字符串（如"无明显变化"）而非对象；
+    - ``history_observations`` 的 ``revision_id`` 写成 ``"version2"``。
+    在 Gateway schema 校验前做宽容映射；无法识别的内容保持原样交给校验拦截。
+    """
+    if not isinstance(data, dict):
+        return data
+    dims = data.get("dimensions")
+    if isinstance(dims, list):
+        for item in dims:
+            if (
+                isinstance(item, dict)
+                and "summary" not in item
+                and isinstance(item.get("string"), str)
+            ):
+                item["summary"] = item.pop("string")
+    if isinstance(data.get("recent_change"), str):
+        # 无 direction 的纯文本变化描述无法满足 up|down 约束，按无变化处理。
+        data["recent_change"] = None
+    observations = data.get("history_observations")
+    if isinstance(observations, list):
+        fixed: list[Any] = []
+        for item in observations:
+            if isinstance(item, dict) and isinstance(item.get("revision_id"), str):
+                digits = re.sub(r"\D", "", item["revision_id"])
+                if not digits:
+                    continue
+                item["revision_id"] = int(digits)
+            fixed.append(item)
+        data["history_observations"] = fixed
+    weights = data.get("ideal_weights")
+    if not isinstance(weights, list):
+        return data
+    normalized: list[Any] = []
+    for item in weights:
+        if (
+            isinstance(item, dict)
+            and "key" not in item
+            and isinstance(item.get("dimension"), str)
+            and item.get("weight") is not None
+        ):
+            label = item["dimension"]
+            normalized.append(
+                {
+                    "key": _IDEAL_WEIGHT_KEY_BY_LABEL.get(label, label),
+                    "label": label,
+                    "percent": item["weight"],
+                }
+            )
+        else:
+            normalized.append(item)
+    data["ideal_weights"] = normalized
+    return data
+
+
+class _OpenAICompatProvider:
+    """OpenAI 兼容 chat API provider 共享基类（DeepSeek / Dots 复用）。
 
     使用 JSON output mode（response_format=json_object）获取结构化输出，
-    再由本类映射为 ``AIProvider`` Protocol 要求的类型化结果。Gateway 会对
-    返回值做二次 schema 校验，因此即使模型输出偏差也会被拦在业务下游之外。
+    再映射为 ``AIProvider`` Protocol 要求的类型化结果。Gateway 会对返回值做
+    二次 schema 校验，因此即使模型输出偏差也会被拦在业务下游之外。
 
-    开发/测试环境可用；生产启用需先满足三道审批门禁（见 config.py）。
+    子类只需在 __init__ 中从 settings 解析各自的 api_key / base_url / model /
+    max_tokens 后调用 super().__init__()；异常到 ProviderError 的映射与四个
+    Protocol 方法实现均在基类。
     """
 
-    def __init__(self, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        api_key: SecretStr | None,
+        base_url: str,
+        model: str,
+        max_tokens: int,
+        api_key_env: str,
+        **kwargs: Any,
+    ) -> None:
         # 延迟 key 校验到首次调用：__init__ 阶段抛异常会绕过 Gateway.invoke 的
         # except ProviderError（AIGateway 在 handler 内构造），被 worker 的
         # except Exception 误判为 retryable=True。改为在 _chat_json 内抛
         # ProviderError(NON_RETRYABLE)，由 Gateway.invoke 正确分类。
-        api_key = settings.ai_deepseek_api_key
         self._api_key = api_key
+        self._base_url = base_url
         # 测试可通过 kwargs 注入 mock client；生产/开发从 settings 读 key 构造。
         self._client = kwargs.pop("client", None)
-        self._model = settings.ai_deepseek_model
-        self._max_tokens = settings.ai_deepseek_max_tokens
+        self._model = model
+        self._max_tokens = max_tokens
+        self._api_key_env = api_key_env
 
     def _ensure_client(self) -> Any:
         """惰性构造客户端；缺 key 时抛 NON_RETRYABLE ProviderError。
@@ -481,16 +577,16 @@ class DeepSeekAIProvider:
             raise ProviderError(
                 code="AI_INPUT_INVALID",
                 message=(
-                    "DeepSeek provider 缺少 API key，请在 .env 配置 "
-                    "AI_DEEPSEEK_API_KEY（仅开发/测试环境）"
+                    f"{self.__class__.__name__} 缺少 API key，请在 .env 配置 "
+                    f"{self._api_key_env}（仅开发/测试环境）"
                 ),
                 kind=ProviderErrorKind.NON_RETRYABLE,
             )
-        self._client = _build_deepseek_client(self._api_key)
+        self._client = _build_openai_compat_client(self._api_key, self._base_url)
         return self._client
 
     async def _chat_json(self, prompt: str) -> Any:
-        """调用 DeepSeek 并返回解析后的 JSON 对象。"""
+        """调用 OpenAI 兼容 chat API 并返回解析后的 JSON 对象。"""
         client = self._ensure_client()
         try:
             response = await client.chat.completions.create(
@@ -639,10 +735,73 @@ class DeepSeekAIProvider:
             request.history_summaries,
         )
         data = await self._chat_json(prompt)
-        # NarrativeResult.model_validate 会做完整的字段校验
-        # （长度/格式/recent_change direction/ideal_weights percent 范围），
-        # 校验失败会抛 ValidationError，由 Gateway 转为 AI_INPUT_INVALID。
-        return NarrativeResult.model_validate(data)
+        # NarrativeResult.model_validate 做完整字段校验（长度/direction/
+        # percent 范围）。生成是非确定性的：偶发 schema 漂移（归一化覆盖不到
+        # 的）转为可重试 ProviderError，让 Worker 重新生成，而不是一次性判死。
+        try:
+            return NarrativeResult.model_validate(_normalize_narrative_payload(data))
+        except ValidationError as exc:
+            raise ProviderError(
+                code="AI_TEMPORARILY_UNAVAILABLE",
+                message=f"narrative 输出未通过 schema 校验: {exc}",
+                kind=ProviderErrorKind.RETRYABLE,
+            ) from exc
+
+    async def generate_reply(
+        self, request: ReplyRequest
+    ) -> ReplyResult:
+        prompt = build_voice_reply_prompt(
+            request.transcript,
+            request.field_key,
+            request.known_fields,
+        )
+        data = await self._chat_json(prompt)
+        # 回复是自由文本，模型偶发输出超长/空串：schema 漂移转为可重试
+        # 错误，由调用方（对话编排器）降级到模板回复，对话不中断。
+        try:
+            return ReplyResult.model_validate(data)
+        except ValidationError as exc:
+            raise ProviderError(
+                code="AI_TEMPORARILY_UNAVAILABLE",
+                message=f"reply 输出未通过 schema 校验: {exc}",
+                kind=ProviderErrorKind.RETRYABLE,
+            ) from exc
+
+
+class DeepSeekAIProvider(_OpenAICompatProvider):
+    """DeepSeek 真 provider（OpenAI 兼容 API），配置取自 ai_deepseek_*。
+
+    开发/测试环境可用；生产启用需先满足三道审批门禁（见 config.py）。
+    """
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(
+            api_key=settings.ai_deepseek_api_key,
+            base_url=settings.ai_deepseek_base_url,
+            model=settings.ai_deepseek_model,
+            max_tokens=settings.ai_deepseek_max_tokens,
+            api_key_env="AI_DEEPSEEK_API_KEY",
+            **kwargs,
+        )
+
+
+class DotsAIProvider(_OpenAICompatProvider):
+    """Dots（小红书 hi lab dots.llm）真 provider（OpenAI 兼容 API）。
+
+    配置取自 ai_dots_*；dots3-note-prev 为推理模型，响应含
+    reasoning_content + content，_chat_json 只消费 content 中的 JSON。
+    开发/测试环境可用；生产启用需先满足三道审批门禁（见 config.py）。
+    """
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(
+            api_key=settings.ai_dots_api_key,
+            base_url=settings.ai_dots_base_url,
+            model=settings.ai_dots_model,
+            max_tokens=settings.ai_dots_max_tokens,
+            api_key_env="AI_DOTS_API_KEY",
+            **kwargs,
+        )
 
 
 class AIProviderRegistry:
@@ -652,6 +811,7 @@ class AIProviderRegistry:
         self._factories: dict[str, Callable[..., AIProvider]] = {
             "mock": MockAIProvider,
             "deepseek": DeepSeekAIProvider,
+            "dots": DotsAIProvider,
         }
 
     def register(self, name: str, factory: Callable[..., AIProvider]) -> None:

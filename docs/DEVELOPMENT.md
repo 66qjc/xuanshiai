@@ -1,6 +1,6 @@
 # 项目操作文档
 
-本文档记录 Xuanshi AI API 后端项目的常用环境、启动、测试、检查和维护命令。默认命令使用 Windows PowerShell，并在项目根目录 `E:\houduan\xuanshiai` 执行。
+本文档记录 Xuanshi AI API 后端项目的常用环境、启动、测试、检查和维护命令。默认命令使用 Windows PowerShell，并在 `xuanshiai-backend/` 项目根目录执行。
 
 ## 一、环境要求
 

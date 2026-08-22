@@ -35,7 +35,6 @@ from app.schemas.ai_profile import (
 from app.services.ai.compatibility import (
     CompatibilityConsentRequired,
     compute_and_write_shadow,
-    read_compatibility_snapshot,
 )
 from app.services.ai.consents import grant_consent, list_consents
 from app.services.ai.profile import (
@@ -346,8 +345,8 @@ async def main() -> None:
     settings.ai_search_enabled = True
     settings.ai_compatibility_shadow_enabled = True
 
-    print(f"=== M06 Shadow 真实 DeepSeek 验证 ===")
-    print(f"provider={settings.ai_provider} model={settings.ai_deepseek_model}")
+    print("=== M06 Shadow 真实 provider 验证 ===")
+    print(f"provider={settings.ai_provider} model={settings.ai_model_name}")
     print(f"USER_A={USER_A} USER_B={USER_B}")
     print()
 
@@ -417,7 +416,7 @@ async def main() -> None:
         print("\n--- Shadow 指标收集 ---")
         metrics = {
             "provider": settings.ai_provider,
-            "model": settings.ai_deepseek_model,
+            "model": settings.ai_model_name,
             "pairs": [],
         }
         for sr in shadow_results:

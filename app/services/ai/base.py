@@ -192,7 +192,7 @@ class NarrativeResult(BaseModel):
     """Typed provider result for narrative generation (画像叙事层)."""
 
     schema_version: str = Field(default="profile-narrative-v1", min_length=1, max_length=32)
-    prompt_version: str = Field(default="profile-narrative-prompt-v1", min_length=1, max_length=32)
+    prompt_version: str = Field(default="profile-narrative-prompt-v4", min_length=1, max_length=32)
     persona_title: str = Field(..., min_length=1, max_length=64)
     persona_tags: tuple[str, ...] = ()
     insight: str = Field(..., min_length=1, max_length=500)
@@ -200,6 +200,8 @@ class NarrativeResult(BaseModel):
     ideal_weights: tuple[NarrativeIdealWeight, ...] = ()
     recent_change: NarrativeRecentChange | None = None
     history_observations: tuple[NarrativeHistoryObservation, ...] = ()
+    # 写在最后：整份画像的概括性收束（prompt v3 起生成；旧数据无此字段为 None）。
+    conclusion: str | None = Field(default=None, min_length=1, max_length=300)
 
 
 class AIProvider(Protocol):
@@ -220,6 +222,39 @@ class AIProvider(Protocol):
     async def generate_narrative(
         self, request: NarrativeRequest
     ) -> NarrativeResult: ...
+
+    async def generate_reply(
+        self, request: ReplyRequest
+    ) -> ReplyResult: ...
+
+
+@dataclass(frozen=True)
+class ReplyRequest:
+    """Input for one voice-conversation reply generation.
+
+    ``transcript`` is the user's final ASR text for this turn (the only raw
+    user text crossing the boundary).  ``known_fields`` carries already
+    extracted field summaries as plain ``{field_key, value}`` dicts so the
+    reply can reference what is already known without re-asking.
+    """
+
+    transcript: str
+    field_key: str = ""
+    known_fields: tuple[dict[str, Any], ...] = ()
+    consent_version: str = "consent-v1"
+    policy_revision: str = "ai-policy-v1"
+
+
+class ReplyResult(BaseModel):
+    """Typed provider result for one conversational reply.
+
+    ``reply_text`` is spoken aloud via TTS — length is capped to keep the
+    spoken turn short (prompt asks for ≤50 chars; 200 is a hard guard).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    reply_text: str = Field(..., min_length=1, max_length=200)
 
 
 class ProviderErrorKind(str, Enum):

@@ -71,17 +71,19 @@ def _make_started_response() -> str:
     })
 
 
-def _make_sentence_result(text: str, is_end: bool = False) -> str:
+def _make_partial_result(text: str) -> str:
+    """TranscriptionResultChanged：边说边出字的中间结果。"""
     return json.dumps({
-        "header": {"task_id": "t1", "name": "SentenceResult"},
-        "payload": {"result": text, "is_sentence_end": is_end},
+        "header": {"task_id": "t1", "name": "TranscriptionResultChanged"},
+        "payload": {"result": text},
     })
 
 
-def _make_final_result(text: str) -> str:
+def _make_sentence_end(text: str) -> str:
+    """SentenceEnd：句子定稿（payload.result 为该句最终文本）。"""
     return json.dumps({
-        "header": {"task_id": "t1", "name": "TranscriptionResult"},
-        "payload": {"result": text, "is_sentence_end": True},
+        "header": {"task_id": "t1", "name": "SentenceEnd"},
+        "payload": {"result": text},
     })
 
 
@@ -185,12 +187,13 @@ async def test_send_chunk_before_connect_raises(
 
 @pytest.mark.asyncio
 async def test_finish_returns_final_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    """服务端已完成（Completed 已消费、连接已关）时 finish 返回累积文本。"""
     settings = _settings_with_keys()
     monkeypatch.setattr("app.services.voice.stream_provider.settings", settings)
     responses = [
         _make_started_response(),
-        _make_sentence_result("我今年28岁", is_end=False),
-        _make_final_result("我今年28岁，在北京工作"),
+        _make_partial_result("我今年28岁"),
+        _make_sentence_end("我今年28岁，在北京工作"),
         _make_completed_response(),
     ]
     mock_ws = MockWSConnection(responses)
@@ -200,9 +203,55 @@ async def test_finish_returns_final_text(monkeypatch: pytest.MonkeyPatch) -> Non
     await client.connect(app_key="app", token="tok")
     final = await client.finish()
     assert final == "我今年28岁，在北京工作"
-    # 最后发送的应为 StopTranscription。
+
+
+@pytest.mark.asyncio
+async def test_finish_sends_stop_when_server_not_completed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """服务端尚未结束时，finish 发送 StopTranscription 并等待收尾。"""
+    settings = _settings_with_keys()
+    monkeypatch.setattr("app.services.voice.stream_provider.settings", settings)
+    responses = [
+        _make_started_response(),
+        _make_partial_result("我今年28岁"),
+        _make_sentence_end("我今年28岁，在北京工作"),
+    ]
+    mock_ws = MockWSConnection(responses)
+    client = AliyunStreamASRClient(
+        ws_connect=AsyncMock(return_value=mock_ws),
+    )
+    await client.connect(app_key="app", token="tok")
+    # drain task 消费完预录响应后结束（无 Completed），finish 发 Stop。
+    final = await client.finish()
+    assert final == "我今年28岁，在北京工作"
     stop_frame = json.loads(mock_ws.sent_texts[-1])
     assert stop_frame["header"]["name"] == "StopTranscription"
+    assert stop_frame["header"]["appkey"] == "app"
+
+
+@pytest.mark.asyncio
+async def test_finish_accumulates_multiple_sentences(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """多句场景：finish 返回各 SentenceEnd 文本的累积。"""
+    settings = _settings_with_keys()
+    monkeypatch.setattr("app.services.voice.stream_provider.settings", settings)
+    responses = [
+        _make_started_response(),
+        _make_partial_result("你好"),
+        _make_sentence_end("你好，我今年28岁。"),
+        _make_partial_result("我在上海工作"),
+        _make_sentence_end("我在上海工作。"),
+        _make_completed_response(),
+    ]
+    mock_ws = MockWSConnection(responses)
+    client = AliyunStreamASRClient(
+        ws_connect=AsyncMock(return_value=mock_ws),
+    )
+    await client.connect(app_key="app", token="tok")
+    final = await client.finish()
+    assert final == "你好，我今年28岁。我在上海工作。"
 
 
 @pytest.mark.asyncio
@@ -213,9 +262,9 @@ async def test_partial_results_yields_intermediate(
     monkeypatch.setattr("app.services.voice.stream_provider.settings", settings)
     responses = [
         _make_started_response(),
-        _make_sentence_result("我今年", is_end=False),
-        _make_sentence_result("我今年28岁", is_end=False),
-        _make_final_result("我今年28岁，在北京工作"),
+        _make_partial_result("我今年"),
+        _make_partial_result("我今年28岁"),
+        _make_sentence_end("我今年28岁，在北京工作"),
         _make_completed_response(),
     ]
     mock_ws = MockWSConnection(responses)
@@ -227,8 +276,9 @@ async def test_partial_results_yields_intermediate(
     partials: list[str] = []
     async for text in client.partial_results():
         partials.append(text)
-    # 最终结果不通过 partial_results yield，只保留中间结果。
-    assert partials == ["我今年", "我今年28岁"]
+    # 中间结果与句子定稿都通过 partial_results yield（前端边说边出字 +
+    # 句子级确认）；整轮最终文本由 finish() 返回。
+    assert partials == ["我今年", "我今年28岁", "我今年28岁，在北京工作"]
 
 
 @pytest.mark.asyncio
