@@ -54,4 +54,16 @@ def _mock_response(messages: list[dict[str, str]], *, json_mode: bool) -> str:
         return json.dumps({"normalized_query": user.split("\n", 1)[-1][:500], "filters": {}, "unresolved": []}, ensure_ascii=False)
     if "MATCH_EXPLAIN" in user:
         return json.dumps({"reason": "资料中的兴趣和生活方式存在重合，建议从共同兴趣开始交流。", "suggestions": ["可以从共同兴趣开始聊天"]}, ensure_ascii=False)
+    if "ADVISOR_ADVICE" in user:
+        return json.dumps({
+            "analysis": "The reply is brief but not rejecting. Acknowledge it and continue with one light question.",
+            "suggestions": [{
+                "content": "It sounds like we have something in common. Do you prefer relaxing at home or going out on weekends?",
+                "style": "natural",
+                "reason": "Acknowledge common ground, then use one open question without interrogating."
+            }],
+            "risk_level": "none",
+            "risk_notice": None,
+            "next_step": "If replies remain brief, pause repeated questions and give the other person space."
+        }, ensure_ascii=False)
     return "我可以帮你梳理这段聊天，并给出更具体的沟通建议。"
