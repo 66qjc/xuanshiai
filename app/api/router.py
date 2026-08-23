@@ -22,6 +22,8 @@ from app.api.routes import (
     ai,
     certifications,
     community,
+    community_admin,
+    message_admin,
     discovery,
     finance,
     health,

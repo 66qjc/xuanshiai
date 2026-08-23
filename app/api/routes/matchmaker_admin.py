@@ -95,12 +95,12 @@ async def update_product(product_id: int = Path(..., ge=1), body: MatchmakerServ
 
 @router.get("/service-requests", response_model=MatchmakerServiceRequestPage, summary="查询红娘服务申请")
 async def service_requests(status: int | None = Query(None, ge=0, le=3), page: int = Query(1, ge=1, le=1000), page_size: int = Query(20, ge=1, le=50), current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> MatchmakerServiceRequestPage:
-    return await admin_list_service_requests(db, page, page_size, status)
+    return await admin_list_service_requests(db, page, page_size, status, current)
 
 
 @router.patch("/service-requests/{service_id}", response_model=MatchmakerServiceRequestResponse, summary="分配或处理红娘服务申请")
 async def update_service_request(service_id: int = Path(..., ge=1), body: MatchmakerAdminServiceRequestUpdate = ..., current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> MatchmakerServiceRequestResponse:
-    return await admin_update_service_request(db, current.account.id, service_id, body)
+    return await admin_update_service_request(db, current.account.id, service_id, body, current)
 
 
 def _legacy_actor(current: CurrentMatchmakerAdmin) -> CurrentUser:
