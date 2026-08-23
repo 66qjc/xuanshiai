@@ -1,6 +1,6 @@
 """注册身份和红娘申请接口。"""
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies import CurrentMatchmakerAdmin, CurrentUser, get_current_user, get_current_matchmaker_admin
@@ -8,6 +8,7 @@ from app.db.session import get_db
 from app.schemas.auth import (
     MatchmakerApplicationCreate,
     MatchmakerApplicationResponse,
+    MatchmakerApplicationAdminPage,
     MatchmakerReviewRequest,
     RegistrationIntentResponse,
     RegistrationIntentUpdate,
@@ -19,6 +20,8 @@ from app.services.identity import (
     get_registration_intent,
     list_my_applications,
     review_matchmaker_application,
+    admin_list_matchmaker_applications,
+    admin_get_matchmaker_application,
     update_registration_intent,
 )
 
@@ -73,6 +76,32 @@ async def my_matchmaker_applications(
     return await list_my_applications(db, current.id)
 
 
+@router.get("/admin/matchmaker/applications", response_model=MatchmakerApplicationAdminPage, summary="分页查询红娘申请")
+async def admin_matchmaker_applications(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    application_type: str | None = Query(None, max_length=32),
+    status: int | None = Query(None, ge=0, le=3),
+    search: str | None = Query(None, max_length=128),
+    admin: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    admin.require("matchmaker.application.read")
+    return await admin_list_matchmaker_applications(
+        db, page=page, page_size=page_size, application_type=application_type, status=status, search=search
+    )
+
+
+@router.get("/admin/matchmaker/applications/{application_id}", response_model=MatchmakerApplicationResponse, summary="查询红娘申请详情")
+async def admin_matchmaker_application_detail(
+    application_id: int,
+    admin: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    admin.require("matchmaker.application.read")
+    return await admin_get_matchmaker_application(db, application_id)
+
+
 @router.patch("/admin/matchmaker/applications/{application_id}", response_model=MatchmakerApplicationResponse, summary="审核红娘申请")
 async def review_matchmaker_application_endpoint(
     application_id: int,
@@ -81,4 +110,5 @@ async def review_matchmaker_application_endpoint(
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     """管理员审核、驳回或暂停红娘及合伙人申请。"""
+    admin.require("matchmaker.application.review")
     return await review_matchmaker_application(db, admin.account.id, application_id, body)

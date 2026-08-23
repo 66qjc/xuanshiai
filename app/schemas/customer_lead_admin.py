@@ -103,3 +103,21 @@ class CustomerLeadStatistics(BaseModel):
     converted_count: int
     lost_count: int
 
+
+class CustomerLeadAbandonRequest(BaseModel):
+    reason: str = Field(min_length=1, max_length=500)
+
+
+class CustomerLeadRestoreRequest(BaseModel):
+    reason: str = Field(min_length=1, max_length=500)
+
+
+class CustomerLeadAbandonment(BaseModel):
+    id: int
+    lead_id: int
+    reason: str
+    abandoned_by: int
+    abandoned_at: datetime
+    restored_by: int | None
+    restored_at: datetime | None
+    restore_reason: str | None

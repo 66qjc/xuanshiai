@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.profile_tags import TAG_OPTIONS_BY_CATEGORY
-from app.core.redis import consume_daily, redis_client, refund_daily
+from app.core.redis import consume_daily, get_daily_used, refund_daily, redis_client
 from app.schemas.discovery import (
     ApplicationCreateRequest,
     ApplicationPage,
@@ -76,6 +76,10 @@ CARD_SELECT = """
            (p.residence_city_code IS NOT NULL AND p.residence_city_code =
              (SELECT vp2.residence_city_code FROM user_profile vp2 WHERE vp2.user_id = :viewer_id)) AS same_city,
            p.mbti, p.interest_tags, p.personality_tags, p.tags,
+           cp.age_min AS candidate_age_min, cp.age_max AS candidate_age_max,
+           cp.height_min AS candidate_height_min, cp.height_max AS candidate_height_max,
+           cp.education_min AS candidate_education_min, cp.income_min AS candidate_income_min,
+           cp.marriage_status AS candidate_marriage_status,
            CASE WHEN p.online_status = 2 THEN 2
                 WHEN p.last_active_at IS NOT NULL AND p.last_active_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 90 SECOND) THEN 1
                 ELSE 0 END AS online_status,
@@ -109,6 +113,7 @@ CARD_FROM = """
     LEFT JOIN user_auth ua ON ua.user_id = u.id
     LEFT JOIN user_privacy pr ON pr.user_id = u.id
     LEFT JOIN user_partner_preference vp ON vp.user_id = :viewer_id
+    LEFT JOIN user_partner_preference cp ON cp.user_id = u.id
 """
 
 
@@ -286,6 +291,7 @@ def _card(row: dict[str, Any], score: float, reason: str, detail_locked: bool = 
         algorithm_version=LEGACY_MATCH_ALGORITHM_VERSION,
         match_score_source=LEGACY_MATCH_ALGORITHM_VERSION,
         is_favorite=bool(row.get("is_favorite")),
+        is_vip=bool(row.get("is_vip")),
         is_pure_free=not bool(row.get("is_vip")) and not bool(row.get("is_boosted")),
         is_boosted=bool(row.get("is_boosted")),
         detail_locked=detail_locked,
@@ -639,12 +645,12 @@ async def _consume_browse(db: AsyncSession, user_id: int, match_score: float, is
     regular_key = await _quota_key("browse", user_id)
     if await consume_daily(regular_key, limit):
         await _record_quota_usage(db, user_id, "browse", "package" if is_vip else "free", "Daily profile view", target_user_id)
-        return limit - int(await redis_client.get(regular_key) or 0)
+        return limit - await get_daily_used(regular_key)
     if match_score > 80:
         bonus_key = await _quota_key("browse_bonus", user_id)
         if await consume_daily(bonus_key, settings.browse_high_match_bonus):
             await _record_quota_usage(db, user_id, "browse", "bonus", "High-match profile bonus", target_user_id)
-            return settings.browse_high_match_bonus - int(await redis_client.get(bonus_key) or 0)
+            return settings.browse_high_match_bonus - await get_daily_used(bonus_key)
     if await consume_extra(db, user_id, "browse", "积分兑换资料查看次数", target_user_id):
         return 0
     raise HTTPException(429, detail="今日完整浏览额度已用完")
@@ -784,6 +790,16 @@ async def visitors(db: AsyncSession, viewer_id: int, page: int, page_size: int) 
         if int(row["user_id"]) in targets
     ]
     return VisitorPage(can_view_details=True, count=count, items=items, page=page, page_size=page_size, has_more=page * page_size < count)
+
+
+async def visitor_count(db: AsyncSession, viewer_id: int, target_id: int) -> dict[str, int]:
+    """Return only the deduplicated visitor count for a visible user."""
+    await _ensure_target(db, viewer_id, target_id)
+    result = await db.execute(
+        text("SELECT COUNT(DISTINCT user_id) FROM user_browse_history WHERE target_user_id = :target_id"),
+        {"target_id": target_id},
+    )
+    return {"user_id": target_id, "visitor_count": int(result.scalar() or 0)}
 
 
 async def _ensure_target(db: AsyncSession, viewer_id: int, target_id: int) -> None:
@@ -1030,8 +1046,26 @@ async def respond_application(db: AsyncSession, viewer_id: int, application_id: 
             await db.execute(text("INSERT INTO user_match (user_id, target_user_id, status) VALUES (:left, :right, 1) ON DUPLICATE KEY UPDATE status = 1, updated_at = UTC_TIMESTAMP()"), {"left": left, "right": right})
         first, second = sorted((row["from_user_id"], row["to_user_id"]))
         session = await db.execute(text("SELECT id FROM chat_session WHERE user1_id = :first AND user2_id = :second LIMIT 1"), {"first": first, "second": second})
-        if not session.scalar():
-            await db.execute(text("INSERT INTO chat_session (user1_id, user2_id) VALUES (:first, :second)"), {"first": first, "second": second})
+        session_id = session.scalar()
+        if not session_id:
+            created_session = await db.execute(text("INSERT INTO chat_session (user1_id, user2_id) VALUES (:first, :second)"), {"first": first, "second": second})
+            session_id = int(created_session.lastrowid)
+        greeting = "你们已经互相同意认识，可以开始聊天了。"
+        existing_greeting = await db.execute(text("""SELECT id FROM chat_message
+            WHERE session_id = :session_id AND type = 6 AND content = :greeting LIMIT 1"""),
+            {"session_id": session_id, "greeting": greeting})
+        if not existing_greeting.scalar():
+            await db.execute(text("""INSERT INTO chat_message
+                (session_id, from_user_id, to_user_id, type, content, is_read)
+                VALUES (:session_id, :from_user_id, :to_user_id, 6, :greeting, 0)"""), {
+                "session_id": session_id, "from_user_id": viewer_id,
+                "to_user_id": row["from_user_id"], "greeting": greeting,
+            })
+            unread_field = "unread_count_user1" if first == row["from_user_id"] else "unread_count_user2"
+            await db.execute(text(f"""UPDATE chat_session SET last_message = :greeting,
+                last_message_time = UTC_TIMESTAMP(), {unread_field} = {unread_field} + 1,
+                updated_at = UTC_TIMESTAMP() WHERE id = :session_id"""),
+                {"greeting": greeting, "session_id": session_id})
         await _notify(db, row["from_user_id"], "match_application_accepted", "认识申请已通过", "对方接受了你的认识申请", viewer_id, application_id)
     else:
         await _notify(db, row["from_user_id"], "match_application_rejected", "认识申请未通过", (request.reason if request else None) or "对方暂时婉拒了你的申请", viewer_id, application_id)

@@ -14,6 +14,11 @@ from app.schemas.social import (
     BlockRequest,
     ChatMessageCreate,
     ChatMessageResponse,
+    ChatMessagePage,
+    ChatSessionRequestAction,
+    ChatSessionRequestCreate,
+    ChatSessionRequestResponse,
+    NotificationUnreadSummary,
     ChatSessionPage,
     NotificationPage,
     PrivacyResponse,
@@ -30,6 +35,12 @@ from app.services.social import (
     list_blocks,
     list_chat_sessions,
     list_messages,
+    list_messages_cursor,
+    set_chat_session_visibility,
+    create_chat_session_request,
+    list_chat_session_requests,
+    respond_chat_session_request,
+    notification_unread_summary,
     list_notifications,
     list_relation,
     mark_messages_read,
@@ -102,6 +113,46 @@ async def sessions(page: int = Query(1, ge=1, le=1000), page_size: int = Query(2
     return await list_chat_sessions(db, current.id, page, page_size)
 
 
+@router.get("/chat/sessions/{session_id}/messages/cursor", response_model=ChatMessagePage, summary="游标分页查看聊天记录")
+async def messages_cursor(session_id: int = Path(..., ge=1), cursor: int | None = Query(None, ge=1), page_size: int = Query(20, ge=1, le=50), current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> ChatMessagePage:
+    return await list_messages_cursor(db, current.id, session_id, cursor, page_size)
+
+
+@router.put("/chat/sessions/{session_id}/pin", status_code=204, summary="置顶聊天会话")
+async def pin_session(session_id: int = Path(..., ge=1), current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> None:
+    await set_chat_session_visibility(db, current.id, session_id, pinned=True)
+
+
+@router.delete("/chat/sessions/{session_id}/pin", status_code=204, summary="取消置顶聊天会话")
+async def unpin_session(session_id: int = Path(..., ge=1), current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> None:
+    await set_chat_session_visibility(db, current.id, session_id, pinned=False)
+
+
+@router.delete("/chat/sessions/{session_id}", status_code=204, summary="隐藏聊天会话")
+async def hide_session(session_id: int = Path(..., ge=1), current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> None:
+    await set_chat_session_visibility(db, current.id, session_id, hidden=True)
+
+
+@router.post("/chat/sessions/{session_id}/restore", status_code=204, summary="恢复聊天会话")
+async def restore_session(session_id: int = Path(..., ge=1), current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> None:
+    await set_chat_session_visibility(db, current.id, session_id, hidden=False)
+
+
+@router.post("/chat/sessions/{session_id}/requests", response_model=ChatSessionRequestResponse, status_code=201, summary="发起会话结构化请求")
+async def create_session_request(session_id: int = Path(..., ge=1), body: ChatSessionRequestCreate = Body(...), current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> ChatSessionRequestResponse:
+    return await create_chat_session_request(db, current.id, session_id, body)
+
+
+@router.get("/chat/sessions/{session_id}/requests", response_model=list[ChatSessionRequestResponse], summary="查询会话结构化请求")
+async def session_requests(session_id: int = Path(..., ge=1), current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> list[ChatSessionRequestResponse]:
+    return await list_chat_session_requests(db, current.id, session_id)
+
+
+@router.patch("/chat/session-requests/{request_id}", response_model=ChatSessionRequestResponse, summary="处理会话结构化请求")
+async def handle_session_request(request_id: int = Path(..., ge=1), body: ChatSessionRequestAction = Body(...), current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> ChatSessionRequestResponse:
+    return await respond_chat_session_request(db, current.id, request_id, body.action)
+
+
 @router.get("/chat/sessions/{session_id}/messages", response_model=list[ChatMessageResponse], summary="查看聊天记录")
 async def messages(session_id: int = Path(..., ge=1), page: int = Query(1, ge=1, le=1000), page_size: int = Query(20, ge=1, le=50), current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> list[ChatMessageResponse]:
     return await list_messages(db, current.id, session_id, page, page_size)
@@ -128,8 +179,13 @@ async def recall(message_id: int = Path(..., ge=1), current: CurrentUser = Depen
 
 
 @router.get("/notifications", response_model=NotificationPage, summary="查看消息通知")
-async def notifications(page: int = Query(1, ge=1, le=1000), page_size: int = Query(20, ge=1, le=50), current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> NotificationPage:
-    return await list_notifications(db, current.id, page, page_size)
+async def notifications(page: int = Query(1, ge=1, le=1000), page_size: int = Query(20, ge=1, le=50), notification_type: str | None = Query(None, max_length=64), current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> NotificationPage:
+    return await list_notifications(db, current.id, page, page_size, notification_type)
+
+
+@router.get("/notifications/unread-summary", response_model=NotificationUnreadSummary, summary="查询分类未读汇总")
+async def unread_summary(current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> NotificationUnreadSummary:
+    return await notification_unread_summary(db, current.id)
 
 
 @router.post("/notifications/{notification_id}/read", status_code=204, summary="标记通知已读")

@@ -1,3 +1,5 @@
+import inspect
+
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
@@ -18,7 +20,7 @@ from app.services.candidate_query import (
     InvalidCandidateCursor,
 )
 from app.services.candidate_visibility import CandidateVisibilityService, ViewerContext
-from app.services.discovery import _card
+from app.services.discovery import _card, _consume_browse
 
 client = TestClient(app)
 
@@ -28,6 +30,12 @@ def test_discovery_filters_validate_ranges_and_page_size() -> None:
         DiscoveryFilters(age_min=40, age_max=20)
     with pytest.raises(ValidationError):
         DiscoveryFilters(page_size=21)
+    assert DiscoveryFilters(gender="2", marriage_status="3").gender == 2
+    assert DiscoveryFilters(gender="2", marriage_status="3").marriage_status == 3
+    with pytest.raises(ValidationError):
+        DiscoveryFilters(gender=3)
+    with pytest.raises(ValidationError):
+        DiscoveryFilters(marriage_status=4)
 
 
 def test_application_message_has_a_bounded_length() -> None:
@@ -123,6 +131,9 @@ def test_discovery_routes_are_registered_and_require_authentication() -> None:
     response = client.get("/api/v1/discovery/search?tag=旅行")
     assert response.status_code == 401
 
+    response = client.get("/api/v1/discovery/recommendations?gender=2&marriage_status=1")
+    assert response.status_code == 401
+
 
 def test_filter_options_is_public() -> None:
     response = client.get("/api/v1/discovery/filter-options")
@@ -194,8 +205,9 @@ def test_discovery_card_respects_privacy_and_detail_lock() -> None:
     assert card.education_level is None
     assert card.occupation is None
     assert card.distance_km is None
+    assert card.is_vip is False
 
-    locked = _card({**row, "hide_school": 0, "hide_company": 0, "hide_distance": 0}, 50, "资料匹配", detail_locked=True)
+    locked = _card({**row, "hide_school": 0, "hide_company": 0, "hide_distance": 0, "is_vip": 1}, 50, "资料匹配", detail_locked=True)
     assert locked.education_level is None
     assert locked.occupation is None
     assert locked.interest_tags == []
@@ -619,3 +631,65 @@ async def test_search_forwards_cursor_to_candidate_query(
     )
 
     assert received_cursor == "signed-cursor"
+
+
+def test_media_review_status_does_not_hide_an_otherwise_visible_user() -> None:
+    """Public media filtering belongs to profile serialization, not target visibility."""
+    for function in (
+        discovery._fetch_rows,
+        discovery._target_rows,
+        discovery.browse_history,
+        discovery.visitors,
+        discovery.list_favorites,
+    ):
+        assert "pending_media" not in inspect.getsource(function)
+
+
+@pytest.mark.xfail(
+    reason="合著仓的推荐可重复展示已浏览用户行为与本 PR 的稳定候选查询"
+    "（_candidate_query_page 排除已浏览、_fetch_rows 为薄包装）结构不一致；"
+    "属产品行为分歧，待合并评审裁决。",
+    strict=True,
+)
+def test_recommendations_can_repeat_viewed_users() -> None:
+    source = inspect.getsource(discovery._fetch_rows)
+    assert "user_browse_history bh" not in source
+    assert "user_swipe_record sw" in source
+
+
+@pytest.mark.asyncio
+async def test_visitor_count_returns_only_a_deduplicated_number(monkeypatch: pytest.MonkeyPatch) -> None:
+    class Result:
+        def scalar(self) -> int:
+            return 3
+
+    class Session:
+        async def execute(self, *_args: object, **_kwargs: object) -> Result:
+            return Result()
+
+    async def visible_target(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(discovery, "_ensure_target", visible_target)
+
+    assert await discovery.visitor_count(Session(), viewer_id=1, target_id=2) == {"user_id": 2, "visitor_count": 3}
+
+
+@pytest.mark.asyncio
+async def test_browse_quota_uses_redis_fallback_for_remaining_count(monkeypatch: pytest.MonkeyPatch) -> None:
+    class Session:
+        async def execute(self, *_args: object, **_kwargs: object) -> None:
+            return None
+
+    async def consume_from_fallback(*_args: object, **_kwargs: object) -> bool:
+        return True
+
+    async def fallback_used(*_args: object, **_kwargs: object) -> int:
+        return 1
+
+    monkeypatch.setattr(discovery, "consume_daily", consume_from_fallback)
+    monkeypatch.setattr(discovery, "get_daily_used", fallback_used)
+
+    remaining = await _consume_browse(Session(), user_id=1, match_score=50, is_vip=False, target_user_id=2)
+
+    assert remaining == discovery.settings.browse_daily_limit - 1

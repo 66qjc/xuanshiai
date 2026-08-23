@@ -18,6 +18,10 @@ from app.schemas.meeting import (
     MeetingRequestResponse,
     MeetingScheduleCreate,
     MeetingStatusUpdate,
+    MeetingRecordAdminPage,
+    MeetingRequestAdminPage,
+    MeetingRecordAdminUpdate,
+    MeetingFeedbackAdminItem,
 )
 from app.services.social import ensure_users_can_interact
 
@@ -148,3 +152,69 @@ async def create_feedback(db: AsyncSession, current: CurrentUser, meeting_id: in
         "private_feedback": request.private_feedback,
     })
     await db.commit()
+
+
+async def admin_list_requests(db: AsyncSession, page: int, page_size: int, status: str | None = None) -> MeetingRequestAdminPage:
+    where = ["1 = 1"]
+    params: dict[str, object] = {"limit": page_size, "offset": (page - 1) * page_size}
+    if status:
+        where.append("status = :status")
+        params["status"] = status
+    clause = " AND ".join(where)
+    rows = await db.execute(text(f"""SELECT id, user_id, target_user_id, matchmaker_id,
+        service_id, organization_id, status, note, created_at, updated_at
+        FROM meeting_request WHERE {clause} ORDER BY id DESC LIMIT :limit OFFSET :offset"""), params)
+    total = int((await db.execute(text(f"SELECT COUNT(*) FROM meeting_request WHERE {clause}"),
+        {key: value for key, value in params.items() if key not in ("limit", "offset")})).scalar() or 0)
+    return MeetingRequestAdminPage(items=[_request_response(row) for row in rows.mappings().all()], page=page, page_size=page_size, total=total, has_more=page * page_size < total)
+
+
+async def admin_list_meetings(db: AsyncSession, page: int, page_size: int, status: str | None = None) -> MeetingRecordAdminPage:
+    where = ["1 = 1"]
+    params: dict[str, object] = {"limit": page_size, "offset": (page - 1) * page_size}
+    if status:
+        where.append("status = :status")
+        params["status"] = status
+    clause = " AND ".join(where)
+    rows = await db.execute(text(f"""SELECT id, request_id, organizer_id, organization_id,
+        scheduled_at, location, status, cancel_reason, created_at, updated_at
+        FROM meeting_record WHERE {clause} ORDER BY scheduled_at DESC, id DESC
+        LIMIT :limit OFFSET :offset"""), params)
+    total = int((await db.execute(text(f"SELECT COUNT(*) FROM meeting_record WHERE {clause}"),
+        {key: value for key, value in params.items() if key not in ("limit", "offset")})).scalar() or 0)
+    return MeetingRecordAdminPage(items=[_record_response(row) for row in rows.mappings().all()], page=page, page_size=page_size, total=total, has_more=page * page_size < total)
+
+
+async def admin_get_meeting(db: AsyncSession, meeting_id: int) -> MeetingRecordResponse:
+    row = (await db.execute(text("""SELECT id, request_id, organizer_id, organization_id,
+        scheduled_at, location, status, cancel_reason, created_at, updated_at
+        FROM meeting_record WHERE id = :id"""), {"id": meeting_id})).mappings().first()
+    if not row:
+        raise HTTPException(404, detail="约见记录不存在")
+    return _record_response(row)
+
+
+async def admin_update_meeting(db: AsyncSession, meeting_id: int, body: MeetingRecordAdminUpdate, actor_id: int) -> MeetingRecordResponse:
+    current = await admin_get_meeting(db, meeting_id)
+    values = body.model_dump(exclude_unset=True)
+    if current.status == "CANCELLED" and values.get("status") not in (None, "CANCELLED"):
+        raise HTTPException(409, detail="已取消的约见不能恢复")
+    if values.get("status") == "CANCELLED" and not values.get("cancel_reason") and not current.cancel_reason:
+        raise HTTPException(422, detail="取消约见必须填写原因")
+    if values:
+        updates = ", ".join(f"{key} = :{key}" for key in values)
+        await db.execute(text(f"UPDATE meeting_record SET {updates}, updated_at = UTC_TIMESTAMP() WHERE id = :id"),
+            {**values, "id": meeting_id})
+    await db.execute(text("""INSERT INTO business_audit_log
+        (actor_user_id, action, resource_type, resource_id)
+        VALUES (:actor, 'meeting.update', 'meeting_record', :id)"""), {"actor": actor_id, "id": meeting_id})
+    await db.commit()
+    return await admin_get_meeting(db, meeting_id)
+
+
+async def admin_feedback(db: AsyncSession, meeting_id: int) -> list[MeetingFeedbackAdminItem]:
+    await admin_get_meeting(db, meeting_id)
+    rows = await db.execute(text("""SELECT id, meeting_id, user_id, target_rating,
+        matchmaker_rating, continue_intent, private_feedback, created_at
+        FROM meeting_feedback WHERE meeting_id = :id ORDER BY id ASC"""), {"id": meeting_id})
+    return [MeetingFeedbackAdminItem(**dict(row)) for row in rows.mappings().all()]

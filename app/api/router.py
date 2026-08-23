@@ -12,6 +12,9 @@ from app.api.routes import (
     ai_search,
     ai_tasks,
     matchmaker_admin,
+    matchmaker_admin_account,
+    matchmaker_member_admin,
+    organization_admin,
     matchmaker_crm_admin,
     customer_leads_admin,
     matchmaker_dashboard_admin,
@@ -19,9 +22,14 @@ from app.api.routes import (
     activity_admin,
     member_follow_up_admin,
     reward_rule_admin,
+    admin_home,
     auth,
+    ai,
+    ai_advisor,
     certifications,
     community,
+    community_admin,
+    message_admin,
     discovery,
     finance,
     health,
@@ -48,6 +56,8 @@ api_router.include_router(location.router, tags=["位置服务"])
 api_router.include_router(location.users_router, tags=["位置服务"])
 api_router.include_router(health.router, tags=["系统"])
 api_router.include_router(auth.router, tags=["账号与认证"])
+api_router.include_router(ai.router, tags=["AI能力"])
+api_router.include_router(ai_advisor.router, tags=["AIAdvisor"])
 api_router.include_router(users.router, tags=["账号与认证"])
 api_router.include_router(certifications.router, tags=["认证审核"])
 api_router.include_router(membership.router, tags=["会员"])
@@ -67,7 +77,12 @@ api_router.include_router(social.router, tags=["消息"])
 api_router.include_router(community.router, tags=["社区"])
 api_router.include_router(media.router, tags=["社区"])
 api_router.include_router(admin.router, tags=["管理后台"])
+api_router.include_router(admin_home.router, tags=["管理端首页"])
+api_router.include_router(admin_home.legacy_router, tags=["管理端首页兼容"])
 api_router.include_router(matchmaker_admin.router, tags=["红娘后台"])
+api_router.include_router(matchmaker_admin_account.router, tags=["红娘后台"])
+api_router.include_router(matchmaker_member_admin.router, tags=["红娘后台"])
+api_router.include_router(organization_admin.router, tags=["红娘后台"])
 api_router.include_router(matchmaker_crm_admin.router, tags=["红娘后台"])
 api_router.include_router(customer_leads_admin.router, tags=["管理后台"])
 api_router.include_router(matchmaker_dashboard_admin.router, tags=["红娘后台"])
@@ -98,6 +113,7 @@ OPENAPI_TAGS = [
     {"name": "红娘", "description": "红娘申请、服务牵线、约见申请和约会记录。"},
     {"name": "社区", "description": "帖子、评论、互动、话题和纸飞机。"},
     {"name": "消息", "description": "申请认识、匹配、聊天、通知和关系安全。"},
+    {"name": "AI能力", "description": "AI助手、资料润色、自然语言搜索和匹配解释。"},
     {"name": "管理后台", "description": "内容、消息、红娘、财务和运营治理。"},
     {"name": "组织与归属", "description": "门店、组织成员、资源分派、推广和合伙团队。"},
     {"name": "财务与结算", "description": "订单、分成、账本、余额和提现。"},

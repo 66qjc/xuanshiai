@@ -30,6 +30,9 @@ def configure_logging(settings: Settings) -> None:
     if getattr(root_logger, "_xuanshi_configured", False):
         return
 
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
     level = getattr(logging, settings.log_level.upper(), logging.INFO)
     formatter = logging.Formatter(
         fmt=(
@@ -61,4 +64,3 @@ def configure_logging(settings: Settings) -> None:
     root_logger.addHandler(console_handler)
     root_logger.addHandler(file_handler)
     root_logger._xuanshi_configured = True
-

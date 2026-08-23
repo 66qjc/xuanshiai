@@ -184,3 +184,48 @@ async def review_matchmaker_application(
     result = await db.execute(text("""SELECT id, application_type, status, real_name, phone, intro,
         cert_images, application_details, fail_reason, created_at, reviewed_at FROM user_matchmaker_apply WHERE id = :id"""), {"id": application_id})
     return application_response(result.mappings().one())
+
+
+async def admin_list_matchmaker_applications(
+    db: AsyncSession,
+    *,
+    page: int,
+    page_size: int,
+    application_type: str | None = None,
+    status: int | None = None,
+    search: str | None = None,
+) -> dict[str, Any]:
+    where = ["1 = 1"]
+    params: dict[str, Any] = {"limit": page_size, "offset": (page - 1) * page_size}
+    if application_type:
+        where.append("application_type = :application_type")
+        params["application_type"] = application_type
+    if status is not None:
+        where.append("status = :status")
+        params["status"] = status
+    if search:
+        where.append("(real_name LIKE :search OR phone LIKE :search)")
+        params["search"] = f"%{search}%"
+    clause = " AND ".join(where)
+    rows = await db.execute(text(f"""SELECT id, application_type, status, real_name, phone, intro,
+        cert_images, application_details, fail_reason, created_at, reviewed_at
+        FROM user_matchmaker_apply WHERE {clause}
+        ORDER BY created_at DESC, id DESC LIMIT :limit OFFSET :offset"""), params)
+    count_params = {key: value for key, value in params.items() if key not in ("limit", "offset")}
+    total = int((await db.execute(text(f"SELECT COUNT(*) FROM user_matchmaker_apply WHERE {clause}"), count_params)).scalar() or 0)
+    return {
+        "items": [application_response(row) for row in rows.mappings().all()],
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+        "has_more": page * page_size < total,
+    }
+
+
+async def admin_get_matchmaker_application(db: AsyncSession, application_id: int) -> dict[str, Any]:
+    row = (await db.execute(text("""SELECT id, application_type, status, real_name, phone, intro,
+        cert_images, application_details, fail_reason, created_at, reviewed_at
+        FROM user_matchmaker_apply WHERE id = :id"""), {"id": application_id})).mappings().first()
+    if not row:
+        raise HTTPException(404, detail="申请不存在")
+    return application_response(row)

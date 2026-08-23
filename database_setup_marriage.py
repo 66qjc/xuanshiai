@@ -98,7 +98,10 @@ def get_db_config():
 def get_logger(name):
     """获取日志记录器"""
     logger = logging.getLogger(name)
-    if not logger.handlers:
+    root_logger = logging.getLogger()
+    # The FastAPI application configures the root logger before importing this
+    # module. Reusing it prevents each initialization message from being logged twice.
+    if not logger.handlers and not root_logger.handlers:
         if hasattr(sys.stdout, "reconfigure"):
             sys.stdout.reconfigure(encoding="utf-8", errors="replace")
         handler = logging.StreamHandler(sys.stdout)
@@ -265,6 +268,14 @@ class DatabaseManager:
                 'moderation_reason': "`moderation_reason` varchar(255) DEFAULT NULL",
                 'moderated_by': "`moderated_by` bigint unsigned DEFAULT NULL",
                 'moderated_at': "`moderated_at` datetime DEFAULT NULL",
+            },
+            'chat_session': {
+                'user1_pinned_at': "`user1_pinned_at` datetime DEFAULT NULL",
+                'user2_pinned_at': "`user2_pinned_at` datetime DEFAULT NULL",
+            },
+            'matchmaker_admin_account': {
+                'data_scope': "`data_scope` varchar(16) NOT NULL DEFAULT 'SELF' COMMENT 'SELF/STORE/ORGANIZATION/ALL'",
+                'organization_id': "`organization_id` bigint unsigned DEFAULT NULL",
             },
             'user_notification': {
                 'target_type': "`target_type` varchar(32) DEFAULT NULL COMMENT '前端导航目标类型'",
@@ -1553,6 +1564,107 @@ class DatabaseManager:
             """,
 
             # ============================================
+            # AI 助手会话与消息
+            # ============================================
+            'ai_assistant_session': """
+                CREATE TABLE IF NOT EXISTS `ai_assistant_session` (
+                    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+                    `user_id` bigint unsigned NOT NULL,
+                    `title` varchar(80) NOT NULL DEFAULT 'AI助手会话',
+                    `status` tinyint NOT NULL DEFAULT '1',
+                    `created_at` datetime DEFAULT CURRENT_TIMESTAMP,
+                    `updated_at` datetime DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    PRIMARY KEY (`id`),
+                    KEY `idx_ai_session_user` (`user_id`,`status`,`updated_at`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='AI助手会话'
+            """,
+            'ai_assistant_message': """
+                CREATE TABLE IF NOT EXISTS `ai_assistant_message` (
+                    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+                    `session_id` bigint unsigned NOT NULL,
+                    `role` varchar(16) NOT NULL,
+                    `content` text NOT NULL,
+                    `created_at` datetime DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (`id`),
+                    KEY `idx_ai_message_session` (`session_id`,`created_at`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='AI助手消息'
+            """,
+
+            # ============================================
+            'ai_advisor_session': """
+                CREATE TABLE IF NOT EXISTS `ai_advisor_session` (
+                    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+                    `user_id` bigint unsigned NOT NULL,
+                    `advisor_type` varchar(32) NOT NULL DEFAULT 'relationship',
+                    `chat_session_id` bigint unsigned DEFAULT NULL,
+                    `title` varchar(80) NOT NULL DEFAULT 'Relationship advisor',
+                    `status` tinyint NOT NULL DEFAULT '1',
+                    `deleted_at` datetime DEFAULT NULL,
+                    `created_at` datetime DEFAULT CURRENT_TIMESTAMP,
+                    `updated_at` datetime DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    PRIMARY KEY (`id`),
+                    KEY `idx_ai_advisor_session_user` (`user_id`,`status`,`updated_at`),
+                    KEY `idx_ai_advisor_session_chat` (`chat_session_id`,`user_id`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='AI relationship advisor session'
+            """,
+            'ai_advisor_message': """
+                CREATE TABLE IF NOT EXISTS `ai_advisor_message` (
+                    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+                    `session_id` bigint unsigned NOT NULL,
+                    `user_id` bigint unsigned NOT NULL,
+                    `role` varchar(16) NOT NULL,
+                    `scenario` varchar(32) DEFAULT NULL,
+                    `input_text` text DEFAULT NULL,
+                    `output_json` json DEFAULT NULL,
+                    `risk_level` varchar(16) NOT NULL DEFAULT 'none',
+                    `status` varchar(16) NOT NULL DEFAULT 'success',
+                    `model_name` varchar(128) DEFAULT NULL,
+                    `prompt_version` varchar(64) DEFAULT NULL,
+                    `knowledge_version` varchar(64) DEFAULT NULL,
+                    `request_id` varchar(64) DEFAULT NULL,
+                    `latency_ms` int DEFAULT NULL,
+                    `quota_consumed` tinyint NOT NULL DEFAULT '0',
+                    `quota_refunded` tinyint NOT NULL DEFAULT '0',
+                    `created_at` datetime DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (`id`),
+                    KEY `idx_ai_advisor_message_session` (`session_id`,`created_at`),
+                    KEY `idx_ai_advisor_message_user` (`user_id`,`created_at`),
+                    KEY `idx_ai_advisor_message_request` (`request_id`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='AI relationship advisor message'
+            """,
+            'ai_advisor_knowledge': """
+                CREATE TABLE IF NOT EXISTS `ai_advisor_knowledge` (
+                    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+                    `advisor_type` varchar(32) NOT NULL DEFAULT 'relationship',
+                    `category` varchar(32) NOT NULL,
+                    `scenario` varchar(32) NOT NULL,
+                    `relationship_stage` varchar(32) NOT NULL DEFAULT 'new',
+                    `tone` varchar(32) NOT NULL DEFAULT 'natural',
+                    `content` varchar(1000) NOT NULL,
+                    `reason` varchar(1000) DEFAULT NULL,
+                    `risk_level` varchar(16) NOT NULL DEFAULT 'low',
+                    `source` varchar(255) DEFAULT NULL,
+                    `version` varchar(64) NOT NULL DEFAULT 'seed-v1',
+                    `enabled` tinyint NOT NULL DEFAULT '1',
+                    `created_at` datetime DEFAULT CURRENT_TIMESTAMP,
+                    `updated_at` datetime DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    PRIMARY KEY (`id`),
+                    KEY `idx_ai_advisor_knowledge_lookup` (`advisor_type`,`scenario`,`relationship_stage`,`tone`,`enabled`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='AI relationship advisor knowledge'
+            """,
+            'ai_advisor_feedback': """
+                CREATE TABLE IF NOT EXISTS `ai_advisor_feedback` (
+                    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+                    `message_id` bigint unsigned NOT NULL,
+                    `user_id` bigint unsigned NOT NULL,
+                    `feedback_type` varchar(32) NOT NULL,
+                    `created_at` datetime DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (`id`),
+                    UNIQUE KEY `uk_ai_advisor_feedback_user_message` (`message_id`,`user_id`),
+                    KEY `idx_ai_advisor_feedback_user` (`user_id`,`created_at`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='AI relationship advisor feedback'
+            """,
+
             # 22. 社区动态
             # ============================================
             'community_post': """
@@ -2513,6 +2625,14 @@ class DatabaseManager:
             cursor.execute(sql)
             logger.debug(f"表 `{table_name}` 已创建/确认")
 
+        # Keep one explicit bootstrap super-admin for upgraded installations.
+        cursor.execute("""
+            INSERT IGNORE INTO matchmaker_admin_permission (account_id, permission)
+            SELECT first_account.id, '*'
+            FROM matchmaker_admin_account first_account
+            WHERE first_account.id = (SELECT MIN(id) FROM matchmaker_admin_account)
+        """)
+
         # Publish the three initial packages and quota products once. Existing
         # rows remain operator-controlled and are never overwritten.
         cursor.execute("""
@@ -2542,6 +2662,7 @@ class DatabaseManager:
 
         # 兼容已存在的旧库：CREATE TABLE IF NOT EXISTS 不会补齐新增字段。
         self._ensure_required_columns(cursor)
+        self._ensure_admin_home_columns(cursor)
 
         # 旧库的 ai_feature_projection 不会由 CREATE TABLE IF NOT EXISTS 补齐
         # Task 9 新增列（版本向量/可见性/失效原因等），与上面同模式幂等补列
@@ -2561,6 +2682,21 @@ class DatabaseManager:
         self._add_all_foreign_keys(cursor)
 
         logger.info(f"✅ 数据库表结构初始化完成（{len(tables)}张表）")
+
+    def _ensure_admin_home_columns(self, cursor) -> None:
+        """Backfill tenant boundaries for databases created before the admin-home module."""
+        for table_name in (
+            "admin_sms_statistics",
+            "admin_academy_category",
+            "admin_recharge_item",
+            "admin_announcement_version",
+            "admin_announcement",
+        ):
+            cursor.execute(f"SHOW COLUMNS FROM `{table_name}` LIKE 'tenant_id'")
+            if not cursor.fetchone():
+                cursor.execute(
+                    f"ALTER TABLE `{table_name}` ADD COLUMN `tenant_id` bigint unsigned NOT NULL DEFAULT 1 AFTER `id`"
+                )
 
     def _backfill_comment_roots(self, cursor) -> None:
         """Resolve legacy nested replies to their top-level root, one depth at a time."""

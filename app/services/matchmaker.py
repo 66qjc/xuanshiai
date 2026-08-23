@@ -12,7 +12,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.dependencies import CurrentUser
+from app.api.dependencies import CurrentMatchmakerAdmin, CurrentUser
 from app.schemas.matchmaker import (
     MatchmakerAdminServiceRequestUpdate,
     MatchmakerCard,
@@ -33,6 +33,7 @@ from app.schemas.matchmaker import (
     MatchmakerServiceRequestPage,
     MatchmakerServiceRequestResponse,
     MatchmakerServiceRequestUpdate,
+    MatchmakerRatingCreate, MatchmakerRatingPage, MatchmakerRatingResponse,
 )
 from app.services.notifications import emit_notification
 from app.services.social import ensure_users_can_interact
@@ -139,8 +140,8 @@ def _service_response(row: Any) -> MatchmakerServiceRequestResponse:
     )
 
 
-SERVICE_SELECT = """SELECT id, user_id, matchmaker_id, service_type, status, requirement,
-    order_id, product_id, feedback, created_at, updated_at, start_at, end_at FROM matchmaker_service"""
+SERVICE_SELECT = """SELECT ms.id, ms.user_id, ms.matchmaker_id, ms.service_type, ms.status, ms.requirement,
+    ms.order_id, ms.product_id, ms.feedback, ms.created_at, ms.updated_at, ms.start_at, ms.end_at FROM matchmaker_service ms"""
 
 
 async def _notify(db: AsyncSession, user_id: int, notification_type: str, title: str, content: str, related_id: int) -> None:
@@ -471,7 +472,7 @@ async def get_matchmaker_contact(
 async def create_contact_exchange(
     db: AsyncSession, current: CurrentUser, service_id: int, request: MatchmakerContactExchangeCreate
 ) -> MatchmakerContactExchangeResponse:
-    service_result = await db.execute(text("""SELECT id, user_id, matchmaker_id, status
+    service_result = await db.execute(text("""SELECT id, user_id, matchmaker_id, order_id, status
         FROM matchmaker_service WHERE id = :id FOR UPDATE"""), {"id": service_id})
     service = service_result.mappings().first()
     if not service or service["matchmaker_id"] != current.id:
@@ -628,21 +629,45 @@ async def update_service_request(
     return _service_response(updated.mappings().one())
 
 
-async def admin_list_service_requests(db: AsyncSession, page: int, page_size: int, status: int | None) -> MatchmakerServiceRequestPage:
+async def admin_list_service_requests(
+    db: AsyncSession, page: int, page_size: int, status: int | None,
+    current: CurrentMatchmakerAdmin | None = None,
+) -> MatchmakerServiceRequestPage:
     where = "WHERE 1=1"
     params: dict[str, Any] = {"limit": page_size, "offset": (page - 1) * page_size}
+    if current is not None:
+        scope = current.scope_condition(
+            organization_column="om.organization_id",
+            user_column="ms.matchmaker_id",
+            params=params,
+        )
+        if scope != "1 = 1":
+            where += " AND EXISTS (SELECT 1 FROM organization_member om WHERE om.user_id = ms.matchmaker_id AND om.status = 1 AND " + scope + ")"
     if status is not None:
         where += " AND status = :status"
         params["status"] = status
     result = await db.execute(text(f"{SERVICE_SELECT} {where} ORDER BY created_at DESC, id DESC LIMIT :limit OFFSET :offset"), params)
-    count = await db.execute(text(f"SELECT COUNT(*) FROM matchmaker_service {where}"), {key: value for key, value in params.items() if key == "status"})
+    count = await db.execute(text(f"SELECT COUNT(*) FROM matchmaker_service ms {where}"), {key: value for key, value in params.items() if key == "status"})
     total = int(count.scalar() or 0)
     items = [_service_response(row) for row in result.mappings().all()]
     return MatchmakerServiceRequestPage(items=items, page=page, page_size=page_size, total=total, has_more=page * page_size < total)
 
 
-async def admin_update_service_request(db: AsyncSession, admin_id: int, service_id: int, request: MatchmakerAdminServiceRequestUpdate) -> MatchmakerServiceRequestResponse:
-    row_result = await db.execute(text(f"{SERVICE_SELECT} WHERE id = :id FOR UPDATE"), {"id": service_id})
+async def admin_update_service_request(
+    db: AsyncSession, admin_id: int, service_id: int, request: MatchmakerAdminServiceRequestUpdate,
+    current: CurrentMatchmakerAdmin | None = None,
+) -> MatchmakerServiceRequestResponse:
+    params: dict[str, Any] = {"id": service_id}
+    scope_sql = ""
+    if current is not None:
+        scope = current.scope_condition(
+            organization_column="om.organization_id",
+            user_column="ms.matchmaker_id",
+            params=params,
+        )
+        if scope != "1 = 1":
+            scope_sql = " AND EXISTS (SELECT 1 FROM organization_member om WHERE om.user_id = ms.matchmaker_id AND om.status = 1 AND " + scope + ")"
+    row_result = await db.execute(text(f"{SERVICE_SELECT} WHERE id = :id{scope_sql} FOR UPDATE"), params)
     row = row_result.mappings().first()
     if not row:
         raise HTTPException(404, detail="牵线申请不存在")
@@ -675,3 +700,37 @@ async def admin_update_service_request(db: AsyncSession, admin_id: int, service_
     await db.commit()
     updated = await db.execute(text(f"{SERVICE_SELECT} WHERE id = :id"), {"id": service_id})
     return _service_response(updated.mappings().one())
+
+
+async def create_matchmaker_rating(
+    db: AsyncSession, current: CurrentUser, service_id: int, request: MatchmakerRatingCreate
+) -> MatchmakerRatingResponse:
+    row = (await db.execute(text("""SELECT id, user_id, matchmaker_id, order_id, status
+        FROM matchmaker_service WHERE id = :id FOR UPDATE"""), {"id": service_id})).mappings().first()
+    if not row:
+        raise HTTPException(404, detail="??????")
+    if int(row["user_id"]) != current.id:
+        raise HTTPException(403, detail="???????????")
+    if int(row["status"]) != 2:
+        raise HTTPException(409, detail="??????????")
+    paid = await db.execute(text("SELECT 1 FROM payment_order WHERE id = :id AND type = 3 AND status = 1 LIMIT 1"), {"id": row.get("order_id")})
+    if row.get("order_id") and not paid.scalar():
+        raise HTTPException(409, detail="?????????")
+    duplicate = await db.execute(text("SELECT id FROM matchmaker_rating WHERE service_id = :service_id AND user_id = :user_id LIMIT 1"), {"service_id": service_id, "user_id": current.id})
+    if duplicate.scalar():
+        raise HTTPException(409, detail="??????")
+    result = await db.execute(text("""INSERT INTO matchmaker_rating
+        (service_id, user_id, matchmaker_id, score, content)
+        VALUES (:service_id, :user_id, :matchmaker_id, :score, :content)"""), {"service_id": service_id, "user_id": current.id, "matchmaker_id": row["matchmaker_id"], **request.model_dump()})
+    await db.commit()
+    created = (await db.execute(text("SELECT id, service_id, user_id, matchmaker_id, score, content, created_at FROM matchmaker_rating WHERE id = :id"), {"id": result.lastrowid})).mappings().one()
+    return MatchmakerRatingResponse(**dict(created))
+
+
+async def list_matchmaker_ratings(db: AsyncSession, matchmaker_id: int, page: int, page_size: int) -> MatchmakerRatingPage:
+    params = {"matchmaker_id": matchmaker_id, "limit": page_size, "offset": (page - 1) * page_size}
+    rows = await db.execute(text("""SELECT id, service_id, user_id, matchmaker_id, score, content, created_at
+        FROM matchmaker_rating WHERE matchmaker_id = :matchmaker_id
+        ORDER BY created_at DESC, id DESC LIMIT :limit OFFSET :offset"""), params)
+    total = int((await db.execute(text("SELECT COUNT(*) FROM matchmaker_rating WHERE matchmaker_id = :matchmaker_id"), {"matchmaker_id": matchmaker_id})).scalar() or 0)
+    return MatchmakerRatingPage(items=[MatchmakerRatingResponse(**dict(row)) for row in rows.mappings().all()], page=page, page_size=page_size, total=total, has_more=page * page_size < total)

@@ -199,6 +199,23 @@ class Settings(BaseSettings):
 
     log_level: str = "INFO"
 
+    # AI 军师（助手/润色/搜索/匹配，合著仓方案）。与画像/搜索/语音的
+    # ai_provider/ai_master_* 那套互不影响：本套用 ai_enabled + ai_base_url 直连。
+    ai_enabled: bool = False
+    ai_base_url: str = "https://api.deepseek.com/v1"
+    ai_api_key: SecretStr | None = None
+    ai_model: str = "deepseek-chat"
+    ai_timeout_seconds: float = Field(default=30, gt=0, le=120)
+    ai_max_context_messages: int = Field(default=80, ge=10, le=200)
+    ai_daily_assistant_limit: int = Field(default=20, ge=1, le=1000)
+    ai_daily_polish_limit: int = Field(default=5, ge=1, le=100)
+    ai_daily_search_limit: int = Field(default=10, ge=1, le=100)
+    ai_daily_match_limit: int = Field(default=10, ge=1, le=100)
+    ai_daily_advisor_limit: int = Field(default=20, ge=1, le=1000)
+    ai_advisor_max_context_messages: int = Field(default=80, ge=10, le=200)
+    ai_advisor_prompt_version: str = "relationship-v1"
+    ai_advisor_knowledge_version: str = "seed-v1"
+
     @property
     def cors_origins(self) -> list[str]:
         """Convert the comma-separated environment value into CORS origins."""

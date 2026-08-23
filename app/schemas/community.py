@@ -412,3 +412,46 @@ class CommunityMediaResponse(BaseModel):
     file_size: int | None = None
     duration_seconds: int | None = None
     status: Literal["ready", "bound", "deleted"]
+
+
+class CommunityTopicAdminCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=64)
+    icon: str | None = Field(default=None, max_length=255)
+    sort: int = Field(default=0, ge=-100000, le=100000)
+    is_active: bool = True
+
+
+class CommunityTopicAdminUpdate(CommunityTopicAdminCreate):
+    pass
+
+
+class CommunityBannerAdminCreate(BaseModel):
+    title: str | None = Field(default=None, max_length=128)
+    image_url: str = Field(min_length=1, max_length=255)
+    link_type: Literal["activity", "url", "miniprogram", "none"] = "none"
+    link_value: str | None = Field(default=None, max_length=500)
+    sort: int = Field(default=0, ge=-100000, le=100000)
+    position: str = Field(default="community", min_length=1, max_length=32)
+    is_active: bool = True
+    start_at: datetime | None = None
+    end_at: datetime | None = None
+
+    @model_validator(mode="after")
+    def validate_window(self):
+        if self.start_at and self.end_at and self.end_at <= self.start_at:
+            raise ValueError("????????????")
+        if self.link_type == "none" and self.link_value:
+            raise ValueError("??? Banner ???????")
+        if self.link_type != "none" and not self.link_value:
+            raise ValueError("????????????")
+        return self
+
+
+class CommunityBannerAdminUpdate(CommunityBannerAdminCreate):
+    pass
+
+
+class CommunityBannerAdminResponse(CommunityBannerResponse):
+    is_active: bool
+    start_at: datetime | None
+    end_at: datetime | None

@@ -17,6 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.responses import Response
 
 from app.api.router import OPENAPI_TAGS, api_router
+from app.api.routes.admin_home import legacy_router as admin_home_legacy_router
 from app.core.config import settings
 from app.core.logging import configure_logging, request_id_context
 
@@ -141,6 +142,8 @@ def create_app() -> FastAPI:
     Path(settings.upload_dir).mkdir(parents=True, exist_ok=True)
     application.mount("/storage/uploads", StaticFiles(directory=settings.upload_dir), name="uploads")
     application.include_router(api_router, prefix=settings.api_prefix)
+    # The captured production admin uses these compatibility paths without /api/v1.
+    application.include_router(admin_home_legacy_router)
 
     @application.get("/", tags=["系统"])
     async def root() -> dict[str, str]:

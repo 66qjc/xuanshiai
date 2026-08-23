@@ -26,6 +26,10 @@ from app.schemas.finance import (
     WithdrawalCreate,
     WithdrawalResponse,
     WithdrawalReview,
+    LedgerEntryPage,
+    LedgerEntryResponse,
+    PaymentOrderAdminPage,
+    WithdrawalAdminPage,
 )
 from app.services.matchmaker import activate_paid_service_order
 
@@ -348,3 +352,61 @@ async def review_withdrawal(db: AsyncSession, admin: CurrentUser, withdrawal_id:
     result = await db.execute(text("""SELECT id, account_type, account_id, amount, status,
         payee_masked, failure_reason, created_at, updated_at FROM withdrawal_request WHERE id = :id"""), {"id": withdrawal_id})
     return _withdrawal(result.mappings().one())
+
+
+async def admin_list_orders(db: AsyncSession, page: int, page_size: int, status: int | None = None, user_id: int | None = None, order_no: str | None = None) -> PaymentOrderAdminPage:
+    where = ["1 = 1"]
+    params: dict[str, object] = {"limit": page_size, "offset": (page - 1) * page_size}
+    if status is not None:
+        where.append("po.status = :status")
+        params["status"] = status
+    if user_id is not None:
+        where.append("po.user_id = :user_id")
+        params["user_id"] = user_id
+    if order_no:
+        where.append("po.order_no = :order_no")
+        params["order_no"] = order_no
+    clause = " AND ".join(where)
+    rows = await db.execute(text(f"""SELECT po.id, po.order_no, po.user_id,
+        po.product_type, po.product_name, po.amount, po.status, po.pay_time, po.created_at
+        FROM payment_order po WHERE {clause}
+        ORDER BY po.id DESC LIMIT :limit OFFSET :offset"""), params)
+    count = await db.execute(text(f"SELECT COUNT(*) FROM payment_order po WHERE {clause}"),
+        {key: value for key, value in params.items() if key not in ("limit", "offset")})
+    total = int(count.scalar() or 0)
+    return PaymentOrderAdminPage(items=[_order(row) for row in rows.mappings().all()], page=page, page_size=page_size, total=total, has_more=page * page_size < total)
+
+
+async def admin_list_withdrawals(db: AsyncSession, page: int, page_size: int, status: str | None = None) -> WithdrawalAdminPage:
+    where = ["1 = 1"]
+    params: dict[str, object] = {"limit": page_size, "offset": (page - 1) * page_size}
+    if status:
+        where.append("status = :status")
+        params["status"] = status
+    clause = " AND ".join(where)
+    rows = await db.execute(text(f"""SELECT id, account_type, account_id, amount, status,
+        payee_masked, failure_reason, created_at, updated_at FROM withdrawal_request
+        WHERE {clause} ORDER BY id DESC LIMIT :limit OFFSET :offset"""), params)
+    count = await db.execute(text(f"SELECT COUNT(*) FROM withdrawal_request WHERE {clause}"),
+        {key: value for key, value in params.items() if key not in ("limit", "offset")})
+    total = int(count.scalar() or 0)
+    return WithdrawalAdminPage(items=[_withdrawal(row) for row in rows.mappings().all()], page=page, page_size=page_size, total=total, has_more=page * page_size < total)
+
+
+async def admin_list_ledger(db: AsyncSession, page: int, page_size: int, account_type: str | None = None, account_id: int | None = None) -> LedgerEntryPage:
+    where = ["1 = 1"]
+    params: dict[str, object] = {"limit": page_size, "offset": (page - 1) * page_size}
+    if account_type:
+        where.append("account_type = :account_type")
+        params["account_type"] = account_type
+    if account_id is not None:
+        where.append("account_id = :account_id")
+        params["account_id"] = account_id
+    clause = " AND ".join(where)
+    rows = await db.execute(text(f"""SELECT id, account_type, account_id, direction, amount,
+        state, source_type, source_id, idempotency_key, created_at
+        FROM account_ledger WHERE {clause} ORDER BY id DESC LIMIT :limit OFFSET :offset"""), params)
+    count = await db.execute(text(f"SELECT COUNT(*) FROM account_ledger WHERE {clause}"),
+        {key: value for key, value in params.items() if key not in ("limit", "offset")})
+    total = int(count.scalar() or 0)
+    return LedgerEntryPage(items=[LedgerEntryResponse(**dict(row)) for row in rows.mappings().all()], page=page, page_size=page_size, total=total, has_more=page * page_size < total)

@@ -1,6 +1,101 @@
 """一期商业化和组织归属领域的数据库表定义。"""
 
 BUSINESS_TABLES = {
+    "admin_sms_statistics": """
+        CREATE TABLE IF NOT EXISTS `admin_sms_statistics` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `tenant_id` bigint unsigned NOT NULL DEFAULT 1,
+            `success_count` bigint unsigned NOT NULL DEFAULT 0,
+            `failed_count` bigint unsigned NOT NULL DEFAULT 0,
+            `remaining_count` bigint unsigned NOT NULL DEFAULT 0,
+            `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`), KEY `idx_admin_sms_tenant` (`tenant_id`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='管理端短信资源汇总；余额以账本任务同步写入'
+    """,
+    "admin_academy_category": """
+        CREATE TABLE IF NOT EXISTS `admin_academy_category` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `tenant_id` bigint unsigned NOT NULL DEFAULT 1,
+            `parent_id` bigint unsigned DEFAULT NULL,
+            `name` varchar(128) NOT NULL,
+            `description` varchar(500) DEFAULT NULL,
+            `image` varchar(500) DEFAULT NULL,
+            `category_type` varchar(32) NOT NULL DEFAULT 'Guides',
+            `sort` int NOT NULL DEFAULT 0,
+            `enabled` tinyint NOT NULL DEFAULT 1,
+            `matchmaker_class_enabled` tinyint NOT NULL DEFAULT 0,
+            PRIMARY KEY (`id`), KEY `idx_academy_tree` (`tenant_id`, `category_type`, `enabled`, `parent_id`, `sort`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='管理端婚创学苑栏目'
+    """,
+    "admin_recharge_item": """
+        CREATE TABLE IF NOT EXISTS `admin_recharge_item` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `tenant_id` bigint unsigned NOT NULL DEFAULT 1,
+            `name` varchar(128) NOT NULL,
+            `resource_type` varchar(32) NOT NULL,
+            `quantity` int unsigned NOT NULL,
+            `price` decimal(12,2) NOT NULL,
+            `sort` int NOT NULL DEFAULT 0,
+            `enabled` tinyint NOT NULL DEFAULT 1,
+            PRIMARY KEY (`id`), KEY `idx_recharge_visible` (`tenant_id`, `enabled`, `sort`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='只读充值商品目录，不记录支付或余额'
+    """,
+    "admin_announcement_version": """
+        CREATE TABLE IF NOT EXISTS `admin_announcement_version` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `tenant_id` bigint unsigned NOT NULL DEFAULT 1,
+            `name` varchar(64) NOT NULL,
+            `is_first` tinyint NOT NULL DEFAULT 0,
+            `published_at` datetime DEFAULT NULL,
+            PRIMARY KEY (`id`), KEY `idx_announcement_version_published` (`tenant_id`, `published_at`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='已发布更新报告版本'
+    """,
+    "admin_announcement": """
+        CREATE TABLE IF NOT EXISTS `admin_announcement` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `tenant_id` bigint unsigned NOT NULL DEFAULT 1,
+            `version_id` bigint unsigned DEFAULT NULL,
+            `category` varchar(64) NOT NULL DEFAULT '',
+            `title` varchar(255) NOT NULL,
+            `title_color` varchar(32) DEFAULT NULL,
+            `title_bold` tinyint NOT NULL DEFAULT 0,
+            `top` tinyint NOT NULL DEFAULT 0,
+            `sort_order` int NOT NULL DEFAULT 0,
+            `link_to` varchar(500) DEFAULT NULL,
+            `published_at` datetime DEFAULT NULL,
+            `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`), KEY `idx_announcement_list` (`tenant_id`, `published_at`, `category`, `top`, `sort_order`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='管理端更新公告'
+    """,
+    "admin_announcement_read": """
+        CREATE TABLE IF NOT EXISTS `admin_announcement_read` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `account_id` bigint unsigned NOT NULL,
+            `announcement_id` bigint unsigned NOT NULL,
+            `read_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`), UNIQUE KEY `uk_announcement_read` (`account_id`, `announcement_id`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='按管理员记录公告已读状态'
+    """,
+    "admin_feedback_message": """
+        CREATE TABLE IF NOT EXISTS `admin_feedback_message` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `tenant_id` bigint unsigned NOT NULL DEFAULT 1,
+            `ticket_id` bigint unsigned NOT NULL,
+            `sender_type` varchar(16) NOT NULL COMMENT 'CUSTOMER/SERVICE/SYSTEM',
+            `content` varchar(4000) DEFAULT NULL,
+            `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`), KEY `idx_feedback_last_message` (`tenant_id`, `ticket_id`, `created_at`, `id`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='工单消息；首页仅读取未读状态'
+    """,
+    "admin_feedback_read": """
+        CREATE TABLE IF NOT EXISTS `admin_feedback_read` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `account_id` bigint unsigned NOT NULL,
+            `feedback_id` bigint unsigned NOT NULL,
+            `read_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`), UNIQUE KEY `uk_feedback_read` (`account_id`, `feedback_id`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='管理员工单消息已读关系'
+    """,
     "customer_lead": """
         CREATE TABLE IF NOT EXISTS `customer_lead` (
             `id` bigint unsigned NOT NULL AUTO_INCREMENT,
@@ -38,6 +133,49 @@ BUSINESS_TABLES = {
             KEY `idx_lead_follow_up_lead` (`lead_id`, `created_at`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='客源线索跟进记录'
     """,
+    "customer_lead_abandonment": """
+        CREATE TABLE IF NOT EXISTS `customer_lead_abandonment` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `lead_id` bigint unsigned NOT NULL,
+            `reason` varchar(500) NOT NULL,
+            `abandoned_by` bigint unsigned NOT NULL,
+            `abandoned_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `restored_by` bigint unsigned DEFAULT NULL,
+            `restored_at` datetime DEFAULT NULL,
+            `restore_reason` varchar(500) DEFAULT NULL,
+            PRIMARY KEY (`id`),
+            KEY `idx_lead_abandonment_active` (`lead_id`, `restored_at`, `abandoned_at`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='客源弃海和恢复审计记录'
+    """,
+    "customer_lead_review": """
+        CREATE TABLE IF NOT EXISTS `customer_lead_review` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT, `lead_id` bigint unsigned NOT NULL,
+            `status` varchar(16) NOT NULL COMMENT 'APPROVED/REJECTED', `reason` varchar(500) DEFAULT NULL,
+            `reviewed_by` bigint unsigned NOT NULL, `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`), KEY `idx_lead_review` (`lead_id`, `created_at`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='客源审核历史'
+    """,
+    "customer_lead_call_note": """
+        CREATE TABLE IF NOT EXISTS `customer_lead_call_note` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT, `lead_id` bigint unsigned NOT NULL,
+            `content` varchar(200) NOT NULL, `created_by` bigint unsigned NOT NULL,
+            `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`), KEY `idx_lead_call_note` (`lead_id`, `created_at`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='客源通话小记'
+    """,
+    "customer_lead_tag": """
+        CREATE TABLE IF NOT EXISTS `customer_lead_tag` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT, `name` varchar(64) NOT NULL, `color` varchar(16) DEFAULT NULL,
+            `enabled` tinyint NOT NULL DEFAULT 1, `sort` int NOT NULL DEFAULT 0,
+            PRIMARY KEY (`id`), UNIQUE KEY `uk_customer_lead_tag` (`name`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='客源标签配置'
+    """,
+    "customer_lead_tag_relation": """
+        CREATE TABLE IF NOT EXISTS `customer_lead_tag_relation` (
+            `lead_id` bigint unsigned NOT NULL, `tag_id` bigint unsigned NOT NULL,
+            PRIMARY KEY (`lead_id`, `tag_id`), KEY `idx_customer_lead_tag` (`tag_id`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='客源标签关联'
+    """,
     "member_follow_up": """
         CREATE TABLE IF NOT EXISTS `member_follow_up` (
             `id` bigint unsigned NOT NULL AUTO_INCREMENT,
@@ -58,6 +196,8 @@ BUSINESS_TABLES = {
             `password_hash` varchar(255) NOT NULL,
             `matchmaker_user_id` bigint unsigned DEFAULT NULL,
             `display_name` varchar(128) NOT NULL,
+            `data_scope` varchar(16) NOT NULL DEFAULT 'SELF' COMMENT 'SELF/STORE/ORGANIZATION/ALL',
+            `organization_id` bigint unsigned DEFAULT NULL,
             `status` tinyint NOT NULL DEFAULT '1' COMMENT '1正常 2停用',
             `failed_count` int unsigned NOT NULL DEFAULT '0',
             `locked_until` datetime DEFAULT NULL,
@@ -87,6 +227,42 @@ BUSINESS_TABLES = {
             UNIQUE KEY `uk_matchmaker_admin_refresh` (`refresh_token_hash`),
             KEY `idx_matchmaker_admin_session_account` (`account_id`, `status`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='红娘后台登录会话'
+    """,
+    "matchmaker_admin_permission": """
+        CREATE TABLE IF NOT EXISTS `matchmaker_admin_permission` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `account_id` bigint unsigned NOT NULL,
+            `permission` varchar(128) NOT NULL,
+            PRIMARY KEY (`id`),
+            UNIQUE KEY `uk_matchmaker_admin_permission` (`account_id`, `permission`),
+            KEY `idx_matchmaker_admin_permission_account` (`account_id`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='独立红娘后台账号权限'
+    """,
+    "matchmaker_admin_login_log": """
+        CREATE TABLE IF NOT EXISTS `matchmaker_admin_login_log` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `account_id` bigint unsigned DEFAULT NULL,
+            `username` varchar(64) NOT NULL,
+            `login_status` tinyint NOT NULL COMMENT '0失败 1成功',
+            `ip` varchar(64) DEFAULT NULL,
+            `user_agent` varchar(255) DEFAULT NULL,
+            `device_id` varchar(128) DEFAULT NULL,
+            `failure_reason` varchar(255) DEFAULT NULL,
+            `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`),
+            KEY `idx_matchmaker_admin_login_account` (`account_id`, `created_at`),
+            KEY `idx_matchmaker_admin_login_username` (`username`, `created_at`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='独立红娘后台登录日志'
+    """,
+    "matchmaker_admin_member_note": """
+        CREATE TABLE IF NOT EXISTS `matchmaker_admin_member_note` (
+            `user_id` bigint unsigned NOT NULL,
+            `note` varchar(2000) DEFAULT NULL,
+            `updated_by` bigint unsigned DEFAULT NULL,
+            `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (`user_id`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='后台会员备注'
     """,
     "organization": """
         CREATE TABLE IF NOT EXISTS `organization` (
@@ -447,5 +623,23 @@ BUSINESS_TABLES = {
             UNIQUE KEY `uk_withdrawal_provider_event` (`provider_event_id`),
             KEY `idx_withdrawal_event_withdrawal` (`withdrawal_id`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='提现支付事件'
+    """,
+    "chat_session_request": """
+        CREATE TABLE IF NOT EXISTS `chat_session_request` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `session_id` bigint unsigned NOT NULL,
+            `requester_id` bigint unsigned NOT NULL,
+            `responder_id` bigint unsigned NOT NULL,
+            `request_type` varchar(32) NOT NULL,
+            `payload` json DEFAULT NULL,
+            `status` varchar(16) NOT NULL DEFAULT 'PENDING',
+            `expire_at` datetime DEFAULT NULL,
+            `responded_at` datetime DEFAULT NULL,
+            `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`),
+            KEY `idx_chat_request_session` (`session_id`,`status`,`created_at`),
+            KEY `idx_chat_request_responder` (`responder_id`,`status`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='会话结构化请求'
     """,
 }

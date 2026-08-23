@@ -7,7 +7,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.schemas.customer_lead_admin import (
-    CustomerLead, CustomerLeadAssignment, CustomerLeadCreate, CustomerLeadFollowUp,
+    CustomerLead, CustomerLeadAbandonment, CustomerLeadAssignment, CustomerLeadCreate, CustomerLeadFollowUp,
     CustomerLeadFollowUpCreate, CustomerLeadPage, CustomerLeadStatistics, CustomerLeadUpdate,
 )
 
@@ -34,6 +34,18 @@ async def _validate_owner(db: AsyncSession, assignment: CustomerLeadAssignment) 
 
 
 async def create_lead(db: AsyncSession, account_id: int, request: CustomerLeadCreate) -> CustomerLead:
+    contact_conditions: list[str] = []
+    params: dict[str, Any] = {}
+    if request.phone:
+        contact_conditions.append("phone = :phone")
+        params["phone"] = request.phone
+    if request.wechat:
+        contact_conditions.append("wechat = :wechat")
+        params["wechat"] = request.wechat
+    duplicate = await db.execute(text("SELECT id FROM customer_lead WHERE status NOT IN ('LOST', 'CLOSED') AND (" + " OR ".join(contact_conditions) + ") LIMIT 1"), params)
+    existing_id = duplicate.scalar()
+    if existing_id:
+        raise HTTPException(409, detail=f"该联系方式已存在客源线索（ID: {existing_id}）")
     result = await db.execute(text("""INSERT INTO customer_lead
         (name, phone, wechat, source, intention_level, remark, created_by)
         VALUES (:name, :phone, :wechat, :source, :intention_level, :remark, :created_by)"""), {
@@ -119,3 +131,36 @@ async def lead_statistics(db: AsyncSession) -> CustomerLeadStatistics:
         FROM customer_lead"""))).mappings().one()
     return CustomerLeadStatistics(**{key: int(row[key] or 0) for key in ("total", "new_count", "contacted_count", "intended_count", "converted_count", "lost_count")})
 
+
+async def abandon_lead(db: AsyncSession, account_id: int, lead_id: int, reason: str) -> CustomerLeadAbandonment:
+    lead = await get_lead(db, lead_id)
+    if lead.status in ("CONVERTED", "CLOSED"):
+        raise HTTPException(409, detail="已入库或已关闭的客源不能弃海")
+    active = await db.execute(text("SELECT 1 FROM customer_lead_abandonment WHERE lead_id = :id AND restored_at IS NULL"), {"id": lead_id})
+    if active.scalar():
+        raise HTTPException(409, detail="该客源已在弃海池")
+    result = await db.execute(text("""INSERT INTO customer_lead_abandonment (lead_id, reason, abandoned_by)
+        VALUES (:lead_id, :reason, :account_id)"""), {"lead_id": lead_id, "reason": reason, "account_id": account_id})
+    await db.execute(text("UPDATE customer_lead SET status = 'LOST', matchmaker_id = NULL, next_follow_at = NULL WHERE id = :id"), {"id": lead_id})
+    await db.execute(text("INSERT INTO business_audit_log (actor_user_id, action, resource_type, resource_id) VALUES (:actor, 'customer_lead.abandon', 'customer_lead', :id)"), {"actor": account_id, "id": lead_id})
+    await db.commit()
+    row = (await db.execute(text("SELECT id, lead_id, reason, abandoned_by, abandoned_at, restored_by, restored_at, restore_reason FROM customer_lead_abandonment WHERE id = :id"), {"id": int(result.lastrowid)})).mappings().one()
+    return CustomerLeadAbandonment(**dict(row))
+
+
+async def restore_lead(db: AsyncSession, account_id: int, lead_id: int, reason: str) -> CustomerLead:
+    await get_lead(db, lead_id)
+    active = (await db.execute(text("SELECT id FROM customer_lead_abandonment WHERE lead_id = :id AND restored_at IS NULL ORDER BY id DESC LIMIT 1"), {"id": lead_id})).scalar()
+    if not active:
+        raise HTTPException(409, detail="该客源不在弃海池")
+    await db.execute(text("UPDATE customer_lead_abandonment SET restored_by = :account_id, restored_at = UTC_TIMESTAMP(), restore_reason = :reason WHERE id = :id"), {"account_id": account_id, "reason": reason, "id": active})
+    await db.execute(text("UPDATE customer_lead SET status = 'NEW', updated_at = UTC_TIMESTAMP() WHERE id = :id"), {"id": lead_id})
+    await db.execute(text("INSERT INTO business_audit_log (actor_user_id, action, resource_type, resource_id) VALUES (:actor, 'customer_lead.restore', 'customer_lead', :id)"), {"actor": account_id, "id": lead_id})
+    await db.commit()
+    return await get_lead(db, lead_id)
+
+
+async def list_abandonments(db: AsyncSession, active_only: bool) -> list[CustomerLeadAbandonment]:
+    where = "WHERE restored_at IS NULL" if active_only else ""
+    rows = await db.execute(text(f"SELECT id, lead_id, reason, abandoned_by, abandoned_at, restored_by, restored_at, restore_reason FROM customer_lead_abandonment {where} ORDER BY id DESC"))
+    return [CustomerLeadAbandonment(**dict(row)) for row in rows.mappings().all()]

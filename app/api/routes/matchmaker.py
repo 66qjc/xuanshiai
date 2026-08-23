@@ -24,7 +24,7 @@ from app.schemas.matchmaker import (
     MatchmakerServiceRequestCreate,
     MatchmakerServiceRequestPage,
     MatchmakerServiceRequestResponse,
-    MatchmakerServiceRequestUpdate,
+    MatchmakerServiceRequestUpdate, MatchmakerRatingCreate, MatchmakerRatingPage, MatchmakerRatingResponse,
 )
 from app.services.matchmaker import (
     admin_list_service_requests,
@@ -47,7 +47,7 @@ from app.services.matchmaker import (
     update_contact_exchange,
     get_contact_exchange,
     admin_update_service_product,
-    update_service_request,
+    update_service_request, create_matchmaker_rating, list_matchmaker_ratings,
 )
 
 router = APIRouter(prefix="/matchmakers")

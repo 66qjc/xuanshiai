@@ -11,13 +11,13 @@ from app.schemas.auth import ProfileResponse
 
 
 class DiscoveryFilters(BaseModel):
-    gender: Literal[1, 2] | None = None
+    gender: int | None = Field(default=None, ge=1, le=2)
     age_min: int | None = Field(default=None, ge=18, le=100)
     age_max: int | None = Field(default=None, ge=18, le=100)
     province_code: str | None = Field(default=None, max_length=32)
     city_code: str | None = Field(default=None, max_length=32)
     district_code: str | None = Field(default=None, max_length=32)
-    marriage_status: Literal[1, 2, 3] | None = None
+    marriage_status: int | None = Field(default=None, ge=1, le=3)
     education_min: int | None = Field(default=None, ge=1, le=8)
     height_min: int | None = Field(default=None, ge=100, le=250)
     height_max: int | None = Field(default=None, ge=100, le=250)
@@ -86,6 +86,7 @@ class DiscoveryCard(BaseModel):
     algorithm_version: str = "legacy-rule-v1"
     match_score_source: str = "legacy-rule-v1"
     is_favorite: bool
+    is_vip: bool = False
     is_pure_free: bool
     is_boosted: bool
     detail_locked: bool = False
@@ -132,6 +133,11 @@ class VisitorPage(BaseModel):
     page: int
     page_size: int
     has_more: bool
+
+
+class VisitorCountResponse(BaseModel):
+    user_id: int
+    visitor_count: int
 
 
 class PublicProfileResponse(BaseModel):
