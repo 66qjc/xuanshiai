@@ -2581,3 +2581,54 @@ async def test_submit_turn_replay_skips_moderation(profile_store) -> None:
     assert replay.turn_id == first.turn_id
     assert replay.replayed is True
     assert await profile_store.count_tasks(first.turn_id) == 1
+
+
+# ----------------------------------------------------------------------
+# WP-P2：进度引导（can_early_publish）与发布门槛共用可配置阈值
+# ----------------------------------------------------------------------
+
+
+def test_session_read_can_early_publish_follows_threshold(monkeypatch) -> None:
+    """进度引导（方案 WP-P2）：确认字段数达到可配置阈值时 can_early_publish=True。
+
+    阈值来自 settings.ai_profile_min_fields（默认 7 = 10 字段的 67%），
+    提前建构与发布共用同一阈值，避免两套数字漂移。
+    """
+    from types import SimpleNamespace
+
+    from app.api.routes.ai_profile import _to_session_read
+    from app.schemas.ai_profile import ProfileSessionStatus
+
+    def _session(confirmed):
+        return SimpleNamespace(
+            session_id="s-1",
+            subject=ProfileSubject("personal"),
+            status=ProfileSessionStatus("draft"),
+            input_mode="text",
+            current_question=None,
+            confirmed_keys=frozenset(confirmed),
+            draft_id=None,
+            profile_revision=0,
+            preference_revision=0,
+            expires_at=None,
+            created_at=_now(),
+        )
+
+    monkeypatch.setattr(settings, "ai_profile_min_fields", 7)
+    below = _to_session_read(
+        _session(["age", "city", "height", "education", "income", "occupation"])
+    )
+    assert below.progress.can_early_publish is False
+    assert below.progress.early_publish_hint == ""
+
+    at = _to_session_read(
+        _session(["age", "city", "height", "education", "income", "occupation", "interest"])
+    )
+    assert at.progress.can_early_publish is True
+    assert "提前" in at.progress.early_publish_hint
+
+    monkeypatch.setattr(settings, "ai_profile_min_fields", 5)
+    lowered = _to_session_read(
+        _session(["age", "city", "height", "education", "income"])
+    )
+    assert lowered.progress.can_early_publish is True

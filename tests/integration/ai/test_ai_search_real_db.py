@@ -692,3 +692,87 @@ async def test_real_old_cursor_invalid_after_generation_switch(
         )
 
     await _clean(real_db_session)
+
+
+@pytest.mark.asyncio
+async def test_real_patch_search_draft_persists_condition_edit(
+    real_db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """回归（审查 I-1）：PATCH 条件微调必须在请求结束后持久化。
+
+    修复前：patch_search_draft 服务层不 commit，路由的 commit 位于
+    try/return/except 之后不可达，get_db 只 close 不提交 → 编辑静默丢失。
+    """
+    from types import SimpleNamespace
+
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "ai_master_enabled", True)
+    monkeypatch.setattr(settings, "ai_search_enabled", True)
+
+    await _clean(real_db_session)
+    draft_id = "draft-patch-regression-0001"
+    await real_db_session.execute(
+        text(
+            "INSERT INTO ai_search_draft (draft_id, user_id, query_text, status, "
+            " condition_revision, condition_schema_version, policy_revision) "
+            "VALUES (:draft_id, :user_id, '希望对方性格开朗', 'awaiting_confirmation', "
+            " 1, 'search-condition-v1', 'ai-policy-2026-08-07-v1')"
+        ),
+        {"draft_id": draft_id, "user_id": OWNER_ID},
+    )
+    await real_db_session.execute(
+        text(
+            "INSERT INTO ai_search_condition (draft_id, condition_revision, condition_no, "
+            " field_key, operator, value_json, condition_kind, user_action) "
+            "VALUES (:draft_id, 1, 1, 'personality', 'contains', :value_json, "
+            " 'soft', 'pending')"
+        ),
+        {
+            "draft_id": draft_id,
+            "value_json": json.dumps({"text": "开朗"}, ensure_ascii=False),
+        },
+    )
+    await real_db_session.commit()
+
+    from app.api.routes.ai_search import patch_search_draft_route
+    from app.schemas.ai_search import SearchConditionPatchRequest
+
+    await patch_search_draft_route(
+        draft_id=draft_id,
+        body=[SearchConditionPatchRequest(condition_no=1, action="confirm")],
+        current=SimpleNamespace(id=OWNER_ID),
+        db=real_db_session,
+        idempotency_key="patch-test-0001",
+        expected_condition_revision=1,
+    )
+
+    # 模拟 get_db 请求收尾（session close → 未提交工作被回滚）：只有路由在成功
+    # 路径显式 commit，rollback 之后才读得到变更。同会话直接 SELECT 会看到本事务
+    # 未提交写入，无法暴露丢失的提交点。
+    await real_db_session.rollback()
+
+    row = (
+        await real_db_session.execute(
+            text(
+                "SELECT user_action FROM ai_search_condition "
+                "WHERE draft_id = :draft_id AND condition_no = 1"
+            ),
+            {"draft_id": draft_id},
+        )
+    ).mappings().first()
+    assert row is not None
+    assert row["user_action"] == "confirmed", "PATCH 编辑必须在请求后持久化"
+
+    draft_row = (
+        await real_db_session.execute(
+            text(
+                "SELECT condition_revision FROM ai_search_draft "
+                "WHERE draft_id = :draft_id"
+            ),
+            {"draft_id": draft_id},
+        )
+    ).mappings().first()
+    assert draft_row is not None
+    # 条件行的 condition_revision 标识其所属版本（保持 1）；乐观锁版本号在草稿表上自增。
+    assert int(draft_row["condition_revision"]) == 2, "草稿条件版本号必须已自增"

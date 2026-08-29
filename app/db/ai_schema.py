@@ -48,6 +48,7 @@ AI_TABLES = {
             `request_digest` char(64) DEFAULT NULL COMMENT '请求摘要哈希，不存原文',
             `status` varchar(24) NOT NULL DEFAULT 'queued' COMMENT 'queued/leased/running/retry_wait/succeeded/failed/cancelled/superseded',
             `stage` varchar(32) DEFAULT NULL,
+            `progress_percent` tinyint unsigned DEFAULT NULL COMMENT '0-100 阶段进度，仅展示用途',
             `attempt_count` int unsigned NOT NULL DEFAULT '0',
             `max_attempts` int unsigned NOT NULL DEFAULT '3',
             `next_run_at` datetime DEFAULT NULL,
@@ -497,6 +498,33 @@ def ensure_ai_projection_columns(cursor: Any) -> None:
             cursor.execute(
                 f"ALTER TABLE `ai_feature_projection` ADD COLUMN {column_def}"
             )
+
+
+# ----------------------------------------------------------------------
+# WP-S1 / F9：ai_task 新增展示用进度列（旧库幂等补列）
+# ----------------------------------------------------------------------
+#
+# 全新库由上面的 CREATE TABLE IF NOT EXISTS 直接获得完整列；旧库的
+# CREATE TABLE 不会补齐新增列，与 ``ensure_ai_projection_columns`` 同模式
+# 幂等补列（SHOW COLUMNS→ALTER TABLE ADD COLUMN；表不存在时静默跳过）。
+AI_TASK_REQUIRED_COLUMNS: dict[str, str] = {
+    "progress_percent": (
+        "`progress_percent` tinyint unsigned DEFAULT NULL "
+        "COMMENT '0-100 阶段进度，仅展示用途'"
+    ),
+}
+
+
+def ensure_ai_task_columns(cursor: Any) -> None:
+    """Idempotently add legacy-DB columns to ``ai_task``（如 progress_percent）。"""
+    try:
+        cursor.execute("SHOW COLUMNS FROM `ai_task`")
+        existing = {row["Field"] for row in cursor.fetchall()}
+    except Exception:  # noqa: BLE001 - legacy bootstrap is best effort
+        return
+    for column_name, column_def in AI_TASK_REQUIRED_COLUMNS.items():
+        if column_name not in existing:
+            cursor.execute(f"ALTER TABLE `ai_task` ADD COLUMN {column_def}")
 
 
 # These additive columns keep an older bootstrap-created database readable until

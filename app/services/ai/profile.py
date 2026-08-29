@@ -100,6 +100,8 @@ PROFILE_CONSENT_SCOPE = "profile_text_extract"
 NARRATIVE_SCHEMA_VERSION = "profile-narrative-v1"
 NARRATIVE_PROMPT_VERSION = "profile-narrative-prompt-v4"
 _NARRATIVE_TASK_TYPE = "profile_narrative"
+# 叙事层重新生成（regenerate）每日上限：24h 窗口内 profile_narrative 任务数。
+_NARRATIVE_REGENERATE_DAILY_LIMIT = 5
 
 # 会话依赖的当前 revision 版本变化（profile/preference 任一）即视为 stale，
 # 客户端必须重新创建会话（统一方案 §7.5 PROFILE_SESSION_STALE）。
@@ -1817,8 +1819,16 @@ def ensure_revision(current: int, expected: int) -> None:
 # 可编辑/可发布草稿状态白名单。deleted/published/cancelled 等终态草稿只读
 # （文档 §7「已发布/已删除草稿只读」），不允许再 PATCH 或 publish。
 _DRAFT_EDITABLE_STATUSES = frozenset({"draft", "awaiting_confirmation"})
-# 成稿最低确认字段数：10 个字段中至少确认一半（5 笔）才能生成不空转的真实画像。
-MIN_CONFIRMED_FIELDS_TO_PUBLISH = 5
+
+
+def min_confirmed_fields_to_publish() -> int:
+    """发布门槛：至少确认字段数，来自 settings.ai_profile_min_fields（默认 7）。
+
+    良配对齐：默认 7/10 ≈ 67%——无需完成全部题目，进度 67% 左右即可提前
+    建构画像。进度提示（can_early_publish）与发布硬门槛共用此值，避免两套
+    数字漂移。
+    """
+    return settings.ai_profile_min_fields
 
 
 def ensure_draft_editable(draft: ProfileDraft, operation: str) -> None:
@@ -2572,9 +2582,10 @@ async def publish_profile_draft(
     ensure_draft_editable(draft, "发布")
     ensure_revision(draft.revision, expected_revision)
     fields = confirmed_fields(draft)
-    if len(fields) < MIN_CONFIRMED_FIELDS_TO_PUBLISH:
+    min_fields = min_confirmed_fields_to_publish()
+    if len(fields) < min_fields:
         raise AIInputError(
-            f"at least {MIN_CONFIRMED_FIELDS_TO_PUBLISH} confirmed fields are required"
+            f"at least {min_fields} confirmed fields are required"
         )
     current_revision = await _load_revision_vector(db, owner_user_id)
     # Reserve the unique task key before mutating the immutable revision. The
@@ -2639,18 +2650,76 @@ async def publish_profile_draft(
     )
     # 入队画像叙事层（narrative）任务——与投影任务并列，发布后异步生成
     # 人格画像解读成品（persona_title/insight/dimensions/ideal_weights）。
-    # 失败不影响发布本身，只改变 narrative 任务状态。
-    narrative_request_hash = hash_narrative_request(
-        revision.revision_id, str(revision.subject)
+    # 失败不影响发布本身，只改变 narrative 任务状态。任务创建复用
+    # ``_enqueue_narrative_task``（regenerate 与 publish 共用同一逻辑）。
+    narrative_task = await _enqueue_narrative_task(
+        db,
+        owner_user_id,
+        str(revision.subject),
+        idempotency_key,
+        revision_id=revision.revision_id,
+        source_revision=published_vector,
+        consent_snapshot=draft.consent_snapshot,
     )
+    return TaskSubmission.accepted(task, revision, narrative_task.task_id)
+
+
+async def _enqueue_narrative_task(
+    db: AsyncSession,
+    owner_user_id: int,
+    subject: str,
+    idempotency_key: str,
+    *,
+    revision_id: int | None = None,
+    source_revision: RevisionVector | None = None,
+    consent_snapshot: dict[str, Any] | None = None,
+) -> AiTaskRecord:
+    """入队一条 ``profile_narrative`` 任务并回填受控摘要（唯一创建入口）。
+
+    publish 与 regenerate 共用本助手，避免两份任务创建逻辑漂移：
+
+    - publish 传入刚落库的 ``revision_id`` / 发布后版本向量 / 授权快照，
+      行为与抽取前逐字节一致；
+    - regenerate 缺省时按库内当前状态解析：该 subject 最近一次发布的
+      revision、用户全量 revision 向量、最新有效 ``profile_text_extract``
+      授权（无授权抛 ``AIConsentRequired``，无历史 revision 抛
+      ``AIInputError``）。
+
+    不 commit，由调用方控制事务。
+    """
+    resolved_revision_id = revision_id
+    if resolved_revision_id is None:
+        row = await _first_row(
+            await db.execute(
+                text(
+                    "SELECT id FROM ai_profile_revision "
+                    "WHERE user_id = :user_id AND subject = :subject "
+                    "ORDER BY revision_no DESC, id DESC LIMIT 1"
+                ),
+                {"user_id": owner_user_id, "subject": subject},
+            )
+        )
+        if row is None:
+            raise AIInputError("尚未生成过画像叙事层，无法重新生成")
+        resolved_revision_id = int(row["id"])
+    resolved_vector = source_revision
+    if resolved_vector is None:
+        resolved_vector = await _load_revision_vector(db, owner_user_id)
+    resolved_consent = consent_snapshot
+    if resolved_consent is None:
+        consent = await _load_latest_consent(db, owner_user_id, PROFILE_CONSENT_SCOPE)
+        if consent is None:
+            raise AIConsentRequired()
+        resolved_consent = _consent_snapshot(consent)
+    narrative_request_hash = hash_narrative_request(resolved_revision_id, subject)
     narrative_task = await enqueue_task(
         db=db,
         owner_user_id=owner_user_id,
         task_type=_NARRATIVE_TASK_TYPE,
         idempotency_key=idempotency_key + "-narrative",
         request_hash=narrative_request_hash,
-        revisions=published_vector,
-        consent=draft.consent_snapshot,
+        revisions=resolved_vector,
+        consent=resolved_consent,
     )
     await db.execute(
         text(
@@ -2662,25 +2731,25 @@ async def publish_profile_draft(
         {
             "payload_summary": json.dumps(
                 {
-                    "published_revision_id": revision.revision_id,
-                    "subject": revision.subject,
+                    "published_revision_id": resolved_revision_id,
+                    "subject": subject,
                     "user_id": owner_user_id,
-                    "source_revision": published_vector.as_dict(),
-                    "consent_snapshot": draft.consent_snapshot,
+                    "source_revision": resolved_vector.as_dict(),
+                    "consent_snapshot": resolved_consent,
                 },
                 ensure_ascii=False,
             ),
             "source_revision_json": json.dumps(
-                published_vector.as_dict(), ensure_ascii=False
+                resolved_vector.as_dict(), ensure_ascii=False
             ),
             "consent_snapshot_json": json.dumps(
-                draft.consent_snapshot, ensure_ascii=False
+                resolved_consent, ensure_ascii=False
             ),
             "task_id": narrative_task.task_id,
         },
     )
     await db.flush()
-    return TaskSubmission.accepted(task, revision, narrative_task.task_id)
+    return narrative_task
 
 
 async def restore_profile_revision(
@@ -3588,13 +3657,16 @@ async def generate_profile_narrative_handler(
     )
     summary_json = result.model_dump_json(ensure_ascii=False)
     content_hash = hashlib.sha256(summary_json.encode("utf-8")).hexdigest()
+    # 叙事层生成后先进入待确认态，用户确认（POST narrative/confirm）后才为
+    # confirmed；读取端透传状态由前端驱动确认 UI（良配对齐 WP-P3）。
     await db.execute(
         text(
             "INSERT INTO ai_profile_summary "
             "(session_id, draft_id, revision_id, user_id, subject, "
             " summary_text, status, content_hash, created_at, updated_at) "
             "VALUES (NULL, NULL, :revision_id, :user_id, :subject, "
-            " :summary_text, 'published', :content_hash, UTC_TIMESTAMP(), UTC_TIMESTAMP())"
+            " :summary_text, 'pending_confirmation', :content_hash, "
+            " UTC_TIMESTAMP(), UTC_TIMESTAMP())"
         ),
         {
             "revision_id": revision_id_int,
@@ -3618,10 +3690,14 @@ async def load_published_narrative(
 ) -> dict[str, Any] | None:
     """读取用户最新发布的画像叙事层成品。
 
-    返回 ``{status, summary_text}`` 或 ``None``（未发布或任务未完成）。
+    返回 ``{status, data}`` 或 ``None``（未发布或任务未完成）。
     路由层据此构造 ``ProfileNarrativeRead``。解析 ``summary_text`` JSON
     时如果格式异常，返回 ``status='pending'`` 而非抛异常——叙事层是展示性
     内容，脏数据不应导致 500。
+
+    状态机（良配对齐 WP-P3）：新行先生成 ``pending_confirmation``，用户
+    确认后转 ``confirmed``；``published`` 仅为历史行兼容值，过滤逻辑不变
+    （始终取最新一条，状态透传由前端驱动确认 UI）。
     """
     result = await db.execute(
         text(
@@ -3643,6 +3719,79 @@ async def load_published_narrative(
     except (ValueError, TypeError):
         return {"status": "pending", "data": None}
     return {"status": str(row.get("status") or "published"), "data": data}
+
+
+async def confirm_profile_narrative(
+    db: AsyncSession, user_id: int, subject: str
+) -> bool:
+    """将用户某 subject 最新一条叙事层标记为 confirmed（方案 WP-P3）。
+
+    只命中最新一行（MySQL 不允许 UPDATE 直接子查询同表，用派生表包装）。
+    不 commit，由调用方控制事务。无行时返回 False（路由层 404）。
+    """
+    result = await db.execute(
+        text(
+            "UPDATE ai_profile_summary SET status = 'confirmed', "
+            " updated_at = UTC_TIMESTAMP() "
+            "WHERE id = (SELECT id FROM ("
+            "  SELECT id FROM ai_profile_summary "
+            "  WHERE user_id = :user_id AND subject = :subject "
+            "  ORDER BY created_at DESC LIMIT 1"
+            ") AS latest)"
+        ),
+        {"user_id": user_id, "subject": subject},
+    )
+    return bool(result.rowcount)
+
+
+async def request_narrative_regenerate(
+    db: AsyncSession, user_id: int, subject: str, idempotency_key: str
+) -> AiTaskRecord:
+    """重新生成画像叙事层（方案 WP-P3）：幂等回放先行，再限频，后复用任务创建入口。
+
+    幂等：同 Idempotency-Key 的重试回放已入队任务而非重新计数/入队——含
+    满限后的重试（终审 Important：限频不得挡住回放）；digest 不一致 409。
+    限频：24h 窗口（UTC_TIMESTAMP，与库内 created_at 写入口径一致）内
+    ``profile_narrative`` 任务满 5 条拒绝（``AIInputError``）。放行前提是
+    该 subject 至少发布过一次 revision；该前置查询的结果经 ``revision_id``
+    传入 ``_enqueue_narrative_task`` 复用，避免重复查询同一最新 revision。
+    不 commit，由调用方控制事务。
+    """
+    revision_result = await db.execute(
+        text(
+            "SELECT id FROM ai_profile_revision "
+            "WHERE user_id = :user_id AND subject = :subject "
+            "ORDER BY revision_no DESC, id DESC LIMIT 1"
+        ),
+        {"user_id": user_id, "subject": subject},
+    )
+    revision_row = await _first_row(revision_result)
+    if revision_row is None:
+        raise AIInputError("尚未生成过画像叙事层，无法重新生成")
+    revision_id = int(revision_row["id"])
+    request_hash = hash_narrative_request(revision_id, subject)
+    existing = await _find_write_task(
+        db, user_id, _NARRATIVE_TASK_TYPE, idempotency_key + "-narrative"
+    )
+    if existing is not None:
+        return _replay_or_conflict(existing, request_hash, "regenerate")
+    count_result = await db.execute(
+        text(
+            "SELECT COUNT(*) AS n FROM ai_task "
+            "WHERE owner_user_id = :user_id AND task_type = :task_type "
+            "AND created_at > UTC_TIMESTAMP() - INTERVAL 24 HOUR"
+        ),
+        {"user_id": user_id, "task_type": _NARRATIVE_TASK_TYPE},
+    )
+    count_row = await _first_row(count_result)
+    if (
+        count_row is not None
+        and int(count_row.get("n") or 0) >= _NARRATIVE_REGENERATE_DAILY_LIMIT
+    ):
+        raise AIInputError("今日叙事重新生成次数已达上限")
+    return await _enqueue_narrative_task(
+        db, user_id, subject, idempotency_key, revision_id=revision_id
+    )
 
 
 async def cleanup_handler(

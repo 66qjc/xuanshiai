@@ -47,6 +47,7 @@ class TaskDetailResponse(TaskPollState):
     result_payload: dict[str, Any] | None = None
     error_code: str | None = None
     error_message: str | None = None
+    progress_percent: int | None = None
 
 
 class CancelAcceptedResponse(BaseModel):
@@ -155,6 +156,7 @@ async def get_ai_task(
         task_id=task.task_id,
         status=task.status,
         stage=task.stage,
+        progress_percent=task.progress_percent,
         poll_after_ms=_compute_poll_after_ms(task.status, task.next_run_at),
         expires_at=task.lease_until if task.lease_until is not None else None,
         result_ref=task.result_ref,

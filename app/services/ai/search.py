@@ -2096,14 +2096,15 @@ async def _active_consent_matches(
 
 
 async def _set_search_task_stage(
-    db: AsyncSession, task_id: str, stage: str
+    db: AsyncSession, task_id: str, stage: str, progress: int | None = None
 ) -> None:
     await db.execute(
         text(
-            "UPDATE ai_task SET stage = :stage, updated_at = UTC_TIMESTAMP() "
-            "WHERE task_id = :task_id"
+            "UPDATE ai_task SET stage = :stage, "
+            "progress_percent = COALESCE(:progress, progress_percent), "
+            "updated_at = UTC_TIMESTAMP() WHERE task_id = :task_id"
         ),
-        {"task_id": task_id, "stage": stage},
+        {"task_id": task_id, "stage": stage, "progress": progress},
     )
 
 
@@ -2123,7 +2124,7 @@ async def materialize_search_snapshot(
     if _is_expired(snapshot.get("expires_at")):
         return SearchResultPageRead(snapshot_id=snapshot_id, status="stale")
     if task_id:
-        await _set_search_task_stage(db, task_id, "validating")
+        await _set_search_task_stage(db, task_id, "validating", progress=10)
     draft_id = str(snapshot.get("draft_id") or "")
     condition_objects = [
         _condition_from_row(row) for row in await _load_condition_rows(db, draft_id)
@@ -2132,7 +2133,7 @@ async def materialize_search_snapshot(
     if compiled.conflicts:
         raise SearchInputInvalid("AI_INPUT_INVALID")
     if task_id:
-        await _set_search_task_stage(db, task_id, "filtering")
+        await _set_search_task_stage(db, task_id, "filtering", progress=30)
     viewer = await _load_viewer_context(db, owner_user_id)
     viewer_is_vip = await _is_vip(db, owner_user_id)
     query_snapshot = build_search_query_snapshot(
@@ -2186,7 +2187,7 @@ async def materialize_search_snapshot(
         )
         visible.append((baseline_index, row, evidence))
     if task_id:
-        await _set_search_task_stage(db, task_id, "ranking")
+        await _set_search_task_stage(db, task_id, "ranking", progress=85)
     visible.sort(
         key=lambda item: (
             -item[2].soft_match_count,
@@ -2244,7 +2245,10 @@ async def materialize_search_snapshot(
         },
     )
     if task_id:
-        await _set_search_task_stage(db, task_id, status_value)
+        await _set_search_task_stage(
+            db, task_id, status_value,
+            progress=100 if status_value == "completed" else None,
+        )
     items = [
         SearchResultItemRead(
             user_id=int(row["user_id"]),

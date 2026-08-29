@@ -192,6 +192,10 @@ class ProfileProgress(BaseModel):
 
     basis: str = "confirmed_field_coverage"
     value: float = Field(default=0.0, ge=0.0, le=1.0)
+    # WP-P2 提前建构引导：确认字段覆盖达到可配置阈值（默认 7/10 ≈ 67%）
+    # 时为 True，并携带引导文案；阈值与发布硬门槛共用 settings.ai_profile_min_fields。
+    can_early_publish: bool = False
+    early_publish_hint: str = ""
 
 
 class ProfileQuestion(BaseModel):
@@ -427,8 +431,11 @@ class ProfileNarrativeHistoryObservation(BaseModel):
 class ProfileNarrativeRead(BaseModel):
     """GET /ai/profiles/{subject}/narrative 响应。
 
-    ``status`` 为 ``'pending'``（未发布或 narrative 任务未完成）或
-    ``'published'``（已生成）。pending 状态下 persona_title/insight 等字段为空。
+    ``status`` 为 ``'pending'`` | ``'pending_confirmation'`` | ``'confirmed'``：
+    pending 表示未发布或 narrative 任务未完成；新叙事层先生成为
+    ``pending_confirmation``（待用户确认，前端据此驱动确认 UI），用户调用
+    confirm 后转 ``'confirmed'``。``'published'`` 仅为历史行兼容值。
+    pending/pending_confirmation 状态下前端应引导确认，字段内容已可展示。
     """
 
     subject: str

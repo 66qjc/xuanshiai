@@ -120,6 +120,16 @@ class Settings(BaseSettings):
     ai_profile_enabled: bool = False
     ai_search_enabled: bool = False
     ai_compatibility_shadow_enabled: bool = False
+    # 画像发布门槛：至少确认多少个字段才允许 publish（提前建构阈值）。
+    # 良配对齐：默认 7/10 ≈ 67%，"无需完成全部题目，进度 67% 左右可提前
+    # 建构画像"。进度提示与发布硬门槛共用此值，避免两套数字漂移。
+    ai_profile_min_fields: int = Field(default=7, ge=1, le=20)
+    # 匹配度外显灰度（方案 WP-C2 / 决策 D6）：off=影子运行不外显（现状）；
+    # bucket=按 viewer 稳定哈希放量 ai_compatibility_display_bucket_pct%；
+    # on=全量外显。仅改变 ai_compatibility_snapshot.display_eligible 的写入值，
+    # 读取端门禁（_apply_display_gate）与 shadow 纪律测试在 off 下保持不变。
+    ai_compatibility_display_mode: Literal["off", "bucket", "on"] = "off"
+    ai_compatibility_display_bucket_pct: int = Field(default=0, ge=0, le=100)
     # 一期默认 mock；deepseek 为首个真 provider（开发/测试可用，生产启用需
     # 先满足 ai_policy_approved / ai_provider_approved / retention 三道门禁）。
     # dots 为小红书 hi lab dots.llm 的 OpenAI 兼容 API provider。

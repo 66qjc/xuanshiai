@@ -58,6 +58,9 @@ _PUBLISHABLE_CONFIRMED_FIELDS = [
     {"field_key": "occupation_group", "value": "technology", "status": "confirmed"},
     {"field_key": "education_level", "value": 4, "status": "confirmed"},
     {"field_key": "height_cm", "value": 175, "status": "confirmed"},
+    # WP-P2：发布门槛改为可配置（默认 7/10 ≈ 67%），fixture 补到 7 个确认字段。
+    {"field_key": "income_band", "value": "high", "status": "confirmed"},
+    {"field_key": "marriage_status", "value": "single", "status": "confirmed"},
 ]
 
 
@@ -767,6 +770,8 @@ async def test_publish_writes_confirmed_fields_only(profile_store) -> None:
         "occupation_group",
         "education_level",
         "height_cm",
+        "income_band",
+        "marriage_status",
     ]
 
 
@@ -928,6 +933,8 @@ async def test_editable_draft_confirm_and_publish_are_unaffected(profile_store) 
             {"field_key": "occupation_group", "value": "technology", "status": "suggested"},
             {"field_key": "education_level", "value": 4, "status": "suggested"},
             {"field_key": "height_cm", "value": 175, "status": "suggested"},
+            {"field_key": "income_band", "value": "high", "status": "suggested"},
+            {"field_key": "marriage_status", "value": "single", "status": "suggested"},
         ],
         revision=1,
     )
@@ -961,6 +968,16 @@ async def test_editable_draft_confirm_and_publish_are_unaffected(profile_store) 
                 action=ProfileFieldPatchAction.CONFIRM,
                 expected_revision=1,
             ),
+            ProfileDraftFieldPatchRequest(
+                field_key="income_band",
+                action=ProfileFieldPatchAction.CONFIRM,
+                expected_revision=1,
+            ),
+            ProfileDraftFieldPatchRequest(
+                field_key="marriage_status",
+                action=ProfileFieldPatchAction.CONFIRM,
+                expected_revision=1,
+            ),
         ],
         expected_revision=1,
     )
@@ -975,6 +992,8 @@ async def test_editable_draft_confirm_and_publish_are_unaffected(profile_store) 
         "occupation_group",
         "education_level",
         "height_cm",
+        "income_band",
+        "marriage_status",
     ]
 
 
@@ -1077,7 +1096,8 @@ async def test_publish_requires_at_least_one_confirmed_field(profile_store) -> N
 
 
 @pytest.mark.asyncio
-async def test_publish_requires_at_least_five_confirmed_fields(profile_store) -> None:
+async def test_publish_requires_minimum_confirmed_fields(profile_store) -> None:
+    """低于阈值（默认 7，见 settings.ai_profile_min_fields）发布被拒。"""
     draft = await profile_store.seed_draft(
         owner_user_id=10,
         subject="personal",
@@ -1086,13 +1106,15 @@ async def test_publish_requires_at_least_five_confirmed_fields(profile_store) ->
             {"field_key": "city_code", "value": "330100", "status": "confirmed"},
             {"field_key": "occupation_group", "value": "technology", "status": "confirmed"},
             {"field_key": "education_level", "value": 4, "status": "confirmed"},
+            {"field_key": "height_cm", "value": 175, "status": "confirmed"},
+            {"field_key": "income_band", "value": "high", "status": "confirmed"},
         ],
         revision=1,
     )
     with pytest.raises(AIInputError) as excinfo:
         await profile_store.publish(draft["draft_id"], owner_user_id=10, expected_revision=1)
     assert excinfo.value.code == "AI_INPUT_INVALID"
-    assert "5 confirmed" in excinfo.value.message
+    assert "7 confirmed" in excinfo.value.message
     assert await profile_store.published_field_keys(10, "personal") == []
 
 
@@ -1122,6 +1144,8 @@ async def test_publish_same_key_replays_same_task_without_second_revision(profil
         "occupation_group",
         "education_level",
         "height_cm",
+        "income_band",
+        "marriage_status",
     ]
 
 
@@ -1445,7 +1469,7 @@ async def test_history_lists_only_own_published_revisions(profile_store) -> None
     page = await list_profile_revisions(profile_store.db, 10)
     assert page.total == 1
     assert page.items[0].revision_no == 1
-    assert page.items[0].field_count == 5
+    assert page.items[0].field_count == 7
     foreign = await list_profile_revisions(profile_store.db, 11)
     assert foreign.total == 0
     assert foreign.items == []

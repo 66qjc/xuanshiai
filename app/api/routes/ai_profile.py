@@ -1,6 +1,6 @@
 """M04 AI 画像路由（统一方案 §7.5/§7.6，执行计划 §3.2）。
 
-前缀 `/api/v1/ai`（由 ``app/api/router.py`` 注册），共 13 个路径：
+前缀 `/api/v1/ai`（由 ``app/api/router.py`` 注册），共 15 个路径：
 
 - ``POST /profile-sessions``：201 创建/复用会话（要求 profile_text_extract 授权）
 - ``GET /profile-sessions/{session_id}``：200 仅本人
@@ -15,6 +15,9 @@
 - ``POST /profile-revisions/{revision_id}/restore``：201 新 draft（旧行只读）
 - ``DELETE /profiles/{subject}``：202 cleanup task（同步隐藏 + 异步清理）
 - ``DELETE /profiles/{subject}/fields/{field_key}``：202 invalidation task
+- ``GET /profiles/{subject}/narrative``：200 最新叙事层（状态透传，WP-P3）
+- ``POST /profiles/{subject}/narrative/confirm``：200 确认叙事层（待确认 → 已确认）
+- ``POST /profiles/{subject}/narrative/regenerate``：202 重新生成叙事层（每日限 5 次）
 
 所有写操作要求 ``Idempotency-Key`` header；错误统一为 ``AiErrorDetail`` 形状并
 携带 request_id。普通响应不携带原文、provider trace 或密钥。
@@ -62,6 +65,7 @@ from app.services.ai.profile import (
     ProfileSessionNotFound,
     ProfileSessionStale,
     confirm_profile_draft,
+    confirm_profile_narrative,
     create_profile_session,
     delete_ai_profile,
     delete_ai_profile_field,
@@ -70,9 +74,11 @@ from app.services.ai.profile import (
     load_owned_draft,
     load_owned_session,
     load_published_narrative,
+    min_confirmed_fields_to_publish,
     pause_profile_session,
     progress_value,
     publish_profile_draft,
+    request_narrative_regenerate,
     restore_profile_revision,
     resume_profile_session,
     skip_profile_question,
@@ -145,6 +151,14 @@ def _to_session_read(session: ProfileSession) -> ProfileSessionRead:
         progress=ProfileProgress(
             basis="confirmed_field_coverage",
             value=progress_value(session.confirmed_keys),
+            can_early_publish=(
+                len(session.confirmed_keys) >= min_confirmed_fields_to_publish()
+            ),
+            early_publish_hint=(
+                "已满足提前建构条件，可以直接生成画像啦"
+                if len(session.confirmed_keys) >= min_confirmed_fields_to_publish()
+                else ""
+            ),
         ),
         current_question=current_question,
         draft_id=session.draft_id,
@@ -712,3 +726,75 @@ async def get_profile_narrative_route(
         history_observations=list(data.get("history_observations") or []),
         conclusion=str(data.get("conclusion") or ""),
     )
+
+
+@router.post(
+    "/profiles/{subject}/narrative/confirm",
+    response_model=ProfileNarrativeRead,
+    status_code=status.HTTP_200_OK,
+    summary="确认画像叙事层（待确认 → 已确认）",
+)
+async def confirm_profile_narrative_route(
+    subject: ProfileSubject,
+    current: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> ProfileNarrativeRead:
+    """确认最新一条画像叙事层（良配对齐 WP-P3 确认闭环）。
+
+    叙事层由 Worker 生成后为 ``pending_confirmation``，用户确认后转
+    ``confirmed``。无任何可确认的叙事层返回 ``404 NARRATIVE_NOT_FOUND``。
+    """
+    _require_profile_feature()
+    changed = await confirm_profile_narrative(db, current.id, subject.value)
+    if not changed:
+        raise _error_response(
+            "NARRATIVE_NOT_FOUND",
+            "暂无可确认的画像叙事层",
+            status.HTTP_404_NOT_FOUND,
+        )
+    await db.commit()
+    narrative = await load_published_narrative(db, current.id, subject.value)
+    data: dict = narrative["data"] if narrative and narrative.get("data") else {}
+    return ProfileNarrativeRead(
+        subject=subject.value,
+        status=str((narrative or {}).get("status") or "confirmed"),
+        persona_title=str(data.get("persona_title") or ""),
+        persona_tags=list(data.get("persona_tags") or []),
+        insight=str(data.get("insight") or ""),
+    )
+
+
+@router.post(
+    "/profiles/{subject}/narrative/regenerate",
+    response_model=ProfilePublishAccepted,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="重新生成画像叙事层（每日限 5 次）",
+)
+async def regenerate_profile_narrative_route(
+    subject: ProfileSubject,
+    current: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> ProfilePublishAccepted:
+    """重新生成画像叙事层：入队新 ``profile_narrative`` 任务，202 + ``task_id``。
+
+    任务创建复用 publish 流程的同一入口（``_enqueue_narrative_task``）；
+    24h（UTC）内该用户 ``profile_narrative`` 任务满 5 次返回
+    ``400 AI_INPUT_INVALID``。前端凭 ``task_id`` 轮询任务状态。
+    """
+    _require_profile_feature()
+    _check_idempotency_key(idempotency_key)
+    try:
+        task = await request_narrative_regenerate(
+            db, current.id, subject.value, idempotency_key or ""
+        )
+    except AIInputError as exc:
+        raise _error_response(exc.code, exc.message, exc.status_code) from exc
+    except AIConsentRequired as exc:
+        raise _error_response(exc.code, exc.message, exc.status_code) from exc
+    except TaskError as exc:
+        raise _error_response(
+            exc.code, exc.message, exc.status_code, retryable=exc.retryable
+        ) from exc
+    await db.commit()
+    return ProfilePublishAccepted(task_id=task.task_id, status=task.status)

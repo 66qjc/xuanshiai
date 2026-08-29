@@ -55,6 +55,7 @@ def _make_task(
         request_digest="hash-1",
         status=status,
         stage=None,
+        progress_percent=None,
         attempt_count=1,
         max_attempts=3,
         next_run_at=datetime(2026, 8, 16, 10, 0, tzinfo=UTC),

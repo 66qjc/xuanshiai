@@ -202,7 +202,7 @@ async def patch_search_draft_route(
             status.HTTP_400_BAD_REQUEST,
         )
     try:
-        return await patch_search_draft(
+        updated = await patch_search_draft(
             db,
             draft_id,
             current.id,
@@ -222,7 +222,10 @@ async def patch_search_draft_route(
         raise _error_response(
             exc.code, exc.message, exc.status_code, retryable=exc.retryable
         ) from exc
+    # 服务层按仓库纪律不 commit；get_db 请求结束只 close 不提交。提交必须在
+    # 成功路径显式执行，否则条件微调静默丢失（审查 I-1 回归）。
     await db.commit()
+    return updated
 
 
 @router.post(

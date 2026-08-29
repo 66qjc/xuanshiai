@@ -32,7 +32,7 @@
 **Interfaces:**
 - Produces: 产品定义小节"AI 体验增强（良配对齐）"，为 Task 6（匹配度外显）提供产品依据。
 
-- [ ] **Step 1: 在 PRODUCT.md 末尾追加以下小节**（保持既有标题层级风格，`##` 一级）
+- [x] **Step 1: 在 PRODUCT.md 末尾追加以下小节**（保持既有标题层级风格，`##` 一级）
 
 ```markdown
 ## AI 体验增强（良配对齐，2026-08）
@@ -52,9 +52,9 @@
 - AI 搜索任务对外暴露百分比进度，支撑等待页动画；本阶段不含中途模糊候选。
 ```
 
-- [ ] **Step 2: 自查** 上面四小节与 PRODUCT.md 既有"Product Promise / Trust, Safety and Privacy"无冲突（特别是"AI 不替人承诺"与"商业化不破坏信任"两条）。
+- [x] **Step 2: 自查** 上面四小节与 PRODUCT.md 既有"Product Promise / Trust, Safety and Privacy"无冲突（特别是"AI 不替人承诺"与"商业化不破坏信任"两条）。
 
-- [ ] **Step 3: Commit（工作区根无 git 仓库则跳过 commit，仅保存）**
+- [x] **Step 3: Commit（工作区根无 git 仓库则跳过 commit，仅保存）**
 
 ```bash
 cd "D:\Users\ASUS\Desktop\宣誓爱\xuanshiai-backend"
@@ -75,7 +75,7 @@ git status   # 确认工作区根 PRODUCT.md 不属于本仓库（仓库根是 x
 - Consumes: `patch_search_draft(db, draft_id, owner_user_id, patches, expected_condition_revision, idempotency_key) -> SearchDraftRead`（`app/services/ai/search.py:1211`，签名不变）
 - Produces: 修复后 PATCH 成功路径持久化；无新接口。
 
-- [ ] **Step 1: 写失败的回归测试**（追加到 `tests/integration/ai/test_ai_search_real_db.py` 末尾。路由签名见 `app/api/routes/ai_search.py:185-194`：body 为 `list[SearchConditionPatchRequest]`（`condition_no/action`，`app/schemas/ai_search.py:139-141`），且 `_check_idempotency_key` 强制要求 8-128 位 ASCII 的 Idempotency-Key；门禁 `_require_search_feature` 需 monkeypatch 打开。`_clean`/`OWNER_ID`/`text`/`json` 均已在该测试文件中存在）
+- [x] **Step 1: 写失败的回归测试**（追加到 `tests/integration/ai/test_ai_search_real_db.py` 末尾。路由签名见 `app/api/routes/ai_search.py:185-194`：body 为 `list[SearchConditionPatchRequest]`（`condition_no/action`，`app/schemas/ai_search.py:139-141`），且 `_check_idempotency_key` 强制要求 8-128 位 ASCII 的 Idempotency-Key；门禁 `_require_search_feature` 需 monkeypatch 打开。`_clean`/`OWNER_ID`/`text`/`json` 均已在该测试文件中存在）
 
 ```python
 @pytest.mark.asyncio
@@ -145,12 +145,12 @@ async def test_real_patch_search_draft_persists_condition_edit(
     assert int(row["condition_revision"]) == 2, "条件版本号必须已自增"
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `python -m pytest tests/integration/ai/test_ai_search_real_db.py::test_real_patch_search_draft_persists_condition_edit -q`
 Expected: FAIL，断言 `user_action` 仍为 `pending`（写丢失）。
 
-- [ ] **Step 3: 修复路由提交点**（`app/api/routes/ai_search.py:208-226`，把 commit 移入成功路径，对齐 `ai_compatibility.py:100-124` 的模式）
+- [x] **Step 3: 修复路由提交点**（`app/api/routes/ai_search.py:208-226`，把 commit 移入成功路径，对齐 `ai_compatibility.py:100-124` 的模式）
 
 ```python
     try:
@@ -180,17 +180,17 @@ Expected: FAIL，断言 `user_action` 仍为 `pending`（写丢失）。
     return updated
 ```
 
-- [ ] **Step 4: 全仓排查同类模式**
+- [x] **Step 4: 全仓排查同类模式**
 
 Run: `grep -rn "await db.commit()" app/api/routes/ | grep -v "^Binary"` 逐一核对每个写路由的 commit 是否在成功路径可达；`grep -rLn "commit" app/api/routes/` 列出无 commit 的路由文件，人工确认其是否只读。
 Expected: 无第二个"commit 不可达"实例；发现问题按 Step 3 同法修复并追加回归测试。
 
-- [ ] **Step 5: 跑测试与全量**
+- [x] **Step 5: 跑测试与全量**
 
 Run: `python -m pytest tests/integration/ai/test_ai_search_real_db.py -q && python -m pytest tests/ -q`
 Expected: 全 PASS。
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add app/api/routes/ai_search.py tests/integration/ai/test_ai_search_real_db.py
@@ -212,7 +212,7 @@ git commit -m "fix(search): PATCH search-draft 条件微调在成功路径显式
 - Consumes: `progress_value(confirmed_keys)`（profile.py:677）、`ProfileSession.confirmed_keys`、路由已导入的 `settings`
 - Produces: `min_confirmed_fields_to_publish() -> int`（profile.py）；`ProfileProgress.can_early_publish: bool = False`、`ProfileProgress.early_publish_hint: str = ""`（schemas）
 
-- [ ] **Step 1: 写失败的单测**（追加到 `tests/test_ai_profile_sessions.py`；`SimpleNamespace` 鸭子类型构造会话，构造参数以 `_to_session_read` 实际读取的属性为准：`session_id/subject/status/input_mode/current_question/confirmed_keys/draft_id/profile_revision/preference_revision/expires_at/created_at`；枚举用按值构造 `ProfileSubject("personal")`、`ProfileSessionStatus("draft")`）
+- [x] **Step 1: 写失败的单测**（追加到 `tests/test_ai_profile_sessions.py`；`SimpleNamespace` 鸭子类型构造会话，构造参数以 `_to_session_read` 实际读取的属性为准：`session_id/subject/status/input_mode/current_question/confirmed_keys/draft_id/profile_revision/preference_revision/expires_at/created_at`；枚举用按值构造 `ProfileSubject("personal")`、`ProfileSessionStatus("draft")`）
 
 ```python
 from types import SimpleNamespace
@@ -257,12 +257,12 @@ def test_session_read_can_early_publish_follows_threshold(monkeypatch):
     assert lowered.progress.can_early_publish is True
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `python -m pytest tests/test_ai_profile_sessions.py -q -k can_early_publish`
 Expected: FAIL（`ai_profile_min_fields` 属性不存在 / `can_early_publish` 字段不存在）。
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 3a. `app/core/config.py` AI 门禁区（`ai_compatibility_shadow_enabled` 之后）加：
 
@@ -319,17 +319,17 @@ def min_confirmed_fields_to_publish() -> int:
 
 并在该文件 import 区补 `from app.services.ai.profile import min_confirmed_fields_to_publish`（合并进既有 profile 导入语句）。
 
-- [ ] **Step 4: 校准既有 publish 测试**
+- [x] **Step 4: 校准既有 publish 测试**
 
 Run: `grep -rn "MIN_CONFIRMED_FIELDS_TO_PUBLISH\|confirmed fields are required" tests/ app/`
 Expected: 除新函数外无旧常量残留。若 `tests/test_ai_profile_publish.py` 的 fixture 恰好只确认 5 个字段（为满足旧阈值），把这些 fixture 的 confirmed 字段补到 7 个（字段从 `app/schemas/ai_common.py:16-29` 的 10 字段白名单中取：age/city/marriage/education/height/income/occupation/interest/lifestyle/relationship_goal）。
 
-- [ ] **Step 5: 跑测试与全量**
+- [x] **Step 5: 跑测试与全量**
 
 Run: `python -m pytest tests/test_ai_profile_sessions.py tests/test_ai_profile_publish.py -q && python -m pytest tests/ -q`
 Expected: 全 PASS。
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add app/core/config.py app/services/ai/profile.py app/schemas/ai_profile.py app/api/routes/ai_profile.py tests/test_ai_profile_sessions.py tests/test_ai_profile_publish.py
@@ -350,7 +350,7 @@ git commit -m "feat(profile): 发布门槛可配置(默认7≈67%)并下发提�
 - Consumes: `load_published_narrative(db, user_id, subject)`（profile.py:3616）；narrative 任务创建调用（publish 流程内，`profile.py:2580-2615` 区域对 `enqueue_task` 的调用）
 - Produces: `confirm_profile_narrative(db, user_id, subject) -> bool`、`request_narrative_regenerate(db, user_id, subject, idempotency_key) -> AiTaskRecord`（profile.py 新增）；状态机 `published 旧值 → generating(任务排队) → pending_confirmation → confirmed`，画像变更使旧总结自然被新 revision 的 pending_confirmation 取代（读取端只取最新一条，无需显式 stale 化）
 
-- [ ] **Step 1: 写失败的集成测试**（追加到 `tests/integration/ai/test_ai_profile_real_db.py`；`ai_profile_summary` 列见 `app/db/ai_schema.py:234-252`，直接 SQL 造数绕开 LLM）
+- [x] **Step 1: 写失败的集成测试**（追加到 `tests/integration/ai/test_ai_profile_real_db.py`；`ai_profile_summary` 列见 `app/db/ai_schema.py:234-252`，直接 SQL 造数绕开 LLM）
 
 ```python
 import json
@@ -419,12 +419,12 @@ async def test_real_narrative_confirmation_loop(real_db_session: AsyncSession) -
     assert missing is False
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `python -m pytest tests/integration/ai/test_ai_profile_real_db.py -q -k narrative_confirmation`
 Expected: FAIL `ImportError: cannot import name 'confirm_profile_narrative'`。
 
-- [ ] **Step 3: 实现服务函数**（`app/services/ai/profile.py`，放在 `load_published_narrative` 之后）
+- [x] **Step 3: 实现服务函数**（`app/services/ai/profile.py`，放在 `load_published_narrative` 之后）
 
 ```python
 async def confirm_profile_narrative(
@@ -454,7 +454,7 @@ async def confirm_profile_narrative(
 
 `app/schemas/ai_profile.py:430-432` docstring 的 status 说明改为：`'pending' | 'pending_confirmation' | 'confirmed'`（`'published'` 仅为历史行兼容值）。
 
-- [ ] **Step 4: 新增两个路由**（`app/api/routes/ai_profile.py`，紧随 narrative GET 路由之后；复用该文件已有的 `_error_response`/`_require_profile_feature`/`ProfileSubject` 模式）
+- [x] **Step 4: 新增两个路由**（`app/api/routes/ai_profile.py`，紧随 narrative GET 路由之后；复用该文件已有的 `_error_response`/`_require_profile_feature`/`ProfileSubject` 模式）
 
 ```python
 @router.post(
@@ -490,12 +490,12 @@ async def confirm_profile_narrative_route(
 
 `regenerate` 路由：`POST /profiles/{subject}/narrative/regenerate`，202 返回 `{task_id, status}`（形状对齐本文件 publish 路由的 202 响应模型）。服务函数 `request_narrative_regenerate(db, user_id, subject, idempotency_key)`：先用 `SELECT COUNT(*) FROM ai_task WHERE owner_user_id=:u AND task_type='profile_narrative' AND created_at > UTC_TIMESTAMP() - INTERVAL 24 HOUR` 限 5 次/天（超出抛 `AIInputError("今日叙事重新生成次数已达上限")`），然后**复用 publish 流程中创建 profile_narrative 任务的同一调用**（读 `profile.py:2580-2615`，提取该 enqueue 调用为模块内私有助手 `_enqueue_narrative_task(db, user_id, subject, idempotency_key)`，publish 与 regenerate 两处共用，避免两份任务创建逻辑漂移）。
 
-- [ ] **Step 5: 跑测试与全量**
+- [x] **Step 5: 跑测试与全量**
 
 Run: `python -m pytest tests/integration/ai/test_ai_profile_real_db.py -q && python -m pytest tests/ -q`
 Expected: 全 PASS（含 `test_ai_release_gates.py`——新路由在门禁关闭时同样 503，无需额外处理）。
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add app/services/ai/profile.py app/api/routes/ai_profile.py app/schemas/ai_profile.py tests/integration/ai/test_ai_profile_real_db.py
@@ -516,7 +516,7 @@ git commit -m "feat(profile): 叙事层确认闭环 pending_confirmation/confirm
 **Interfaces:**
 - Produces: `ai_task.progress_percent TINYINT UNSIGNED NULL`；`_set_search_task_stage(db, task_id, stage, progress=None)`；`AiTaskRecord.progress_percent: int | None`；`TaskDetailResponse.progress_percent: int | None = None`。搜索各阶段进度契约：validating=10、filtering=30、ranking=85、终态 completed=100（方案原 60 档扫描点在现有代码中无独立 stage 调用点，不虚构）。
 
-- [ ] **Step 1: 写失败测试**（`tests/test_ai_tasks.py` 追加单测）
+- [x] **Step 1: 写失败测试**（`tests/test_ai_tasks.py` 追加单测）
 
 ```python
 def test_task_record_from_row_maps_progress_percent():
@@ -538,12 +538,12 @@ def test_task_record_from_row_maps_progress_percent():
     assert record.progress_percent == 30
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `python -m pytest tests/test_ai_tasks.py -q -k progress_percent`
 Expected: FAIL（`from_row` 收到意外关键字 `progress_percent` 或字段缺失）。
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 3a. `app/db/ai_schema.py`：`ai_task` CREATE TABLE 中 `` `stage` varchar(32) DEFAULT NULL, ``（第 50 行）后加：
 
@@ -613,7 +613,7 @@ async def _set_search_task_stage(
 
 3d. `ai_tasks.py`：`TaskDetailResponse` 增 `progress_percent: int | None = None`；GET 响应组装（`return TaskDetailResponse(...)`）增一行 `progress_percent=task.progress_percent,`。
 
-- [ ] **Step 4: 集成测试**（`tests/integration/ai/test_ai_tasks.py` 追加；`ai_task` 最小 INSERT 只填 NOT NULL 列：task_id/scene/task_type/idempotency_key）
+- [x] **Step 4: 集成测试**（`tests/integration/ai/test_ai_tasks.py` 追加；`ai_task` 最小 INSERT 只填 NOT NULL 列：task_id/scene/task_type/idempotency_key）
 
 ```python
 @pytest.mark.asyncio
@@ -648,12 +648,12 @@ async def test_real_set_search_task_stage_writes_progress(
     await real_db_session.commit()
 ```
 
-- [ ] **Step 5: 跑测试与全量**
+- [x] **Step 5: 跑测试与全量**
 
 Run: `python -m pytest tests/test_ai_tasks.py tests/integration/ai/test_ai_tasks.py -q && python -m pytest tests/ -q`
 Expected: 全 PASS。
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add app/db/ai_schema.py app/services/ai/tasks.py app/services/ai/search.py app/api/routes/ai_tasks.py tests/test_ai_tasks.py tests/integration/ai/test_ai_tasks.py
@@ -673,7 +673,7 @@ git commit -m "feat(search): ai_task 增加 progress_percent，搜索任务下�
 - Consumes: `settings`（compatibility.py 已导入）；INSERT 参数字典（compatibility.py:988-995 区域）
 - Produces: `_resolve_display_eligible(user_id: int) -> bool`（compatibility.py 模块级）；settings 新项 `ai_compatibility_display_mode: Literal["off","bucket","on"] = "off"`、`ai_compatibility_display_bucket_pct: int = Field(default=0, ge=0, le=100)`。读路径门禁（compatibility.py:1185-1193）不改——它按快照库值放行，写路径打开后自然生效。
 
-- [ ] **Step 1: 写失败单测**（追加到 `tests/test_ai_compatibility.py`）
+- [x] **Step 1: 写失败单测**（追加到 `tests/test_ai_compatibility.py`）
 
 ```python
 def test_resolve_display_eligible_modes(monkeypatch):
@@ -703,12 +703,12 @@ def test_resolve_display_eligible_modes(monkeypatch):
         assert _resolve_display_eligible(987654321) == first
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `python -m pytest tests/test_ai_compatibility.py -q -k resolve_display`
 Expected: FAIL（属性/函数不存在）。
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 3a. `app/core/config.py`（`ai_compatibility_shadow_enabled` 之后）：
 
@@ -754,12 +754,12 @@ def _resolve_display_eligible(viewer_user_id: int) -> bool:
 
 同文件 16 行与 884-901 行注释中"display_eligible 固定 0"的表述同步改为"默认 0，外显灰度打开后按 `_resolve_display_eligible` 写入"。
 
-- [ ] **Step 4: 跑测试与全量**
+- [x] **Step 4: 跑测试与全量**
 
 Run: `python -m pytest tests/test_ai_compatibility.py -q && python -m pytest tests/ -q`
 Expected: 全 PASS。特别注意 `test_ai_compatibility.py` 既有 shadow 纪律用例必须依旧绿（默认 off 下行为零变化）。
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add app/core/config.py app/services/ai/compatibility.py tests/test_ai_compatibility.py
@@ -774,19 +774,19 @@ git commit -m "feat(compatibility): 外显灰度开关 off/bucket/on，写路径
 - Verify/Modify: `.gitignore`、`.env.example`（均在 `xuanshiai-backend/`）
 - 用户动作（不可代办）：在 dots/DeepSeek/阿里云控制台轮换密钥
 
-- [ ] **Step 1: 核验 .gitignore**
+- [x] **Step 1: 核验 .gitignore**
 
 Run: `git check-ignore -v .env ; grep -n "^\.env" .gitignore`
 Expected: `.env` 被忽略。若未被忽略：把 `.env` 加入 `.gitignore` 并 `git rm --cached .env`（若曾被跟踪，需在 commit message 标注密钥已泄露必须轮换）。
 
-- [ ] **Step 2: 核验 .env.example 无真实密钥**
+- [x] **Step 2: 核验 .env.example 无真实密钥**
 
 Run: `grep -nE "(sk-|ak-|api_key\s*=\s*[^Y<])" .env.example`
 Expected: 只有 `YOUR_DEEPSEEK_API_KEY` 类占位符。发现真实密钥立即替换为占位符。
 
-- [ ] **Step 3: 向用户输出轮换清单**（聊天里列出，不写入仓库）：dots 控制台、DeepSeek 控制台、阿里云 AccessKey（语音）三处旧 key 作废重发 → 更新服务器 `.env` → 重启后端 → `python -m pytest tests/test_dots_provider.py -q` 验证。
+- [x] **Step 3: 向用户输出轮换清单**（聊天里列出，不写入仓库）：dots 控制台、DeepSeek 控制台、阿里云 AccessKey（语音）三处旧 key 作废重发 → 更新服务器 `.env` → 重启后端 → `python -m pytest tests/test_dots_provider.py -q` 验证。
 
-- [ ] **Step 4: Commit（仅当 .gitignore/.env.example 有改动）**
+- [x] **Step 4: Commit（仅当 .gitignore/.env.example 有改动）**
 
 ```bash
 git add .gitignore .env.example

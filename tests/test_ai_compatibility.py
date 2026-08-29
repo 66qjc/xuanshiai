@@ -1183,3 +1183,35 @@ def test_recompute_request_schema_requires_both_revisions() -> None:
     )
     assert request.expected_viewer_profile_revision == 12
     assert request.expected_target_profile_revision == 18
+
+
+# ----------------------------------------------------------------------
+# 匹配度外显灰度开关（WP-C2 / F11）：写路径 display_eligible 灰度
+# ----------------------------------------------------------------------
+
+
+def test_resolve_display_eligible_modes(monkeypatch):
+    """外显灰度（方案 WP-C2/D6）：off 恒 False；on 恒 True；bucket 按稳定哈希命中。"""
+    from app.core.config import settings
+    from app.services.ai.compatibility import _resolve_display_eligible
+
+    monkeypatch.setattr(settings, "ai_compatibility_display_mode", "off")
+    monkeypatch.setattr(settings, "ai_compatibility_display_bucket_pct", 100)
+    assert _resolve_display_eligible(12345) is False  # off 优先于 pct
+
+    monkeypatch.setattr(settings, "ai_compatibility_display_mode", "on")
+    assert _resolve_display_eligible(12345) is True
+
+    monkeypatch.setattr(settings, "ai_compatibility_display_mode", "bucket")
+    monkeypatch.setattr(settings, "ai_compatibility_display_bucket_pct", 0)
+    assert _resolve_display_eligible(12345) is False
+
+    monkeypatch.setattr(settings, "ai_compatibility_display_mode", "bucket")
+    monkeypatch.setattr(settings, "ai_compatibility_display_bucket_pct", 100)
+    assert _resolve_display_eligible(12345) is True
+
+    # 同一用户重复判定必须一致（稳定分桶，不随调用漂移）。
+    monkeypatch.setattr(settings, "ai_compatibility_display_bucket_pct", 50)
+    first = _resolve_display_eligible(987654321)
+    for _ in range(5):
+        assert _resolve_display_eligible(987654321) == first

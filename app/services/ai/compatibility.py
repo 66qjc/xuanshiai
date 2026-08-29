@@ -13,7 +13,8 @@
   （§9.3）。
 - ``write_shadow_snapshot`` 只写 ``ai_compatibility_snapshot``：algorithm_version
   ``compatibility-rule-v1``、score_semantics ``rule_based_reference_shadow``、
-  experiment_bucket ``shadow``、display_eligible 固定 0；绝不触碰旧
+  experiment_bucket ``shadow``、display_eligible 默认 0，外显灰度打开后按
+  ``_resolve_display_eligible`` 写入；绝不触碰旧
   ``match_score``/``match_reason``（语义恒为 ``legacy-rule-v1``，§10.4）。
 - ``read_compatibility_snapshot`` 每次读取重过 ``CandidateVisibilityService`` 门禁
   （不可见 → ``CANDIDATE_NOT_VISIBLE`` 404，不泄露归属）；版本/隐私 revision 变化
@@ -876,6 +877,21 @@ async def compute_and_write_shadow(
 # shadow 快照写入（§9.4/§10.4）
 # ----------------------------------------------------------------------
 
+
+def _resolve_display_eligible(viewer_user_id: int) -> bool:
+    """按灰度模式决定该用户的匹配度快照是否外显（方案 WP-C2/D6）。
+
+    off 恒 False（影子纪律不变）；on 恒 True；bucket 用乘法哈希做稳定
+    分桶——同一用户永远得到同一结果，不随调用顺序漂移。
+    """
+    if settings.ai_compatibility_display_mode == "on":
+        return True
+    if settings.ai_compatibility_display_mode != "bucket":
+        return False
+    bucket = (viewer_user_id * 2654435761) % 100
+    return bucket < settings.ai_compatibility_display_bucket_pct
+
+
 _SNAPSHOT_INSERT_COLUMNS = (
     "snapshot_id, viewer_user_id, target_user_id, algorithm_version, snapshot_hash, "
     "status, score_semantics, compatibility_index, coverage, direction_json, "
@@ -898,7 +914,8 @@ async def write_shadow_snapshot(
     """把双向规则结果写入 ``ai_compatibility_snapshot``（shadow，永不覆盖旧字段）。
 
     固定写 algorithm_version=compatibility-rule-v1、score_semantics=
-    rule_based_reference_shadow、experiment_bucket=shadow、display_eligible=0；
+    rule_based_reference_shadow、experiment_bucket=shadow；display_eligible
+    默认 0，外显灰度打开后按 ``_resolve_display_eligible`` 写入；
     保存 profile/privacy revision pair、expires_at 与 evidence_json。本函数绝不
     触碰旧 ``match_score``/``match_reason`` 或推荐排序。``viewer_id`` 必须与
     ``target_id`` 不同（数据库 CHECK 亦强制）。不 commit。
@@ -950,6 +967,7 @@ async def write_shadow_snapshot(
             " privacy_revision_pair_json = VALUES(privacy_revision_pair_json), "
             " source_revision_pair_json = VALUES(source_revision_pair_json), "
             " consent_snapshot_pair_json = VALUES(consent_snapshot_pair_json), "
+            " display_eligible = VALUES(display_eligible), "
             " calculated_at = VALUES(calculated_at), "
             " expires_at = VALUES(expires_at), "
             " invalidated_at = NULL, purge_after = NULL, "
@@ -990,7 +1008,7 @@ async def write_shadow_snapshot(
                 consent_pair, ensure_ascii=False
             ),
             "experiment_bucket": COMPATIBILITY_EXPERIMENT_BUCKET,
-            "display_eligible": 0,
+            "display_eligible": 1 if _resolve_display_eligible(int(viewer_id)) else 0,
             "disclaimer": DISCLAIMER,
             "expires_at": expires_at,
         },

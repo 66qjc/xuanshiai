@@ -2615,6 +2615,7 @@ class DatabaseManager:
             AI_TABLES,
             ensure_ai_legacy_columns,
             ensure_ai_projection_columns,
+            ensure_ai_task_columns,
         )
 
         tables.update(AI_TABLES)
@@ -2668,6 +2669,9 @@ class DatabaseManager:
         # Task 9 新增列（版本向量/可见性/失效原因等），与上面同模式幂等补列
         # （SHOW COLUMNS→ALTER TABLE ADD COLUMN；表不存在时由 helper 静默跳过）。
         ensure_ai_projection_columns(cursor)
+        # WP-S1 / F9：旧库 ai_task 幂等补 progress_percent（展示用阶段进度），
+        # 与上面同模式（SHOW COLUMNS→ALTER TABLE ADD COLUMN）。
+        ensure_ai_task_columns(cursor)
         # Task 2 additive AI fields are safe to backfill during bootstrap;
         # constraint/index changes remain in the reviewed migration runner.
         ensure_ai_legacy_columns(cursor)

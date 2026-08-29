@@ -1255,3 +1255,26 @@ def test_worker_dry_run_is_safe_and_prints_zero_counts(capsys: pytest.CaptureFix
     out = capsys.readouterr().out.strip()
     assert code == 0
     assert out == "claimed=0 completed=0 failed=0"
+
+
+# ----------------------------------------------------------------------
+# WP-S1 / F9：搜索任务百分比进度
+# ----------------------------------------------------------------------
+
+def test_task_record_from_row_maps_progress_percent():
+    """进度字段（方案 WP-S1）：from_row 必须透传 progress_percent。"""
+    from app.services.ai.tasks import AiTaskRecord
+
+    row = {
+        "id": 1, "task_id": "t1", "owner_user_id": 1, "task_type": "search_execute",
+        "scene": "ai", "idempotency_key": "k1", "request_digest": None,
+        "status": "running", "stage": "filtering", "progress_percent": 30,
+        "attempt_count": 0, "max_attempts": 3, "next_run_at": None,
+        "lease_owner": None, "lease_until": None, "consent_snapshot_json": None,
+        "source_revision_json": None, "payload_summary": None,
+        "error_code": None, "error_message": None, "result_ref": None,
+        "created_at": None, "updated_at": None, "started_at": None,
+        "finished_at": None,
+    }
+    record = AiTaskRecord.from_row(row)
+    assert record.progress_percent == 30

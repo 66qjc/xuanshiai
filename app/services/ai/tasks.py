@@ -99,7 +99,8 @@ _DEFAULT_SAFE_ERROR_MESSAGE = "AI 服务调用失败"
 
 _SELECT_COLUMNS = """
     id, task_id, owner_user_id, task_type, scene, idempotency_key,
-    request_digest, status, stage, attempt_count, max_attempts, next_run_at,
+    request_digest, status, stage, progress_percent, attempt_count,
+    max_attempts, next_run_at,
     lease_owner, lease_until, consent_snapshot_json, source_revision_json,
     payload_summary, error_code, error_message, result_ref,
     created_at, updated_at, started_at, finished_at
@@ -152,6 +153,7 @@ class AiTaskRecord:
     request_digest: str | None
     status: AiTaskStatus
     stage: str | None
+    progress_percent: int | None
     attempt_count: int
     max_attempts: int
     next_run_at: datetime | None
@@ -180,6 +182,11 @@ class AiTaskRecord:
             request_digest=str(row["request_digest"]) if row.get("request_digest") else None,
             status=AiTaskStatus(row["status"]),
             stage=str(row["stage"]) if row.get("stage") else None,
+            progress_percent=(
+                int(row["progress_percent"])
+                if row.get("progress_percent") is not None
+                else None
+            ),
             attempt_count=int(row["attempt_count"] or 0),
             max_attempts=int(row["max_attempts"] or 0),
             next_run_at=row["next_run_at"],
