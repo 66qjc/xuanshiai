@@ -810,3 +810,146 @@ async def test_real_update_session_clarify_loop_and_patch_draft(
     async with factory() as cleanup_db:
         await _clean(cleanup_db, user_id)
        
+
+
+@pytest.mark.asyncio
+async def test_real_published_fields_is_new_across_two_revisions(
+    real_db_session: AsyncSession,
+    real_db_engine: AsyncEngine,
+) -> None:
+    """WP-P4b 真库：两轮发布后第二轮新增条目 is_new=true 置顶，首轮条目
+    is_new=false 且仍在（追加不覆盖）；structured 恒 False；投影物化
+    first_seen_revision。"""
+    from app.schemas.ai_common import ProjectionKind
+    from app.services.ai.features import build_feature_projection
+    from app.services.ai.profile import list_published_profile_fields
+
+    user_id = 9_880_000_401
+    await _clean(real_db_session, user_id)
+    factory = async_sessionmaker(real_db_engine, expire_on_commit=False)
+
+    async def _seed_revision(db, revision_no: int, entries: list[tuple[str, str]]) -> int:
+        await db.execute(
+            text(
+                "INSERT INTO ai_profile_revision "
+                "(user_id, subject, revision_no, draft_id, source_revision_json, "
+                " policy_revision, published_by) "
+                "VALUES (:user_id, 'personal', :revision_no, NULL, "
+                " '{\"profile\": 1, \"preference\": 0, \"privacy\": 0, "
+                "\"relationship\": 0, \"policy\": 0}', :policy_revision, :user_id)"
+            ),
+            {
+                "user_id": user_id,
+                "revision_no": revision_no,
+                "policy_revision": POLICY_REVISION,
+            },
+        )
+        revision_id = (
+            await db.execute(
+                text(
+                    "SELECT id FROM ai_profile_revision "
+                    "WHERE user_id = :user_id AND subject = 'personal' "
+                    "AND revision_no = :revision_no LIMIT 1"
+                ),
+                {"user_id": user_id, "revision_no": revision_no},
+            )
+        ).scalar_one()
+        await db.execute(
+            text(
+                "INSERT INTO ai_profile_revision_field "
+                "(revision_id, field_key, subject, field_kind, value_json, "
+                " display_value, confidence, content_hash) "
+                "VALUES (:revision_id, 'height_cm', 'personal', 'structured', "
+                " '175', '175', 0.9, 'hash-height')"
+            ),
+            {"revision_id": revision_id},
+        )
+        for field_key, content in entries:
+            await db.execute(
+                text(
+                    "INSERT INTO ai_profile_revision_field "
+                    "(revision_id, field_key, subject, field_kind, category, content, "
+                    " value_json, display_value, confidence, content_hash) "
+                    "VALUES (:revision_id, :field_key, 'personal', 'entry', 'values', "
+                    " :content, NULL, :content, 0.9, :content_hash)"
+                ),
+                {
+                    "revision_id": revision_id,
+                    "field_key": field_key,
+                    "content": content,
+                    "content_hash": f"hash-{field_key}-{revision_no}",
+                },
+            )
+        return revision_id
+
+    async with factory() as seed_db:
+        await seed_db.execute(
+            text(
+                "INSERT INTO user_revision_state "
+                "(user_id, profile_revision, preference_revision, privacy_revision, "
+                "relationship_revision, policy_revision) VALUES (:user_id, 2, 0, 0, 0, 0)"
+            ),
+            {"user_id": user_id},
+        )
+        await grant_consent(
+            seed_db,
+            user_id,
+            "profile_text_extract",
+            AiConsentGrantRequest(
+                consent_version=CONSENT_VERSION,
+                policy_revision=POLICY_REVISION,
+            ),
+            f"new-grant-{user_id}",
+            0,
+        )
+        await _seed_revision(seed_db, 1, [("entry_values_r1", "欣赏踏实上进的人")])
+        # 真实 update 流程会把旧字段（含条目）以 confirmed 拷入新草稿再发布，
+        # 因此第二轮 revision 同时包含旧条目与新条目。
+        await _seed_revision(
+            seed_db,
+            2,
+            [
+                ("entry_values_r1", "欣赏踏实上进的人"),
+                ("entry_interests_r2", "热爱艺术愿意看展"),
+            ],
+        )
+        await seed_db.commit()
+
+    async with factory() as read_db:
+        fields = await list_published_profile_fields(read_db, user_id, "personal")
+        by_key = {item["field_key"]: item for item in fields}
+        # 第二轮新增条目：is_new=True。
+        assert by_key["entry_interests_r2"]["is_new"] is True
+        # 首轮条目：is_new=False 但仍在（追加不覆盖）。
+        assert by_key["entry_values_r1"]["is_new"] is False
+        assert by_key["entry_values_r1"]["content"] == "欣赏踏实上进的人"
+        # structured 恒 False；New 条目排在最前。
+        assert by_key["height_cm"]["is_new"] is False
+        assert fields[0]["field_key"] == "entry_interests_r2"
+        # 投影物化：isNew 群组最早来源 revision_no = 1。
+        projection = await build_feature_projection(
+            read_db, user_id, ProjectionKind.PERSONAL_SEARCHABLE, revision_vector=None
+        )
+        assert projection.id is not None
+        await read_db.commit()
+    async with factory() as check_db:
+        first_seen = (
+            await check_db.execute(
+                text(
+                    "SELECT first_seen_revision FROM ai_feature_projection "
+                    "WHERE subject_user_id = :user_id AND status = 'active' "
+                    "AND projection_kind = 'personal_searchable'"
+                ),
+                {"user_id": user_id},
+            )
+        ).scalar_one()
+        assert first_seen == 1
+
+    # 共享测试库纪律：清场（含 projection 入队外的行）。
+    async with factory() as cleanup_db:
+        await cleanup_db.execute(
+            text("DELETE FROM ai_feature_projection WHERE subject_user_id = :user_id"),
+            {"user_id": user_id},
+        )
+        await cleanup_db.commit()
+        await _clean(cleanup_db, user_id)

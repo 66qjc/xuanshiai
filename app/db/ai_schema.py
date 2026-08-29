@@ -364,6 +364,7 @@ AI_TABLES = {
             `projection_version` varchar(32) NOT NULL,
             `fields_json` json DEFAULT NULL COMMENT '仅 allowlist 字段，不含原文',
             `entry_digest` text DEFAULT NULL COMMENT 'WP-P1：该维度全部已发布条目的紧凑摘要（每行"分类：内容"），仅 self_only 维度存理想型条目',
+            `first_seen_revision` int unsigned DEFAULT NULL COMMENT 'WP-P4：本投影内 isNew 条目群组的最早来源 revision_no（is_new 读取端判定的物化锚）',
             `source_revision_json` json DEFAULT NULL COMMENT '五维版本向量快照（profile/preference/privacy/relationship/policy），写入必须显式提供',
             `profile_revision` int unsigned NOT NULL DEFAULT '0',
             `preference_revision` int unsigned NOT NULL DEFAULT '0',
@@ -484,6 +485,10 @@ AI_PROJECTION_REQUIRED_COLUMNS: dict[str, str] = {
     "entry_digest": (
         "`entry_digest` text DEFAULT NULL "
         "COMMENT 'WP-P1：该维度全部已发布条目的紧凑摘要（每行\"分类：内容\"）'"
+    ),
+    "first_seen_revision": (
+        "`first_seen_revision` int unsigned DEFAULT NULL "
+        "COMMENT 'WP-P4：isNew 条目群组的最早来源 revision_no'"
     ),
     "visibility_class": (
         "`visibility_class` varchar(32) NOT NULL DEFAULT 'searchable' "

@@ -369,6 +369,25 @@ class ProfileRevisionRead(BaseModel):
     published_at: datetime
 
 
+class ProfilePublishedFieldRead(BaseModel):
+    """WP-P4b：最新发布版本字段读取端出参（含条目 New 角标与排序）。"""
+
+    field_key: str
+    field_kind: str = Field(default="structured", pattern="^(structured|entry)$")
+    category: str | None = None
+    content: str | None = None
+    value: Any = None
+    display_value: str | None = None
+    is_new: bool = False
+    updated_at: datetime | None = None
+
+
+class ProfilePublishedFieldsPage(BaseModel):
+    subject: ProfileSubject
+    revision_no: int = 0
+    fields: list[ProfilePublishedFieldRead] = Field(default_factory=list)
+
+
 class ProfileDraftPatchRequest(BaseModel):
     """PATCH draft body: draft-level optimistic lock plus per-field actions.
 

@@ -175,10 +175,10 @@ replaces_field_key VARCHAR(64) DEFAULT NULL     -- entry 改写时指向被替�
 **is_new 判定语义（锁定）：** 条目级——该 `field_key` 在 `ai_profile_revision_field` 历史中首次出现的 revision_no 等于最新已发布 revision_no，则为 new。被 modify 替换的旧条目保留原位（不置顶、不标新）；用户显式删除走 `delete_ai_profile_field`。
 
 **Steps:**
-- [ ] RED（单测）：add patch 确认 → 草稿出现新 entry、旧条目仍在；modify patch → 新行带 `replaces_field_key`、旧行未删；publish 后读取端 `is_new` 与置顶排序正确。
-- [ ] GREEN：实现并入/发布/读取端。
-- [ ] RED（集成）：真库两轮发布 → 第二轮新增条目 is_new=true、首轮条目 is_new=false 且仍在；rollback-then-assert。
-- [ ] 全量回归（`test_ai_profile_publish.py` 必须全绿）。
+- [x] RED（单测）：add patch 确认 → 草稿出现新 entry、旧条目仍在；modify patch → 新行带 `replaces_field_key`、旧行未删；publish 后读取端 `is_new` 与置顶排序正确。
+- [x] GREEN：实现并入/发布/读取端。
+- [x] RED（集成）：真库两轮发布 → 第二轮新增条目 is_new=true、首轮条目 is_new=false 且仍在；rollback-then-assert。
+- [x] 全量回归（`test_ai_profile_publish.py` 必须全绿）。
 
 **验收（方案 WP-P4 验收原文）：** 全流程 e2e——update-intent"希望对方是艺术家"→AI 追问→答复→确认→publish→读取端出现 `is_new=true` 的条目置顶，原条目仍在。
 **Commit:** `feat(profile): 对话式追加并入+New角标置顶（不覆盖语义）`

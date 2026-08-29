@@ -278,6 +278,40 @@ async def _load_revision_fields(
 _ENTRY_DIGEST_LINE_MAX = 100
 
 
+async def _compute_first_seen_revision(
+    db: AsyncSession, field_rows: list[dict[str, Any]]
+) -> int | None:
+    """物化 isNew 条目群组的最早来源 revision_no（WP-P4）。
+
+    对本次发布包含的条目 field_key 在历史中求 MIN(revision_no)，取其最小值
+    写入投影行；纯 structured 投影返回 NULL。is_new 的读取端判定仍以
+    「MIN(revision_no) == 最新 revision_no」为准（锁定语义），此列仅作为
+    投影层的群组锚，供调试与后续增量读取优化。
+    """
+    entry_keys = [
+        str(row.get("field_key"))
+        for row in field_rows
+        if str(row.get("field_kind") or "structured") == "entry"
+    ]
+    if not entry_keys:
+        return None
+    placeholders = ", ".join(f":k{idx}" for idx in range(len(entry_keys)))
+    params: dict[str, Any] = {
+        f"k{idx}": key for idx, key in enumerate(entry_keys)
+    }
+    result = await db.execute(
+        text(
+            "SELECT MIN(r.revision_no) AS first_no "
+            "FROM ai_profile_revision_field f "
+            "JOIN ai_profile_revision r ON r.id = f.revision_id "
+            f"WHERE f.field_kind = 'entry' AND f.field_key IN ({placeholders})"
+        ),
+        params,
+    )
+    row = await _first_row(result)
+    return int(row["first_no"]) if row and row.get("first_no") is not None else None
+
+
 def build_entry_digest(field_rows: list[dict[str, Any]]) -> str | None:
     """把已发布条目行折成紧凑摘要（每行“分类：内容”），无条目返回 NULL。
 
@@ -523,6 +557,7 @@ async def build_feature_projection(
     if not payload:
         raise ProjectionBuildError(f"no allowlisted confirmed fields for {subject}")
     entry_digest = build_entry_digest(field_rows)
+    first_seen_revision = await _compute_first_seen_revision(db, field_rows)
 
     source_hash = projection_source_hash(projection_kind, subject, payload, revision)
     expires_at = _now_utc() + timedelta(days=_PROJECTION_TTL_DAYS)
@@ -559,12 +594,14 @@ async def build_feature_projection(
         text(
             "INSERT INTO ai_feature_projection "
             "(subject_user_id, projection_kind, source_hash, projection_version, "
-            " fields_json, entry_digest, source_revision_json, profile_revision, "
+            " fields_json, entry_digest, first_seen_revision, source_revision_json, "
+            " profile_revision, "
             " preference_revision, privacy_revision, relationship_revision, "
             " policy_revision, consent_snapshot_json, visibility_class, "
             " status, expires_at, created_at, updated_at) "
             "VALUES (:subject_user_id, :projection_kind, :source_hash, "
-            " :projection_version, :fields_json, :entry_digest, :source_revision_json, "
+            " :projection_version, :fields_json, :entry_digest, "
+            " :first_seen_revision, :source_revision_json, "
             " :profile_revision, :preference_revision, :privacy_revision, "
             " :relationship_revision, :policy_revision, :consent_snapshot_json, "
             " :visibility_class, 'active', :expires_at, UTC_TIMESTAMP(), "
@@ -572,6 +609,7 @@ async def build_feature_projection(
             "ON DUPLICATE KEY UPDATE "
             " fields_json = VALUES(fields_json), "
             " entry_digest = VALUES(entry_digest), "
+            " first_seen_revision = VALUES(first_seen_revision), "
             " source_revision_json = VALUES(source_revision_json), "
             " profile_revision = VALUES(profile_revision), "
             " preference_revision = VALUES(preference_revision), "
@@ -592,6 +630,7 @@ async def build_feature_projection(
             "projection_version": schema_version,
             "fields_json": json.dumps(payload, ensure_ascii=False),
             "entry_digest": entry_digest,
+            "first_seen_revision": first_seen_revision,
             "source_revision_json": json.dumps(revision.as_dict(), ensure_ascii=False),
             "profile_revision": revision.profile,
             "preference_revision": revision.preference,

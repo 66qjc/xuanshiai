@@ -4589,6 +4589,88 @@ async def cleanup_handler(
     return None
 
 
+async def list_published_profile_fields(
+    db: AsyncSession, owner_user_id: int, subject: str
+) -> list[dict[str, Any]]:
+    """WP-P4b：最新发布版本的字段读取端（含条目 New 角标）。
+
+    is_new 判定（锁定语义）：条目级——该 field_key 在 ``ai_profile_revision_field``
+    历史中首次出现的 revision_no 等于最新已发布 revision_no 即为 new；
+    structured 字段恒 False。排序 ``is_new DESC, updated_at DESC``（发布行
+    不可变，以 created_at 充当 updated_at）。旧行永不删除——「追加不覆盖」
+    的读取面：被 modify 的旧条目保留原位，不置顶、不标新。不 commit。
+    """
+    latest = await _first_row(
+        await db.execute(
+            text(
+                "SELECT id, revision_no FROM ai_profile_revision "
+                "WHERE user_id = :user_id AND subject = :subject "
+                "ORDER BY revision_no DESC, id DESC LIMIT 1"
+            ),
+            {"user_id": owner_user_id, "subject": subject},
+        )
+    )
+    if latest is None:
+        return []
+    latest_revision_no = int(latest["revision_no"])
+    rows = (
+        await db.execute(
+            text(
+                "SELECT field_key, field_kind, category, content, value_json, "
+                "display_value, created_at FROM ai_profile_revision_field "
+                "WHERE revision_id = :revision_id ORDER BY created_at DESC, id DESC"
+            ),
+            {"revision_id": int(latest["id"])},
+        )
+    ).mappings().all()
+    entry_keys = [
+        str(row["field_key"])
+        for row in rows
+        if str(row.get("field_kind") or "structured") == "entry"
+    ]
+    first_seen: dict[str, int] = {}
+    if entry_keys:
+        placeholders = ", ".join(f":k{idx}" for idx in range(len(entry_keys)))
+        params: dict[str, Any] = {f"k{idx}": key for idx, key in enumerate(entry_keys)}
+        first_rows = await db.execute(
+            text(
+                "SELECT f.field_key, MIN(r.revision_no) AS first_no "
+                "FROM ai_profile_revision_field f "
+                "JOIN ai_profile_revision r ON r.id = f.revision_id "
+                f"WHERE f.field_kind = 'entry' AND f.field_key IN ({placeholders}) "
+                "GROUP BY f.field_key"
+            ),
+            params,
+        )
+        for row in first_rows.mappings().all():
+            first_seen[str(row["field_key"])] = int(row["first_no"] or 0)
+    items: list[dict[str, Any]] = []
+    for row in rows:
+        field_kind = str(row.get("field_kind") or "structured")
+        is_new = (
+            field_kind == "entry"
+            and first_seen.get(str(row["field_key"]), 0) == latest_revision_no
+            and latest_revision_no > 0
+        )
+        items.append(
+            {
+                "field_key": str(row["field_key"]),
+                "field_kind": field_kind,
+                "category": row.get("category"),
+                "content": row.get("content"),
+                "value": _maybe_json(row.get("value_json")),
+                "display_value": row.get("display_value"),
+                "is_new": is_new,
+                "updated_at": row.get("created_at"),
+            }
+        )
+    # 排序 is_new DESC（True 在前）+ updated_at DESC：先按时间降序，再做
+    # 稳定的 is_new 分组排序（Python 排序稳定，组内时间序保留）。
+    items.sort(key=lambda item: item["updated_at"] or _now_utc(), reverse=True)
+    items.sort(key=lambda item: 1 if item["is_new"] else 0, reverse=True)
+    return items
+
+
 async def list_profile_revisions(
     db: AsyncSession,
     owner_user_id: int,

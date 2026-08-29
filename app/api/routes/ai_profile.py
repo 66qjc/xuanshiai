@@ -47,6 +47,7 @@ from app.schemas.ai_profile import (
     ProfileSessionCreateRequest,
     ProfileUpdateIntentAccepted,
     ProfileUpdateIntentRequest,
+    ProfilePublishedFieldsPage,
     ProfileSessionRead,
     ProfileSkipQuestionRequest,
     ProfileSubject,
@@ -70,6 +71,7 @@ from app.services.ai.profile import (
     confirm_profile_narrative,
     create_profile_session,
     create_update_session,
+    list_published_profile_fields,
     delete_ai_profile,
     delete_ai_profile_field,
     delete_profile_session,
@@ -671,6 +673,23 @@ async def restore_profile_revision_route(
         raise _error_response(exc.code, exc.message, exc.status_code) from exc
     await db.commit()
     return _to_draft_read(draft)
+
+
+@router.get(
+    "/profiles/{subject}/fields",
+    response_model=ProfilePublishedFieldsPage,
+    status_code=status.HTTP_200_OK,
+    summary="读取本人最新发布画像字段（条目按分类携带 is_new 角标）",
+)
+async def list_published_profile_fields_route(
+    subject: ProfileSubject,
+    current: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> ProfilePublishedFieldsPage:
+    """WP-P4b：New 条目置顶（is_new DESC, updated_at DESC），旧条目保留原位。"""
+    _require_profile_feature()
+    fields = await list_published_profile_fields(db, current.id, subject.value)
+    return ProfilePublishedFieldsPage(subject=subject, fields=fields)
 
 
 @router.delete(
