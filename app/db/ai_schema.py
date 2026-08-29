@@ -175,6 +175,10 @@ AI_TABLES = {
             `draft_id` varchar(64) NOT NULL,
             `field_key` varchar(64) NOT NULL,
             `subject` varchar(24) NOT NULL COMMENT 'personal/ideal_partner',
+            `field_kind` enum('structured','entry') NOT NULL DEFAULT 'structured' COMMENT 'structured=受控字段/entry=条目（WP-P1，决策D2并存扩展）',
+            `category` varchar(32) DEFAULT NULL COMMENT 'entry 分类，服务层校验 9 枚举',
+            `content` varchar(200) DEFAULT NULL COMMENT 'entry 正文，≤200 字由服务层双保险',
+            `replaces_field_key` varchar(64) DEFAULT NULL COMMENT 'entry 改写指向的被替换条目 field_key',
             `value_json` json DEFAULT NULL,
             `display_value` varchar(500) DEFAULT NULL,
             `source_type` varchar(24) DEFAULT NULL,
@@ -217,6 +221,10 @@ AI_TABLES = {
             `revision_id` bigint unsigned NOT NULL,
             `field_key` varchar(64) NOT NULL,
             `subject` varchar(24) NOT NULL COMMENT 'personal/ideal_partner',
+            `field_kind` enum('structured','entry') NOT NULL DEFAULT 'structured' COMMENT 'structured=受控字段/entry=条目（WP-P1，决策D2并存扩展）',
+            `category` varchar(32) DEFAULT NULL COMMENT 'entry 分类，服务层校验 9 枚举',
+            `content` varchar(200) DEFAULT NULL COMMENT 'entry 正文，≤200 字由服务层双保险',
+            `replaces_field_key` varchar(64) DEFAULT NULL COMMENT 'entry 改写指向的被替换条目 field_key',
             `value_json` json DEFAULT NULL,
             `display_value` varchar(500) DEFAULT NULL,
             `confidence` decimal(5,4) DEFAULT NULL,
@@ -525,6 +533,51 @@ def ensure_ai_task_columns(cursor: Any) -> None:
     for column_name, column_def in AI_TASK_REQUIRED_COLUMNS.items():
         if column_name not in existing:
             cursor.execute(f"ALTER TABLE `ai_task` ADD COLUMN {column_def}")
+
+
+# ----------------------------------------------------------------------
+# WP-P1 / F4：画像字段表条目化补列（旧库幂等补列）
+# ----------------------------------------------------------------------
+#
+# draft_field 与 revision_field 同构补 4 列；field_kind 默认 'structured'
+# 保证存量行与既有 structured 链路零感知（决策 D2 并存扩展，entry 不改变
+# 建构门槛边界）。与 ensure_ai_task_columns 同模式：SHOW COLUMNS→
+# ALTER TABLE ADD COLUMN；表不存在时静默跳过（新库走 CREATE TABLE 完整列）。
+AI_PROFILE_ENTRY_REQUIRED_COLUMNS: dict[str, str] = {
+    "field_kind": (
+        "`field_kind` enum('structured','entry') NOT NULL DEFAULT 'structured' "
+        "COMMENT 'structured=受控字段/entry=条目（WP-P1，决策D2并存扩展）'"
+    ),
+    "category": (
+        "`category` varchar(32) DEFAULT NULL "
+        "COMMENT 'entry 分类，服务层校验 9 枚举'"
+    ),
+    "content": (
+        "`content` varchar(200) DEFAULT NULL "
+        "COMMENT 'entry 正文，≤200 字由服务层双保险'"
+    ),
+    "replaces_field_key": (
+        "`replaces_field_key` varchar(64) DEFAULT NULL "
+        "COMMENT 'entry 改写指向的被替换条目 field_key'"
+    ),
+}
+
+AI_PROFILE_ENTRY_FIELD_TABLES = ("ai_profile_draft_field", "ai_profile_revision_field")
+
+
+def ensure_ai_profile_entry_columns(cursor: Any) -> None:
+    """Idempotently add entry columns to both profile field tables（旧库幂等补列）。"""
+    for table_name in AI_PROFILE_ENTRY_FIELD_TABLES:
+        try:
+            cursor.execute(f"SHOW COLUMNS FROM `{table_name}`")
+            existing = {row["Field"] for row in cursor.fetchall()}
+        except Exception:  # noqa: BLE001 - legacy bootstrap is best effort
+            continue
+        for column_name, column_def in AI_PROFILE_ENTRY_REQUIRED_COLUMNS.items():
+            if column_name not in existing:
+                cursor.execute(
+                    f"ALTER TABLE `{table_name}` ADD COLUMN {column_def}"
+                )
 
 
 # These additive columns keep an older bootstrap-created database readable until

@@ -44,7 +44,7 @@
 - Modify: `D:\Users\ASUS\Desktop\宣誓爱\PRODUCT.md`（工作区根，约 461 行；已有"AI 体验增强（良配对齐，2026-08）"章节）
 
 **Steps:**
-- [ ] 在该章节后追加"### AI 体验增强·阶段2（条目式画像与搜索体验，2026-08）"，含 5 小节，每节写清产品定义与边界：
+- [x] 在该章节后追加"### AI 体验增强·阶段2（条目式画像与搜索体验，2026-08）"，含 5 小节，每节写清产品定义与边界：
   1. **条目式画像**：分类（基本情况/工作状态/外形特征/性格特征/价值观/兴趣爱好/作息习惯/饮食习惯/生活规划）× 方向（关于我/关于对方）× 自由文本 ≤200 字；与既有 10 个结构化字段并存；主业务 `user_profile` 仍不直写，前端读 AI 投影/叙事接口。
   2. **对话式画像更新**：随时陈述新期望→AI 追问澄清→确认后**追加**为 New 条目；旧条目不覆盖（除非用户显式删除）；New 角标规则（最新发布版本首现的条目置顶标新）。
   3. **语音/文字双模式**：同一会话内可切换，进度与已确认字段无缝延续；语音抽取结果与文字模式同库同状态机。
@@ -74,9 +74,9 @@ replaces_field_key VARCHAR(64) DEFAULT NULL     -- entry 改写时指向被替�
 ```
 
 **Steps:**
-- [ ] RED：集成测试断言 `information_schema.COLUMNS` 中两张表各含 4 新列，且存量行 `field_kind='structured'` 默认成立；旧库场景（先建旧结构再跑 ensure）补列后断言通过、**连跑两遍不报错**（幂等）。
-- [ ] GREEN：CREATE TABLE 更新 + ensure helper + `database_setup_marriage.py` 接线。
-- [ ] 全量回归：`python -m pytest tests/ -x -q`（默认值保证现有用例不感知新列）。
+- [x] RED：集成测试断言 `information_schema.COLUMNS` 中两张表各含 4 新列，且存量行 `field_kind='structured'` 默认成立；旧库场景（先建旧结构再跑 ensure）补列后断言通过、**连跑两遍不报错**（幂等）。
+- [x] GREEN：CREATE TABLE 更新 + ensure helper + `database_setup_marriage.py` 接线。
+- [x] 全量回归：`python -m pytest tests/ -x -q`（默认值保证现有用例不感知新列）。
 
 **验收：** 新列存在且幂等；全量测试不新增红。
 **Commit:** `feat(schema): 画像条目模型列（field_kind/category/content/replaces_field_key）幂等迁移`

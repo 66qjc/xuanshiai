@@ -2614,6 +2614,7 @@ class DatabaseManager:
             AI_CONSENT_OPERATION_TABLE,
             AI_TABLES,
             ensure_ai_legacy_columns,
+            ensure_ai_profile_entry_columns,
             ensure_ai_projection_columns,
             ensure_ai_task_columns,
         )
@@ -2672,6 +2673,9 @@ class DatabaseManager:
         # WP-S1 / F9：旧库 ai_task 幂等补 progress_percent（展示用阶段进度），
         # 与上面同模式（SHOW COLUMNS→ALTER TABLE ADD COLUMN）。
         ensure_ai_task_columns(cursor)
+        # WP-P1 / F4：旧库画像字段表幂等补条目 4 列（field_kind 默认
+        # 'structured'，存量行与 structured 链路零影响）。
+        ensure_ai_profile_entry_columns(cursor)
         # Task 2 additive AI fields are safe to backfill during bootstrap;
         # constraint/index changes remain in the reviewed migration runner.
         ensure_ai_legacy_columns(cursor)
