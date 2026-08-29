@@ -24,6 +24,7 @@ from app.services.ai.base import (
     AIProvider,
     ExtractedEntry,
     ExtractedField,
+    ExtractedPatch,
     ModerationRequest,
     ModerationResult,
     NarrativeDimension,
@@ -42,7 +43,7 @@ from app.services.ai.base import (
     StructuredExtractRequest,
     StructuredExtractResult,
 )
-from app.services.ai.prompts.profile_extract import build_profile_extract_prompt
+from app.services.ai.prompts.profile_extract import build_profile_extract_prompt, build_profile_update_clarify_prompt
 from app.services.ai.prompts.profile_narrative import build_profile_narrative_prompt
 from app.services.ai.prompts.search_parse import build_search_parse_prompt
 from app.services.ai.prompts.voice_reply import build_voice_reply_prompt
@@ -851,6 +852,8 @@ class _OpenAICompatProvider:
     async def structured_extract(
         self, request: StructuredExtractRequest
     ) -> StructuredExtractResult:
+        if request.session_kind == "update":
+            return await self._structured_extract_update(request)
         prompt = build_profile_extract_prompt(
             request.subject,
             request.turn_texts,
@@ -908,6 +911,52 @@ class _OpenAICompatProvider:
             schema_version=_PROFILE_SCHEMA_VERSION,
             fields=tuple(fields),
             entries=tuple(entries),
+        )
+
+    async def _structured_extract_update(
+        self, request: StructuredExtractRequest
+    ) -> StructuredExtractResult:
+        """update 会话澄清式抽取：产出 clarifying_question 或 entry patch。"""
+        prompt = build_profile_update_clarify_prompt(
+            request.subject,
+            request.turn_texts,
+            entry_digest=request.entry_digest,
+        )
+        data = await self._chat_json(prompt)
+        subject = ProfileSubject(request.subject)
+        patches_data = data.get("patches", []) if isinstance(data, dict) else []
+        patches: list[ExtractedPatch] = []
+        for item in patches_data:
+            if not isinstance(item, dict):
+                continue
+            try:
+                patches.append(
+                    ExtractedPatch(
+                        action=item.get("action", ""),
+                        category=item.get("category", ""),
+                        content=item.get("content", ""),
+                        replaces_field_key=item.get("replaces_field_key"),
+                        subject=subject,
+                        source_quote=item.get("source_quote"),
+                        confidence=_safe_confidence(item.get("confidence")),
+                        needs_confirmation=True,
+                        confirmation_status="suggested",
+                        schema_version=_PROFILE_SCHEMA_VERSION,
+                        prompt_version=_PROFILE_PROMPT_VERSION,
+                        policy_revision=request.policy_revision,
+                    )
+                )
+            except ValidationError:
+                continue
+        question = data.get("clarifying_question") if isinstance(data, dict) else None
+        if not isinstance(question, str) or not question.strip():
+            question = None
+        return StructuredExtractResult(
+            schema_version=_PROFILE_SCHEMA_VERSION,
+            fields=(),
+            entries=(),
+            clarifying_question=question,
+            patches=tuple(patches),
         )
 
     async def parse_search_query(

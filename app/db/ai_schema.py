@@ -103,6 +103,7 @@ AI_TABLES = {
             `user_id` bigint unsigned NOT NULL,
             `subject` varchar(24) NOT NULL COMMENT 'personal/ideal_partner',
             `input_mode` varchar(16) NOT NULL DEFAULT 'text',
+            `session_kind` enum('build','update') NOT NULL DEFAULT 'build' COMMENT 'build=建构问答/update=对话式追加（WP-P4，澄清式追问+entry patch）',
             `status` varchar(24) NOT NULL DEFAULT 'draft' COMMENT 'draft/extracting/awaiting_confirmation/paused/published/failed/cancelled/stale',
             `active_status` tinyint NOT NULL DEFAULT '1' COMMENT '1活动 0已关闭',
             `consent_version` varchar(32) NOT NULL,
@@ -583,6 +584,31 @@ def ensure_ai_profile_entry_columns(cursor: Any) -> None:
                 cursor.execute(
                     f"ALTER TABLE `{table_name}` ADD COLUMN {column_def}"
                 )
+
+
+# ----------------------------------------------------------------------
+# WP-P4 / F5：画像会话 update 语义补列（旧库幂等补列）
+# ----------------------------------------------------------------------
+#
+# session_kind 默认 'build' 保证存量会话行为零变化；update 会话是加法通道。
+AI_PROFILE_SESSION_REQUIRED_COLUMNS: dict[str, str] = {
+    "session_kind": (
+        "`session_kind` enum('build','update') NOT NULL DEFAULT 'build' "
+        "COMMENT 'build=建构问答/update=对话式追加（WP-P4）'"
+    ),
+}
+
+
+def ensure_ai_profile_session_columns(cursor: Any) -> None:
+    """Idempotently add update-session columns to ``ai_profile_session``。"""
+    try:
+        cursor.execute("SHOW COLUMNS FROM `ai_profile_session`")
+        existing = {row["Field"] for row in cursor.fetchall()}
+    except Exception:  # noqa: BLE001 - legacy bootstrap is best effort
+        return
+    for column_name, column_def in AI_PROFILE_SESSION_REQUIRED_COLUMNS.items():
+        if column_name not in existing:
+            cursor.execute(f"ALTER TABLE `ai_profile_session` ADD COLUMN {column_def}")
 
 
 # These additive columns keep an older bootstrap-created database readable until

@@ -153,9 +153,9 @@ replaces_field_key VARCHAR(64) DEFAULT NULL     -- entry 改写时指向被替�
 - Idempotency-Key 语义沿用会话创建端点既有模式。
 
 **Steps:**
-- [ ] RED（单测）：update-intent → 创建 `session_kind='update'` 会话 + 首轮澄清追问；已有活动会话时拒绝；澄清两轮后产出 add/modify patch 候选。
-- [ ] GREEN：实现服务 + 路由 + 迁移。
-- [ ] RED（集成）：真库建 update 会话 → turns 落库 → rollback 后重读成立。
+- [x] RED（单测）：update-intent → 创建 `session_kind='update'` 会话 + 首轮澄清追问；已有活动会话时拒绝；澄清两轮后产出 add/modify patch 候选。
+- [x] GREEN：实现服务 + 路由 + 迁移。
+- [x] RED（集成）：真库建 update 会话 → turns 落库 → rollback 后重读成立。
 
 **验收：** 对已发布画像发起 update-intent"希望对方是艺术家"→ 返回澄清追问（如"偏向音乐、绘画还是舞蹈？"）→ 答复 → 产出可确认 patch；全量回归不新增红。
 **Commit:** `feat(profile): update-intent 对话式追加会话（澄清式追问+entry patch）`

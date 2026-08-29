@@ -38,6 +38,12 @@ class StructuredExtractRequest:
     allowlist: frozenset[str] = AI_FIELD_ALLOWLIST
     locale: str | None = None
     target_field_key: str | None = None
+    # WP-P4：build=建构问答（既有抽取）；update=对话式追加（澄清式追问，
+    # 产出 clarifying_question 或 entry patch 候选）。
+    session_kind: str = "build"
+    # update 会话专用：该维度已发布条目摘要（含 field_key），供 modify patch
+    # 定位被改写条目；build 会话为 None。
+    entry_digest: str | None = None
 
 
 class ExtractedField(BaseModel):
@@ -115,6 +121,53 @@ class ExtractedEntry(BaseModel):
         return self
 
 
+class ExtractedPatch(BaseModel):
+    """One entry patch candidate produced by an update (clarify) session（WP-P4）.
+
+    ``add`` 新增条目；``modify`` 改写既有条目——必须携带
+    ``replaces_field_key`` 指向被改写条目（旧条目行永不删除，覆盖语义由
+    读取端 New 角标/排序表达，追加不覆盖是硬约束）。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    action: str = Field(..., pattern="^(add|modify)$")
+    category: str = Field(..., min_length=1, max_length=32)
+    content: str = Field(..., min_length=1, max_length=PROFILE_ENTRY_CONTENT_MAX_LENGTH)
+    replaces_field_key: str | None = Field(default=None, max_length=64)
+    subject: ProfileSubject
+    source_quote: str | None = None
+    source_span: str | None = Field(default=None, max_length=500)
+    source_turn_ids: tuple[str, ...] = ()
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+    needs_confirmation: bool = True
+    confirmation_status: str = Field(
+        default=ProfileFieldConfirmationStatus.SUGGESTED.value,
+        pattern="^suggested$",
+    )
+    schema_version: str = Field(default="profile-extract-v1", min_length=1, max_length=32)
+    prompt_version: str = Field(default="profile-extract-prompt-v1", min_length=1, max_length=32)
+    policy_revision: str = Field(default="ai-policy-2026-08-07-v1", min_length=1, max_length=64)
+
+    @model_validator(mode="after")
+    def validate_patch_contract(self) -> ExtractedPatch:
+        if self.category not in PROFILE_ENTRY_CATEGORIES:
+            raise ValueError("patch category is not in the frozen allowlist")
+        if not self.content.strip():
+            raise ValueError("patch content must not be blank")
+        if self.action == "modify" and not self.replaces_field_key:
+            raise ValueError("modify patch requires replaces_field_key")
+        if self.action == "add" and self.replaces_field_key:
+            raise ValueError("add patch must not carry replaces_field_key")
+        if self.source_span is None:
+            self.source_span = self.source_quote
+        elif self.source_quote is not None and self.source_quote != self.source_span:
+            raise ValueError("source_quote and source_span must agree")
+        if not self.needs_confirmation:
+            raise ValueError("provider patches must require confirmation")
+        return self
+
+
 class StructuredExtractResult(BaseModel):
     """Typed provider result for profile extraction (统一方案 §6.2 shape)."""
 
@@ -122,6 +175,9 @@ class StructuredExtractResult(BaseModel):
     fields: tuple[ExtractedField, ...] = ()
     # WP-P1 加法通道：条目候选。默认空 tuple，既有 provider/fake 零感知。
     entries: tuple[ExtractedEntry, ...] = ()
+    # WP-P4 加法通道：update 会话的澄清追问与 entry patch 候选。
+    clarifying_question: str | None = Field(default=None, max_length=300)
+    patches: tuple[ExtractedPatch, ...] = ()
     unknown_or_ambiguous: tuple[str, ...] = ()
 
 

@@ -256,6 +256,23 @@ class ProfileSessionCreateRequest(BaseModel):
     input_mode: Literal["text"] = "text"
 
 
+class ProfileUpdateIntentRequest(BaseModel):
+    """WP-P4：对话式追加会话入参——自然语言期望 + 画像方向。"""
+
+    subject: ProfileSubject
+    desired_text: str = Field(..., min_length=1, max_length=2000)
+    consent_version: str = Field(..., min_length=1, max_length=32)
+
+
+class ProfileUpdateIntentAccepted(BaseModel):
+    """202 update-intent 结果：会话 + 首轮澄清任务（异步，轮询 turns/会话）。"""
+
+    session: ProfileSessionRead
+    task_id: str
+    turn_id: str
+    status: str = "queued"
+
+
 class ProfileTurnCreateRequest(BaseModel):
     client_turn_id: str = Field(..., min_length=8, max_length=128)
     answer_text: str = Field(..., min_length=1, max_length=2000)
@@ -272,6 +289,8 @@ class ProfileSessionRead(BaseModel):
     subject: ProfileSubject
     status: ProfileSessionStatus
     input_mode: str = "text"
+    # WP-P4 加法字段：build=建构问答；update=对话式追加。旧前端零感知。
+    session_kind: str = Field(default="build", pattern="^(build|update)$")
     progress: ProfileProgress
     current_question: dict[str, str] | None = None
     # 加法字段（Task6 Step2）：当前会话的活动草稿 ID，供前端直接跳转草稿编辑器；

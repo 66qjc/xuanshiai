@@ -45,6 +45,8 @@ from app.schemas.ai_profile import (
     ProfilePublishAccepted,
     ProfileRevisionPage,
     ProfileSessionCreateRequest,
+    ProfileUpdateIntentAccepted,
+    ProfileUpdateIntentRequest,
     ProfileSessionRead,
     ProfileSkipQuestionRequest,
     ProfileSubject,
@@ -67,6 +69,7 @@ from app.services.ai.profile import (
     confirm_profile_draft,
     confirm_profile_narrative,
     create_profile_session,
+    create_update_session,
     delete_ai_profile,
     delete_ai_profile_field,
     delete_profile_session,
@@ -148,6 +151,7 @@ def _to_session_read(session: ProfileSession) -> ProfileSessionRead:
         subject=session.subject,
         status=session.status,
         input_mode=session.input_mode,
+        session_kind=session.session_kind,
         progress=ProfileProgress(
             basis="confirmed_field_coverage",
             value=progress_value(session.confirmed_keys),
@@ -246,6 +250,49 @@ async def create_profile_session_route(
         ) from exc
     await db.commit()
     return _to_session_read(session)
+
+
+@router.post(
+    "/profile-sessions/update-intent",
+    response_model=ProfileUpdateIntentAccepted,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="发起对话式画像更新（澄清式追问，产出条目 patch）",
+)
+async def create_update_session_route(
+    body: ProfileUpdateIntentRequest,
+    current: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> ProfileUpdateIntentAccepted:
+    """WP-P4：陈述新期望 → 创建 update 会话 + 首轮澄清任务（异步）。
+
+    首轮澄清追问由 profile_extract 任务按 update 分支异步生成，前端轮询
+    会话 turns 读取 assistant 追问。已有活动会话时 400（先完成/放弃）。
+    """
+    _require_profile_feature()
+    _check_idempotency_key(idempotency_key)
+    try:
+        session, submission = await create_update_session(
+            db, current.id, body.subject, body.desired_text, body.consent_version,
+            idempotency_key or "",
+        )
+    except AIConsentRequired as exc:
+        raise _error_response(exc.code, exc.message, exc.status_code) from exc
+    except AIInputError as exc:
+        raise _error_response(exc.code, exc.message, exc.status_code) from exc
+    except ProfileSessionStale as exc:
+        raise _error_response(exc.code, exc.message, exc.status_code) from exc
+    except TaskError as exc:
+        raise _error_response(
+            exc.code, exc.message, exc.status_code, retryable=exc.retryable
+        ) from exc
+    await db.commit()
+    return ProfileUpdateIntentAccepted(
+        session=_to_session_read(session),
+        task_id=submission.task_id,
+        turn_id=submission.turn_id,
+        status=submission.status,
+    )
 
 
 @router.get(

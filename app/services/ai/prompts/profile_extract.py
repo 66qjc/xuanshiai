@@ -139,3 +139,77 @@ def build_profile_extract_prompt(
         f"{_ENTRY_GUIDE}\n\n"
         f"以下是用户的会话回答：\n{turn_block}"
     )
+
+
+# WP-P4：对话式更新（update 会话）的澄清式 prompt。与建构抽取不同：模型
+# 先判断「信息是否足以固化为条目」，不足则只提一个聚焦的澄清问题；足够则
+# 直接产出 entry patch。faithfulness 是硬约束——只准基于用户陈述归纳。
+_UPDATE_SYSTEM_HEADER = (
+    "你是一个画像更新助手。用户会陈述对画像的新期望或新信息，"
+    "你的任务是围绕这段陈述追问澄清，或把它固化为条目。规则：\n"
+    "  - 只能基于用户陈述内容归纳，禁止编造、引申用户没有表达过的偏好或细节；\n"
+    "  - 陈述信息不足、有歧义或有多种理解时，输出 clarifying_question：\n"
+    "    只问一个问题，聚焦最关键的分歧点，不超过 80 字，不要堆叠多个问题；\n"
+    "  - 陈述已经足够清晰时，输出 patches：每条含 action（add=新增/modify=改写\n"
+    "    既有条目）、category、content（1 到 200 字）、replaces_field_key\n"
+    "    （仅 modify 需要，指向被改写条目的 field_key）；\n"
+    "  - 不要同时输出 clarifying_question 和 patches；\n"
+    "  - category 只能取：basics（基本情况）/ occupation（工作状态）/ "
+    "appearance（外形特征）/ personality（性格特征）/ values（价值观）/ "
+    "interests（兴趣爱好）/ routine（作息习惯）/ diet（饮食习惯）/ "
+    "life_plan（生活规划）。\n"
+)
+
+_UPDATE_JSON_FORMAT_INSTRUCTION = (
+    "请以 JSON 格式输出，根对象形如：\n"
+    "{\n"
+    "  \"clarifying_question\": \"偏向音乐、绘画还是舞蹈？\",\n"
+    "  \"patches\": []\n"
+    "}\n"
+    "或\n"
+    "{\n"
+    "  \"clarifying_question\": null,\n"
+    "  \"patches\": [\n"
+    "    {\n"
+    "      \"action\": \"add\",\n"
+    "      \"category\": \"interests\",\n"
+    "      \"content\": \"希望对方热爱艺术，愿意一起看展、听音乐会\",\n"
+    "      \"source_quote\": \"希望对方是搞艺术的，能陪我看展\",\n"
+    "      \"confidence\": 0.86\n"
+    "    }\n"
+    "  ]\n"
+    "}"
+)
+
+
+def build_profile_update_clarify_prompt(
+    subject: str,
+    turn_texts: tuple[str, ...],
+    entry_digest: str | None = None,
+) -> str:
+    """构造 update 会话单轮澄清 prompt（system + 对话 + JSON 契约）。
+
+    ``turn_texts`` 是本会话按时间顺序的用户陈述/答复；``entry_digest`` 是该
+    维度已发布条目摘要，供 modify patch 定位被改写条目，可为 None。
+    """
+    is_personal = subject == ProfileSubject.PERSONAL.value
+    subject_label = "个人画像" if is_personal else "理想型画像"
+    dialogue_block = "\n\n".join(
+        f"【第 {idx + 1} 句】\n{text}" for idx, text in enumerate(turn_texts) if text
+    )
+    if not dialogue_block:
+        dialogue_block = "（用户尚未陈述）"
+    digest_block = ""
+    if entry_digest:
+        digest_block = (
+            f"\n该维度当前已发布的条目（modify 时 replaces_field_key 从中选取；\n"
+            f"本摘要不含 field_key，仅作语义参考，replaces_field_key 由系统按\n"
+            f"语义最接近的既有条目回填）：\n{entry_digest}\n"
+        )
+    return (
+        f"{_UPDATE_SYSTEM_HEADER}\n\n"
+        f"更新目标：{subject_label}。\n"
+        f"{digest_block}\n"
+        f"{_UPDATE_JSON_FORMAT_INSTRUCTION}\n\n"
+        f"以下是用户在本会话中的陈述：\n{dialogue_block}"
+    )

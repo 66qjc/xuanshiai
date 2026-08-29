@@ -20,6 +20,7 @@ from app.schemas.ai_common import AiConsentGrantRequest
 from app.schemas.ai_profile import (
     ProfileDraftFieldPatchRequest,
     ProfileFieldPatchAction,
+    ProfileSessionStatus,
     ProfileSubject,
 )
 from app.services.ai import profile as profile_module
@@ -562,3 +563,250 @@ async def test_real_projection_entry_digest_and_structured_only_null(
     async with factory() as cleanup_db:
         await _clean(cleanup_db, user_entries)
         await _clean(cleanup_db, user_plain)
+
+
+@pytest.mark.asyncio
+async def test_real_update_session_clarify_loop_and_patch_draft(
+    real_db_session: AsyncSession,
+    real_db_engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """WP-P4a/b 真库全流程：update-intent → 澄清追问(assistant turn) →
+    答复 → patch 候选（add+modify）落更新草稿（旧字段 confirmed、旧行不动）。"""
+    from app.services.ai.base import ExtractedPatch, StructuredExtractResult
+    from app.services.ai.consents import grant_consent
+    from app.services.ai.profile import (
+        _insert_assistant_turn,  # noqa: F401  (导入即冒烟)
+        create_update_session,
+        load_owned_session,
+    )
+    from app.services.ai.tasks import complete_task
+
+    user_id = 9_880_000_301
+    await _clean(real_db_session, user_id)
+    factory = async_sessionmaker(real_db_engine, expire_on_commit=False)
+
+    # 种子：授权 + 已发布 revision（2 structured + 1 entry，modify 目标）。
+    async with factory() as seed_db:
+        await seed_db.execute(
+            text(
+                "INSERT INTO user_revision_state "
+                "(user_id, profile_revision, preference_revision, privacy_revision, "
+                "relationship_revision, policy_revision) VALUES (:user_id, 1, 0, 0, 0, 0)"
+            ),
+            {"user_id": user_id},
+        )
+        await grant_consent(
+            seed_db,
+            user_id,
+            "profile_text_extract",
+            AiConsentGrantRequest(
+                consent_version=CONSENT_VERSION,
+                policy_revision=POLICY_REVISION,
+            ),
+            f"upd-grant-{user_id}",
+            0,
+        )
+        await seed_db.execute(
+            text(
+                "INSERT INTO ai_profile_revision "
+                "(user_id, subject, revision_no, draft_id, source_revision_json, "
+                " policy_revision, published_by) "
+                "VALUES (:user_id, 'personal', 1, NULL, "
+                " '{\"profile\": 1, \"preference\": 0, \"privacy\": 0, "
+                "\"relationship\": 0, \"policy\": 0}', :policy_revision, :user_id)"
+            ),
+            {"user_id": user_id, "policy_revision": POLICY_REVISION},
+        )
+        revision_id = (
+            await seed_db.execute(
+                text(
+                    "SELECT id FROM ai_profile_revision "
+                    "WHERE user_id = :user_id AND subject = 'personal' "
+                    "ORDER BY id DESC LIMIT 1"
+                ),
+                {"user_id": user_id},
+            )
+        ).scalar_one()
+        for field_key, value_json, display in (
+            ("interest_tags", '["旅行"]', "旅行"),
+            ("height_cm", "175", "175"),
+        ):
+            await seed_db.execute(
+                text(
+                    "INSERT INTO ai_profile_revision_field "
+                    "(revision_id, field_key, subject, field_kind, value_json, "
+                    " display_value, confidence, content_hash) "
+                    "VALUES (:revision_id, :field_key, 'personal', 'structured', "
+                    " :value_json, :display_value, 0.9, :content_hash)"
+                ),
+                {
+                    "revision_id": revision_id,
+                    "field_key": field_key,
+                    "value_json": value_json,
+                    "display_value": display,
+                    "content_hash": f"hash-{field_key}",
+                },
+            )
+        await seed_db.execute(
+            text(
+                "INSERT INTO ai_profile_revision_field "
+                "(revision_id, field_key, subject, field_kind, category, content, "
+                " value_json, display_value, confidence, content_hash) "
+                "VALUES (:revision_id, 'entry_values_seed01', 'personal', 'entry', "
+                " 'values', '欣赏踏实上进的人', NULL, '欣赏踏实上进的人', 0.9, "
+                " 'hash-entry-seed01')"
+            ),
+            {"revision_id": revision_id},
+        )
+        await seed_db.commit()
+
+    # 澄清 fake：第一次问追问，第二次产出 add+modify patch。
+    calls: list[str] = []
+
+    class _UpdateGateway:
+        def __init__(self, timeout_seconds: float | None = None) -> None:
+            del timeout_seconds
+
+        async def structured_extract(self, context: object, request: object) -> _FakeOutcome:
+            calls.append(getattr(request, "entry_digest", None) or "")
+            if len(calls) == 1:
+                return _FakeOutcome(
+                    StructuredExtractResult(
+                        schema_version=profile_module.PROFILE_SCHEMA_VERSION,
+                        clarifying_question="偏向音乐、绘画还是舞蹈？",
+                    )
+                )
+            return _FakeOutcome(
+                StructuredExtractResult(
+                    schema_version=profile_module.PROFILE_SCHEMA_VERSION,
+                    patches=(
+                        ExtractedPatch(
+                            action="add",
+                            category="interests",
+                            content="希望对方热爱艺术，愿意一起看展、听音乐会",
+                            subject=ProfileSubject.PERSONAL,
+                            source_quote="希望对方是搞艺术的，能陪我看展",
+                            confidence=0.86,
+                            schema_version=profile_module.PROFILE_SCHEMA_VERSION,
+                            prompt_version=profile_module.PROFILE_PROMPT_VERSION,
+                            policy_revision=POLICY_REVISION,
+                        ),
+                        ExtractedPatch(
+                            action="modify",
+                            category="values",
+                            content="欣赏有艺术修养、踏实上进的人",
+                            replaces_field_key="entry_values_seed01",
+                            subject=ProfileSubject.PERSONAL,
+                            source_quote="还是得有艺术修养",
+                            confidence=0.9,
+                            schema_version=profile_module.PROFILE_SCHEMA_VERSION,
+                            prompt_version=profile_module.PROFILE_PROMPT_VERSION,
+                            policy_revision=POLICY_REVISION,
+                        ),
+                    ),
+                )
+            )
+
+    async with factory() as intent_db:
+        session, submission = await create_update_session(
+            intent_db, user_id, ProfileSubject.PERSONAL,
+            "希望对方是艺术家，还是得有艺术修养", CONSENT_VERSION, "upd-intent-001",
+        )
+        assert session.session_kind == "update"
+        assert session.status is ProfileSessionStatus.EXTRACTING
+        await intent_db.commit()
+        first_task_id = submission.task_id
+
+    started = await _claim_and_start(factory, "worker-upd-a")
+    assert started.task_id == first_task_id
+
+    # 第一轮：clarifying_question → assistant turn + 会话回 draft。
+    async with factory() as handler_db:
+        monkeypatch.setattr(profile_module, "AIGateway", _UpdateGateway)
+        result = await extract_profile_turn(handler_db, started, "worker-upd-a")
+        assert result is not None
+        assert result[0].startswith("profile-update:question:")
+        await handler_db.commit()
+    async with factory() as finalize_db:
+        await complete_task(
+            finalize_db, first_task_id, "worker-upd-a", result[0], result[1]
+        )
+        await finalize_db.commit()
+    async with factory() as check_db:
+        reloaded = await load_owned_session(check_db, session.session_id, user_id)
+        assert reloaded.status is ProfileSessionStatus.DRAFT
+        turns = (
+            await check_db.execute(
+                text(
+                    "SELECT role, answer_text FROM ai_profile_turn "
+                    "WHERE session_id = :session_id ORDER BY turn_no"
+                ),
+                {"session_id": session.session_id},
+            )
+        ).all()
+        assert [row[0] for row in turns] == ["user", "assistant"]
+        assert "偏向音乐、绘画还是舞蹈" in turns[1][1]
+        # prompt 输入带条目摘要（modify 可定位）。
+        assert any("entry_values_seed01" in digest for digest in calls)
+
+    # 第二轮：答复 → patch 草稿（旧字段 confirmed，add/modify suggested）。
+    async with factory() as answer_db:
+        accepted = await submit_profile_turn(
+            answer_db,
+            session.session_id,
+            user_id,
+            "upd-turn-client-002",
+            "偏向看展和摄影，还是得有艺术修养",
+            "upd-extract-002",
+        )
+        await answer_db.commit()
+    second_started = await _claim_and_start(factory, "worker-upd-a")
+    assert second_started.task_id == accepted.task_id
+    async with factory() as handler_db:
+        result2 = await extract_profile_turn(handler_db, second_started, "worker-upd-a")
+        assert result2 is not None
+        assert result2[0].startswith("profile-draft:")
+        draft_id = result2[0].split(":", 1)[1]
+        await handler_db.commit()
+    async with factory() as finalize_db:
+        await complete_task(
+            finalize_db, accepted.task_id, "worker-upd-a", result2[0], result2[1]
+        )
+        await finalize_db.commit()
+
+    async with factory() as check_db:
+        reloaded = await load_owned_session(check_db, session.session_id, user_id)
+        assert reloaded.status is ProfileSessionStatus.AWAITING_CONFIRMATION
+        rows = (
+            await check_db.execute(
+                text(
+                    "SELECT field_kind, category, content, confirmation_status, "
+                    "replaces_field_key FROM ai_profile_draft_field "
+                    "WHERE draft_id = :draft_id ORDER BY field_kind, field_key"
+                ),
+                {"draft_id": draft_id},
+            )
+        ).all()
+        base_structured = [r for r in rows if r[0] == "structured"]
+        base_entries = [r for r in rows if r[0] == "entry" and r[3] == "confirmed"]
+        patch_rows = [r for r in rows if r[0] == "entry" and r[3] == "suggested"]
+        # 底稿：旧 structured 全部 confirmed（发布不丢字段）。
+        assert len(base_structured) == 2
+        assert all(r[3] == "confirmed" for r in base_structured)
+        # 底稿：旧 entry confirmed 且原行未动（追加不覆盖）。
+        assert len(base_entries) == 1
+        assert base_entries[0][2] == "欣赏踏实上进的人"
+        assert base_entries[0][4] is None
+        # patch：add 无 replaces；modify 指向被改写条目。
+        assert len(patch_rows) == 2
+        modify_rows = [r for r in patch_rows if r[4] is not None]
+        add_rows = [r for r in patch_rows if r[4] is None]
+        assert len(modify_rows) == 1 and modify_rows[0][4] == "entry_values_seed01"
+        assert len(add_rows) == 1 and (add_rows[0][1] or "") == "interests"
+        assert add_rows[0][2] == "希望对方热爱艺术，愿意一起看展、听音乐会"
+
+    # 共享测试库纪律：清场。
+    async with factory() as cleanup_db:
+        await _clean(cleanup_db, user_id)
+       
