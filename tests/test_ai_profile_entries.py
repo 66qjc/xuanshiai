@@ -299,3 +299,56 @@ async def test_publish_gate_ignores_confirmed_entries(profile_store) -> None:
     await publish_profile_draft(
         store.session, draft_id, 20, expected_revision=1, idempotency_key="pub-entry-ok"
     )
+
+
+# ----------------------------------------------------------------------
+# T4：entry_digest 摘要与叙事 serialize
+# ----------------------------------------------------------------------
+
+
+def test_serialize_fields_for_prompt_includes_entries() -> None:
+    from app.services.ai.prompts.profile_narrative import serialize_fields_for_prompt
+
+    rows = [
+        {"field_key": "height_cm", "value_json": "175", "display_value": "175"},
+        {
+            "field_key": "entry_values_x",
+            "value_json": None,
+            "display_value": "欣赏阳光开朗、品行端正的人",
+            "field_kind": "entry",
+            "category": "values",
+            "content": "欣赏阳光开朗、品行端正的人",
+        },
+        {"field_key": "entry_blank", "field_kind": "entry", "category": "diet", "content": ""},
+    ]
+    result = serialize_fields_for_prompt(rows)
+    assert result[0]["field_key"] == "height_cm"
+    entry_line = result[1]
+    assert entry_line["field_key"] == "entry_values"
+    assert "条目·价值观" in entry_line["display_value"]
+    assert "欣赏阳光开朗" in entry_line["display_value"]
+    # 空正文条目不进 prompt。
+    assert all(item["field_key"] != "entry_diet" for item in result)
+
+
+def test_build_entry_digest_lines_and_empty() -> None:
+    from app.services.ai.features import build_entry_digest
+
+    rows = [
+        {"field_kind": "structured", "field_key": "height_cm", "content": None},
+        {
+            "field_kind": "entry",
+            "category": "values",
+            "content": "欣赏阳光开朗、品行端正的人",
+        },
+        {"field_kind": "entry", "category": "interests", "content": "周末旅行与看展"},
+        {"field_kind": "entry", "category": "diet", "content": "   "},
+    ]
+    digest = build_entry_digest(rows)
+    assert digest is not None
+    assert "价值观：欣赏阳光开朗、品行端正的人" in digest
+    assert "兴趣爱好：周末旅行与看展" in digest
+    assert "饮食习惯" not in digest
+    assert "height_cm" not in digest
+    # 纯 structured 用户：摘要为 NULL（回归保护）。
+    assert build_entry_digest([{"field_kind": "structured", "content": "x"}]) is None

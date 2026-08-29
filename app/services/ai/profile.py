@@ -3603,10 +3603,14 @@ async def profile_projection_handler(
 async def _load_revision_fields(
     db: AsyncSession, revision_id: int
 ) -> list[dict[str, Any]]:
-    """读取一个已发布 revision 的全部字段行（field_key + display_value）。"""
+    """读取一个已发布 revision 的全部字段行（field_key + display_value）。
+
+    WP-P1：附带 field_kind/category/content，供叙事 serialize 把条目折成
+    「条目·分类」行（structured 行这些列为默认值，行为不变）。
+    """
     result = await db.execute(
         text(
-            "SELECT field_key, value_json, display_value "
+            "SELECT field_key, value_json, display_value, field_kind, category, content "
             "FROM ai_profile_revision_field WHERE revision_id = :revision_id"
         ),
         {"revision_id": revision_id},

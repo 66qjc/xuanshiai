@@ -33,6 +33,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.schemas.ai_common import ProjectionKind, ProjectionVisibility
+from app.schemas.ai_profile import PROFILE_ENTRY_CATEGORY_LABELS
 from app.services.revisions import RevisionVector
 
 # 投影 schema 版本：与 M04 抽取 Schema 同源冻结（Task 1/5），不新增版本。
@@ -264,12 +265,41 @@ async def _load_revision_fields(
 ) -> list[dict[str, Any]]:
     result = await db.execute(
         text(
-            "SELECT field_key, subject, value_json, schema_version "
+            "SELECT field_key, subject, value_json, field_kind, category, content, "
+            "schema_version "
             "FROM ai_profile_revision_field WHERE revision_id = :revision_id"
         ),
         {"revision_id": revision_id},
     )
     return result.mappings().all()
+
+
+# entry_digest 单行内容截断长度：摘要只服务搜索/匹配度与调试，保留头 100 字。
+_ENTRY_DIGEST_LINE_MAX = 100
+
+
+def build_entry_digest(field_rows: list[dict[str, Any]]) -> str | None:
+    """把已发布条目行折成紧凑摘要（每行“分类：内容”），无条目返回 NULL。
+
+    供搜索（猜你喜欢）与匹配度消费；行内容全部来自用户已确认条目，不含
+    原始回答文本。ideal_partner 维度的摘要落在 self_only 投影行，天然不外
+    泄（visibility_class 纪律不变）。
+    """
+    lines: list[str] = []
+    for row in field_rows:
+        if str(row.get("field_kind") or "structured") != "entry":
+            continue
+        content = str(row.get("content") or "").strip()
+        if not content:
+            continue
+        category = str(row.get("category") or "")
+        label = PROFILE_ENTRY_CATEGORY_LABELS.get(category, category)
+        if len(content) > _ENTRY_DIGEST_LINE_MAX:
+            content = content[:_ENTRY_DIGEST_LINE_MAX] + "…"
+        lines.append(f"{label}：{content}")
+    if not lines:
+        return None
+    return "\n".join(lines)
 
 
 async def _load_consent_snapshot(
@@ -492,6 +522,7 @@ async def build_feature_projection(
     payload = build_projection_payload(subject, confirmed_fields)
     if not payload:
         raise ProjectionBuildError(f"no allowlisted confirmed fields for {subject}")
+    entry_digest = build_entry_digest(field_rows)
 
     source_hash = projection_source_hash(projection_kind, subject, payload, revision)
     expires_at = _now_utc() + timedelta(days=_PROJECTION_TTL_DAYS)
@@ -528,18 +559,19 @@ async def build_feature_projection(
         text(
             "INSERT INTO ai_feature_projection "
             "(subject_user_id, projection_kind, source_hash, projection_version, "
-            " fields_json, source_revision_json, profile_revision, "
+            " fields_json, entry_digest, source_revision_json, profile_revision, "
             " preference_revision, privacy_revision, relationship_revision, "
             " policy_revision, consent_snapshot_json, visibility_class, "
             " status, expires_at, created_at, updated_at) "
             "VALUES (:subject_user_id, :projection_kind, :source_hash, "
-            " :projection_version, :fields_json, :source_revision_json, "
+            " :projection_version, :fields_json, :entry_digest, :source_revision_json, "
             " :profile_revision, :preference_revision, :privacy_revision, "
             " :relationship_revision, :policy_revision, :consent_snapshot_json, "
             " :visibility_class, 'active', :expires_at, UTC_TIMESTAMP(), "
             " UTC_TIMESTAMP()) "
             "ON DUPLICATE KEY UPDATE "
             " fields_json = VALUES(fields_json), "
+            " entry_digest = VALUES(entry_digest), "
             " source_revision_json = VALUES(source_revision_json), "
             " profile_revision = VALUES(profile_revision), "
             " preference_revision = VALUES(preference_revision), "
@@ -559,6 +591,7 @@ async def build_feature_projection(
             "source_hash": source_hash,
             "projection_version": schema_version,
             "fields_json": json.dumps(payload, ensure_ascii=False),
+            "entry_digest": entry_digest,
             "source_revision_json": json.dumps(revision.as_dict(), ensure_ascii=False),
             "profile_revision": revision.profile,
             "preference_revision": revision.preference,

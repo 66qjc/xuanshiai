@@ -362,6 +362,7 @@ AI_TABLES = {
             `source_hash` char(64) NOT NULL,
             `projection_version` varchar(32) NOT NULL,
             `fields_json` json DEFAULT NULL COMMENT '仅 allowlist 字段，不含原文',
+            `entry_digest` text DEFAULT NULL COMMENT 'WP-P1：该维度全部已发布条目的紧凑摘要（每行"分类：内容"），仅 self_only 维度存理想型条目',
             `source_revision_json` json DEFAULT NULL COMMENT '五维版本向量快照（profile/preference/privacy/relationship/policy），写入必须显式提供',
             `profile_revision` int unsigned NOT NULL DEFAULT '0',
             `preference_revision` int unsigned NOT NULL DEFAULT '0',
@@ -479,6 +480,10 @@ AI_PROJECTION_REQUIRED_COLUMNS: dict[str, str] = {
     "preference_revision": "`preference_revision` int unsigned NOT NULL DEFAULT '0'",
     "relationship_revision": "`relationship_revision` int unsigned NOT NULL DEFAULT '0'",
     "policy_revision": "`policy_revision` int unsigned NOT NULL DEFAULT '0'",
+    "entry_digest": (
+        "`entry_digest` text DEFAULT NULL "
+        "COMMENT 'WP-P1：该维度全部已发布条目的紧凑摘要（每行\"分类：内容\"）'"
+    ),
     "visibility_class": (
         "`visibility_class` varchar(32) NOT NULL DEFAULT 'searchable' "
         "COMMENT 'searchable/self_only；self_only 仅本人偏好计算读取'"

@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.schemas.ai_profile import ProfileSubject
+from app.schemas.ai_profile import PROFILE_ENTRY_CATEGORY_LABELS, ProfileSubject
 
 # 维度定义（personal 和 ideal_partner 共用同一套维度卡片）
 _DIMENSIONS = {
@@ -207,9 +207,23 @@ def serialize_fields_for_prompt(
     """把数据库行转成 prompt 安全的 field dict 元组。
 
     只保留 field_key 和 display_value，不含原始回答文本或用户 ID。
+    WP-P1：条目（field_kind='entry'）以「条目·分类」伪字段行进入 prompt，
+    让叙事自然融合条目；正文来自用户已确认内容，faithfulness 约束不变。
     """
     result: list[dict[str, Any]] = []
     for row in rows:
+        if str(row.get("field_kind") or "structured") == "entry":
+            category = str(row.get("category") or "")
+            label = PROFILE_ENTRY_CATEGORY_LABELS.get(category, category)
+            content = str(row.get("content") or "").strip()
+            if content:
+                result.append(
+                    {
+                        "field_key": f"entry_{category}",
+                        "display_value": f"条目·{label}：{content}",
+                    }
+                )
+            continue
         result.append(
             {
                 "field_key": str(row.get("field_key", "")),

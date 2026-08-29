@@ -127,9 +127,9 @@ replaces_field_key VARCHAR(64) DEFAULT NULL     -- entry 改写时指向被替�
 - 读取端出参：`{field_kind, category, content, confirmation_status, updated_at}`，structured 条目原样保留既有字段。
 
 **Steps:**
-- [ ] RED：发布含 entry 的草稿 → projection 行 `entry_digest` 非空且含分类前缀；narrative 任务 payload 含条目摘要；字段接口按分类分组。
-- [ ] GREEN：实现三处消费。
-- [ ] 集成测试：rollback-then-assert 投影行；旧 structured-only 用户投影 `entry_digest` 为 NULL 的回归用例。
+- [x] RED：发布含 entry 的草稿 → projection 行 `entry_digest` 非空且含分类前缀；narrative 任务 payload 含条目摘要；字段接口按分类分组。
+- [x] GREEN：实现三处消费。
+- [x] 集成测试：rollback-then-assert 投影行；旧 structured-only 用户投影 `entry_digest` 为 NULL 的回归用例。
 
 **验收（方案 WP-P1 验收原文）：** 创建会话→答出 entry→确认→发布→`GET /profiles/{subject}/narrative` 与字段接口均能按分类返回条目；旧结构化字段回归测试全绿。
 **Commit:** `feat(profile): 条目进入叙事与投影（entry_digest）+ 分类读取端`

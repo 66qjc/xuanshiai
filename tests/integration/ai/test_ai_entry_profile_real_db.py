@@ -412,3 +412,153 @@ async def test_real_entry_edit_and_publish_threshold(
     # 同上：发布入队的 projection/cleanup 任务一并清理，不留活跃任务。
     async with factory() as cleanup_db:
         await _clean(cleanup_db, USER_EDIT)
+
+
+@pytest.mark.asyncio
+async def test_real_projection_entry_digest_and_structured_only_null(
+    real_db_session: AsyncSession,
+    real_db_engine: AsyncEngine,
+) -> None:
+    """发布含条目的 revision → 投影行 entry_digest 非空且带分类前缀；
+    纯 structured 用户的投影 entry_digest 为 NULL。rollback-then-assert。"""
+    from app.schemas.ai_common import ProjectionKind
+    from app.services.ai.features import build_feature_projection
+
+    factory = async_sessionmaker(real_db_engine, expire_on_commit=False)
+    user_entries = 9_880_000_201
+    user_plain = 9_880_000_202
+    await _clean(real_db_session, user_entries)
+    await _clean(real_db_session, user_plain)
+    zero_vector = (
+        '{"profile": 0, "preference": 0, "privacy": 0, '
+        '"relationship": 0, "policy": 0}'
+    )
+
+    async def _seed_user(db: AsyncSession, user_id: int, with_entries: bool) -> int:
+        """Seed consent + revision(+fields)；返回 revision_id。"""
+        await db.execute(
+            text(
+                "INSERT INTO user_revision_state "
+                "(user_id, profile_revision, preference_revision, privacy_revision, "
+                "relationship_revision, policy_revision) VALUES (:user_id, 0, 0, 0, 0, 0)"
+            ),
+            {"user_id": user_id},
+        )
+        await grant_consent(
+            db,
+            user_id,
+            "profile_text_extract",
+            AiConsentGrantRequest(
+                consent_version=CONSENT_VERSION,
+                policy_revision=POLICY_REVISION,
+            ),
+            f"digest-grant-{user_id}",
+            0,
+        )
+        await db.execute(
+            text(
+                "INSERT INTO ai_profile_revision "
+                "(user_id, subject, revision_no, draft_id, source_revision_json, "
+                " policy_revision, published_by) "
+                "VALUES (:user_id, 'personal', 1, NULL, :source_json, "
+                " :policy_revision, :user_id)"
+            ),
+            {
+                "user_id": user_id,
+                "source_json": zero_vector,
+                "policy_revision": POLICY_REVISION,
+            },
+        )
+        row = (
+            await db.execute(
+                text(
+                    "SELECT id FROM ai_profile_revision "
+                    "WHERE user_id = :user_id AND subject = 'personal' "
+                    "ORDER BY id DESC LIMIT 1"
+                ),
+                {"user_id": user_id},
+            )
+        ).one()
+        revision_id = int(row[0])
+        fields = [
+            ("height_cm", None, None, "175", '"175"'),
+            ("city_code", None, None, "杭州", '"330100"'),
+        ]
+        if with_entries:
+            fields.extend(
+                [
+                    ("entry_values_digest01", "values", "欣赏阳光开朗、品行端正的人", None, None),
+                    ("entry_interests_digest02", "interests", "周末旅行与看展", None, None),
+                ]
+            )
+        for field_key, category, content, display, value_json in fields:
+            await db.execute(
+                text(
+                    "INSERT INTO ai_profile_revision_field "
+                    "(revision_id, field_key, subject, field_kind, category, content, "
+                    " value_json, display_value, confidence, content_hash) "
+                    "VALUES (:revision_id, :field_key, 'personal', "
+                    " :field_kind, :category, :content, :value_json, :display_value, "
+                    " 0.9, :content_hash)"
+                ),
+                {
+                    "revision_id": revision_id,
+                    "field_key": field_key,
+                    "field_kind": "entry" if category else "structured",
+                    "category": category,
+                    "content": content,
+                    "value_json": value_json,
+                    "display_value": display or content,
+                    "content_hash": f"hash-{field_key}",
+                },
+            )
+        return revision_id
+
+    async with factory() as seed_db:
+        await _seed_user(seed_db, user_entries, with_entries=True)
+        await _seed_user(seed_db, user_plain, with_entries=False)
+        await seed_db.commit()
+
+    async with factory() as build_db:
+        projection_a = await build_feature_projection(
+            build_db, user_entries, ProjectionKind.PERSONAL_SEARCHABLE,
+            revision_vector=None,
+        )
+        projection_b = await build_feature_projection(
+            build_db, user_plain, ProjectionKind.PERSONAL_SEARCHABLE,
+            revision_vector=None,
+        )
+        assert projection_a.id is not None
+        await build_db.commit()
+
+    async with factory() as check_db:
+        digest_row = (
+            await check_db.execute(
+                text(
+                    "SELECT entry_digest FROM ai_feature_projection "
+                    "WHERE subject_user_id = :user_id AND status = 'active' "
+                    "AND projection_kind = 'personal_searchable'"
+                ),
+                {"user_id": user_entries},
+            )
+        ).one()
+        digest = digest_row[0]
+        assert digest is not None
+        assert "价值观：欣赏阳光开朗、品行端正的人" in digest
+        assert "兴趣爱好：周末旅行与看展" in digest
+        plain_row = (
+            await check_db.execute(
+                text(
+                    "SELECT entry_digest FROM ai_feature_projection "
+                    "WHERE subject_user_id = :user_id AND status = 'active' "
+                    "AND projection_kind = 'personal_searchable'"
+                ),
+                {"user_id": user_plain},
+            )
+        ).one()
+        assert plain_row[0] is None
+
+    # 共享测试库纪律：清场。
+    async with factory() as cleanup_db:
+        await _clean(cleanup_db, user_entries)
+        await _clean(cleanup_db, user_plain)
