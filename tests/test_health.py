@@ -10,7 +10,10 @@ def test_root_endpoint() -> None:
     response = client.get("/")
 
     assert response.status_code == 200
-    assert response.json()["service"] == "Xuanshi AI API"
+    payload = response.json()
+    assert payload["service"] == "Xuanshi AI API"
+    if payload.get("playground"):
+        assert payload["playground"] == "/ai-playground"
 
 
 def test_health_endpoint() -> None:

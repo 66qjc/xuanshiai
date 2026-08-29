@@ -557,6 +557,7 @@ async def publish_profile_draft_route(
         revision_no=revision.revision_no if revision else None,
         subject=ProfileSubject(revision.subject) if revision else None,
         field_count=len(revision.changed_field_keys) if revision else None,
+        narrative_task_id=submission.narrative_task_id,
     )
 
 

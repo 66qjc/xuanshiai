@@ -322,6 +322,10 @@ class ProfilePublishAccepted(BaseModel):
     ``replayed=True`` marks a same-key same-payload retry: the first task is
     returned and nothing is written twice.  Revision fields are ``null`` on a
     replay because no new revision is created.
+
+    ``narrative_task_id`` carries the async narrative generation task so the
+    frontend can poll it via the standard task-status endpoint instead of
+    polling the narrative business interface with a fixed short window.
     """
 
     task_id: str
@@ -334,6 +338,7 @@ class ProfilePublishAccepted(BaseModel):
     revision_no: int | None = None
     subject: ProfileSubject | None = None
     field_count: int | None = None
+    narrative_task_id: str | None = None
 
 
 class ProfileRevisionPage(BaseModel):

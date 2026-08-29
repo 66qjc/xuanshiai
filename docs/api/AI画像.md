@@ -7,6 +7,7 @@
 - 2026-08-08：新增 6 个 `/api/v1/ai/profile-sessions*` 路径；错误统一为 `AiErrorDetail` 形状（含 `request_id`）；普通响应不携带原文、provider trace 或密钥。本期仅会话/回答/草稿抽取；字段确认、发布、历史与删除传播由后续任务提供。
 - 2026-08-08：新增 6 个草稿确认/发布/历史/删除路径（§7-§12）；发布只接受 `confirmed` 字段并写不可变 `ai_profile_revision`；删除在同步响应前令草稿与派生结果不可读；补上创建会话错误表缺失的 `409 PROFILE_SESSION_STALE` 行。
 - 2026-08-08（Task 12 纠偏）：§8 PATCH 错误表、§9 publish 错误表补 `409 RESULT_STALE` 行；§13 稳定错误码总表补 `RESULT_STALE`。删除不递增草稿 `expected_revision`，客户端持旧 revision 操作已删除草稿返回 `409 RESULT_STALE`（守卫先于乐观锁），而非文档此前声称的 `DRAFT_VERSION_CONFLICT`。
+- 2026-08-26（Task 1）：§9 publish 的最低发布门槛统一为 `confirmed_count >= 5`；`suggested`/`rejected`/`deleted` 不计入确认数且不进入 revision；202 响应增加可选异步叙事生成任务 ID `narrative_task_id`。
 
 通用请求头（所有接口）：
 
@@ -748,7 +749,7 @@ Content-Type: application/json
 
 ## 9. 发布已确认字段
 
-**基本信息**：只把 `confirmed` 字段写入不可变 `ai_profile_revision` 并创建投影任务；完整 URL `POST /api/v1/ai/profile-drafts/{draft_id}/publish`；HTTP Method `POST`；需要登录（Bearer Token）；权限：仅本人、至少一项 confirmed 字段、主体权限正确；请求 `Content-Type`：无请求体（`expected_revision` 通过查询参数）；响应 `Content-Type`：`application/json`；成功状态码 `202 Accepted`。
+**基本信息**：只把 `confirmed` 字段写入不可变 `ai_profile_revision` 并创建投影任务；完整 URL `POST /api/v1/ai/profile-drafts/{draft_id}/publish`；HTTP Method `POST`；需要登录（Bearer Token）；权限：仅本人、至少 5 个 confirmed 字段（`confirmed_count >= 5`）、主体权限正确；请求 `Content-Type`：无请求体（`expected_revision` 通过查询参数）；响应 `Content-Type`：`application/json`；成功状态码 `202 Accepted`。
 
 ### 请求参数
 
@@ -785,6 +786,7 @@ Idempotency-Key: profile-publish-20260807-02
 | 字段 | 类型 | 必返 | 空值含义 | 枚举含义 | 业务含义 | 示例值 |
 | --- | --- | --- | --- | --- | --- | --- |
 | `task_id` | string | 是 | — | — | `profile_projection` 投影任务 ID | `9f8e7d6c...` |
+| `narrative_task_id` | string | 否 | `null` 仅表示历史/兼容数据中未创建或配套叙事任务缺失 | — | 异步 narrative 生成任务 ID；非空时前端通过通用任务接口轮询叙事成稿状态；同 Idempotency-Key 回放应复用首次发布的值 | `narr_7e6d5c4b...` |
 | `status` | string | 是 | — | 固定 `queued` | 投影任务状态 | `queued` |
 | `stage` | string | 否 | `null` | — | 任务阶段 | `null` |
 | `poll_after_ms` | integer | 是 | — | `>=0`；新建 `1000`，回放 `0` | 下次轮询间隔 | `1000` |
@@ -793,7 +795,7 @@ Idempotency-Key: profile-publish-20260807-02
 | `revision_id` | integer | 否 | `null` 表示回放 | — | 新建的不可变版本 ID | `42` |
 | `revision_no` | integer | 否 | `null` 表示回放 | `>=1` | 该主体的发布版本号 | `1` |
 | `subject` | string | 否 | `null` 表示回放 | `personal/ideal_partner` | 发布主体 | `personal` |
-| `field_count` | integer | 否 | `null` 表示回放 | — | 本次发布写入的 confirmed 字段数 | `2` |
+| `field_count` | integer | 否 | `null` 表示回放 | `>=5`（新建发布至少 5 个） | 本次发布写入的 confirmed 字段数 | `5` |
 
 ### 返回示例
 
@@ -802,6 +804,7 @@ Idempotency-Key: profile-publish-20260807-02
 ```json
 {
   "task_id": "9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c",
+  "narrative_task_id": "narr_7e6d5c4b3a2f1e0d9c8b7a6f5e4d3c2b",
   "status": "queued",
   "stage": null,
   "poll_after_ms": 1000,
@@ -810,7 +813,7 @@ Idempotency-Key: profile-publish-20260807-02
   "revision_id": 42,
   "revision_no": 1,
   "subject": "personal",
-  "field_count": 2
+  "field_count": 5
 }
 ```
 
@@ -819,6 +822,7 @@ Idempotency-Key: profile-publish-20260807-02
 ```json
 {
   "task_id": "9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c",
+  "narrative_task_id": "narr_7e6d5c4b3a2f1e0d9c8b7a6f5e4d3c2b",
   "status": "queued",
   "stage": null,
   "poll_after_ms": 0,
@@ -833,19 +837,19 @@ Idempotency-Key: profile-publish-20260807-02
 
 ### 使用方法与业务规则
 
-- 前置条件：草稿属于本人；至少一项 `confirmed` 字段；`expected_revision` 匹配。
+- 前置条件：草稿属于本人；至少 5 个 `confirmed` 字段（`confirmed_count >= 5`）；`expected_revision` 匹配。
 - 调用顺序：先 PATCH 确认字段，再 publish；发布成功后草稿置为 `published`、所属会话 `published`（历史只读）。
 - 幂等与防重：`Idempotency-Key` 必填；同 key 同 `draft_id + expected_revision` 回放同一投影任务，**不重复写 revision、不重复递增 revision 向量**；不同 payload 返回 `409 TASK_IDEMPOTENCY_CONFLICT`。
 - 频率/额度/次数限制：无独立额度。
 - 状态流转：`confirmed` 字段 → 不可变 `ai_profile_revision`（含逐字段 content_hash/source revision）→ 只递增对应主体 revision（personal → `profile_revision`，ideal_partner → `preference_revision`，互不干扰）→ 写一条 outbox 事件 → 入队投影任务。**未确认字段永不进入发布版本与投影。**
-- 边界场景：无 confirmed 字段返回 `400 AI_INPUT_INVALID`（至少一项 confirmed 才能发布）；版本不匹配返回 `409 DRAFT_VERSION_CONFLICT`；主体隔离保证 ideal_partner 永不写 personal 事实。
+- 边界场景：`confirmed_count < 5` 返回 `400 AI_INPUT_INVALID`（仅 `confirmed` 计数，`suggested`/`rejected`/`deleted` 不计入且不进入 revision）；版本不匹配返回 `409 DRAFT_VERSION_CONFLICT`；主体隔离保证 ideal_partner 永不写 personal 事实。
 - 前端处理建议：保存 `revision_no`/`revision_id` 用于历史展示；通过 `GET /api/v1/ai/tasks/{task_id}` 轮询投影任务。
 
 ### 错误
 
 | HTTP | 业务码 | 触发条件 | retryable | 前端处理建议 |
 | --- | --- | --- | --- | --- |
-| 400 | `AI_INPUT_INVALID` | 缺少/非法 `expected_revision` 查询参数、无 confirmed 字段、Idempotency-Key 非法 | false | 修正参数或先确认字段，不重试版本类错误 |
+| 400 | `AI_INPUT_INVALID` | 缺少/非法 `expected_revision` 查询参数、`confirmed_count < 5`、Idempotency-Key 非法 | false | 修正参数或先确认至少五个字段，不重试版本类错误 |
 | 404 | `PROFILE_DRAFT_NOT_FOUND` | 草稿不存在或非本人 | false | 提示草稿不存在 |
 | 409 | `DRAFT_VERSION_CONFLICT` | `expected_revision` 不匹配 | false | 拉取最新草稿，提示合并 |
 | 409 | `RESULT_STALE` | 草稿已进入只读终态（`published`/`deleted`/`cancelled`）；守卫先于乐观锁，已删除草稿不得用原 `expected_revision` 重新发布 | false | 提示草稿已终态；删除意图不可被静默撤销 |
@@ -895,12 +899,12 @@ Authorization: Bearer <access_token>
 | `subject` | string | 是 | `personal/ideal_partner` | 发布主体 | `personal` |
 | `revision_no` | integer | 是 | `>=1` | 该主体的发布版本号 | `1` |
 | `policy_revision` | string | 是 | — | 发布时的策略版本 | `ai-policy-2026-08-07-v1` |
-| `field_count` | integer | 是 | `0` 表示空发布（不应发生） | 该版本字段快照数 | `2` |
+| `field_count` | integer | 是 | `0` 表示空发布（历史兼容数据） | `>=0`；2026-08-26 起新发布为 `>=5` | 该版本字段快照数；历史 immutable revision 可能低于 5，不迁移、不隐藏 | `5` |
 | `published_at` | string(datetime) | 是 | — | 发布时间 | `2026-08-07T09:10:00Z` |
 
 ### 返回示例
 
-成功（200）：
+成功（200；历史 immutable revision 可能低于 5，不迁移、不隐藏）：
 
 ```json
 {

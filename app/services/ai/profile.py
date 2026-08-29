@@ -558,29 +558,44 @@ class PublishedRevision:
 
 @dataclass(frozen=True)
 class TaskSubmission:
-    """202 publish result; ``replayed=True`` means no second write happened."""
+    """202 publish result; ``replayed=True`` means no second write happened.
+
+    ``narrative_task_id`` carries the async narrative generation task so the
+    frontend can poll it directly instead of polling the business interface
+    with a fixed short window.
+    """
 
     task_id: str
     status: str
     replayed: bool
     revision: PublishedRevision | None
+    narrative_task_id: str | None = None
 
     @classmethod
-    def accepted(cls, task: AiTaskRecord, revision: PublishedRevision) -> TaskSubmission:
+    def accepted(
+        cls,
+        task: AiTaskRecord,
+        revision: PublishedRevision,
+        narrative_task_id: str | None = None,
+    ) -> TaskSubmission:
         return cls(
             task_id=task.task_id,
             status=task.status.value,
             replayed=False,
             revision=revision,
+            narrative_task_id=narrative_task_id,
         )
 
     @classmethod
-    def replay(cls, task: AiTaskRecord) -> TaskSubmission:
+    def replay(
+        cls, task: AiTaskRecord, narrative_task_id: str | None = None
+    ) -> TaskSubmission:
         return cls(
             task_id=task.task_id,
             status=task.status.value,
             replayed=True,
             revision=None,
+            narrative_task_id=narrative_task_id,
         )
 
 
@@ -1802,8 +1817,8 @@ def ensure_revision(current: int, expected: int) -> None:
 # 可编辑/可发布草稿状态白名单。deleted/published/cancelled 等终态草稿只读
 # （文档 §7「已发布/已删除草稿只读」），不允许再 PATCH 或 publish。
 _DRAFT_EDITABLE_STATUSES = frozenset({"draft", "awaiting_confirmation"})
-# 成稿最低确认字段数：一题一字段，至少 3 笔才够写一篇不空转的叙事。
-MIN_CONFIRMED_FIELDS_TO_PUBLISH = 3
+# 成稿最低确认字段数：10 个字段中至少确认一半（5 笔）才能生成不空转的真实画像。
+MIN_CONFIRMED_FIELDS_TO_PUBLISH = 5
 
 
 def ensure_draft_editable(draft: ProfileDraft, operation: str) -> None:
@@ -2530,8 +2545,12 @@ async def publish_profile_draft(
         db, owner_user_id, _PROJECTION_TASK_TYPE, idempotency_key
     )
     if existing is not None:
+        narrative_existing = await _find_write_task(
+            db, owner_user_id, _NARRATIVE_TASK_TYPE, idempotency_key + "-narrative"
+        )
         return TaskSubmission.replay(
-            _replay_or_conflict(existing, request_hash, "publish")
+            _replay_or_conflict(existing, request_hash, "publish"),
+            narrative_task_id=narrative_existing.task_id if narrative_existing else None,
         )
     draft = await load_owned_draft_for_update(db, draft_id, owner_user_id)
     request_hash = hash_publish_request(draft_id, expected_revision)
@@ -2543,8 +2562,12 @@ async def publish_profile_draft(
         db, owner_user_id, _PROJECTION_TASK_TYPE, idempotency_key
     )
     if existing is not None:
+        narrative_existing = await _find_write_task(
+            db, owner_user_id, _NARRATIVE_TASK_TYPE, idempotency_key + "-narrative"
+        )
         return TaskSubmission.replay(
-            _replay_or_conflict(existing, request_hash, "publish")
+            _replay_or_conflict(existing, request_hash, "publish"),
+            narrative_task_id=narrative_existing.task_id if narrative_existing else None,
         )
     ensure_draft_editable(draft, "发布")
     ensure_revision(draft.revision, expected_revision)
@@ -2657,7 +2680,7 @@ async def publish_profile_draft(
         },
     )
     await db.flush()
-    return TaskSubmission.accepted(task, revision)
+    return TaskSubmission.accepted(task, revision, narrative_task.task_id)
 
 
 async def restore_profile_revision(
@@ -3337,31 +3360,24 @@ async def _load_previous_revision_id(
 
     用 ``revision_no < 当前版本号`` 而非 ``id <`` 定位：revision_no 是业务
     语义上的版本序号，id 只保证插入顺序，二者不必然一致（并发重试时
-    revision_no 回滚但 id 可能更大）。先取当前 revision_no，再找比它小的
-    最大 revision_no 对应行。
+    revision_no 回滚但 id 可能更大）。用子查询合并成一次 round trip：
+    先取当前行的 revision_no，再找比它小的最大 revision_no 对应行。
     """
-    cur_result = await db.execute(
-        text(
-            "SELECT revision_no FROM ai_profile_revision "
-            "WHERE id = :revision_id AND user_id = :user_id AND subject = :subject"
-        ),
-        {"revision_id": current_revision_id, "user_id": user_id, "subject": subject},
-    )
-    cur_row = cur_result.mappings().first()
-    if cur_row is None:
-        return None
-    current_revision_no = int(cur_row["revision_no"])
     result = await db.execute(
         text(
-            "SELECT id FROM ai_profile_revision "
-            "WHERE user_id = :user_id AND subject = :subject "
-            "AND revision_no < :current_revision_no "
-            "ORDER BY revision_no DESC LIMIT 1"
+            "SELECT p.id FROM ai_profile_revision p "
+            "WHERE p.user_id = :user_id AND p.subject = :subject "
+            "AND p.revision_no < ("
+            "  SELECT c.revision_no FROM ai_profile_revision c "
+            "  WHERE c.id = :current_revision_id "
+            "  AND c.user_id = :user_id AND c.subject = :subject"
+            ") "
+            "ORDER BY p.revision_no DESC LIMIT 1"
         ),
         {
             "user_id": user_id,
             "subject": subject,
-            "current_revision_no": current_revision_no,
+            "current_revision_id": current_revision_id,
         },
     )
     row = result.mappings().first()
@@ -3379,13 +3395,22 @@ async def _load_history_summaries(
 
     排除当前 revision（``id != current_revision_id``）：history_observations
     描述的是"过去的你"，当前版本的解读在 dimensions/insight 里，不应重复出现。
+
+    用子查询先取近 N 个 revision id，再 JOIN 字段表一次性取回所有字段，
+    避免对每个 revision 逐一查询（N+1 → 1 次 round trip）。
     """
     result = await db.execute(
         text(
-            "SELECT id, revision_no FROM ai_profile_revision "
-            "WHERE user_id = :user_id AND subject = :subject "
-            "AND id != :current_revision_id "
-            "ORDER BY revision_no DESC LIMIT :limit"
+            "SELECT r.id AS rev_id, r.revision_no AS rev_no, "
+            "f.field_key, f.value_json, f.display_value "
+            "FROM ("
+            "  SELECT id, revision_no FROM ai_profile_revision "
+            "  WHERE user_id = :user_id AND subject = :subject "
+            "  AND id != :current_revision_id "
+            "  ORDER BY revision_no DESC LIMIT :limit"
+            ") r "
+            "JOIN ai_profile_revision_field f ON f.revision_id = r.id "
+            "ORDER BY r.revision_no DESC, f.field_key"
         ),
         {
             "user_id": user_id,
@@ -3394,21 +3419,26 @@ async def _load_history_summaries(
             "limit": limit,
         },
     )
-    rev_rows = result.mappings().all()
-    if not rev_rows:
+    rows = result.mappings().all()
+    if not rows:
         return ()
-    summaries: list[dict[str, Any]] = []
-    for rev_row in rev_rows:
-        rev_id = int(rev_row["id"])
-        fields = await _load_revision_fields(db, rev_id)
-        summaries.append(
-            {
+    grouped: dict[int, dict[str, Any]] = {}
+    for row in rows:
+        rev_id = int(row["rev_id"])
+        if rev_id not in grouped:
+            grouped[rev_id] = {
                 "revision_id": rev_id,
-                "revision_no": int(rev_row["revision_no"]),
-                "fields": fields,
+                "revision_no": int(row["rev_no"]),
+                "fields": [],
+            }
+        grouped[rev_id]["fields"].append(
+            {
+                "field_key": row["field_key"],
+                "value_json": row["value_json"],
+                "display_value": row["display_value"],
             }
         )
-    return tuple(summaries)
+    return tuple(grouped.values())
 
 
 async def generate_profile_narrative_handler(
@@ -3456,6 +3486,13 @@ async def generate_profile_narrative_handler(
     revision_id_int = int(published_revision_id)
 
     # 1. 读取本次发布的字段
+    await db.execute(
+        text(
+            "UPDATE ai_task SET stage = 'reading_fields', updated_at = UTC_TIMESTAMP() "
+            "WHERE task_id = :task_id"
+        ),
+        {"task_id": task.task_id},
+    )
     current_field_rows = await _load_revision_fields(db, revision_id_int)
     if not current_field_rows:
         await fail_task(
@@ -3481,6 +3518,13 @@ async def generate_profile_narrative_handler(
     )
 
     # 4. 调 Gateway 生成叙事层
+    await db.execute(
+        text(
+            "UPDATE ai_task SET stage = 'calling_llm', updated_at = UTC_TIMESTAMP() "
+            "WHERE task_id = :task_id"
+        ),
+        {"task_id": task.task_id},
+    )
     context = AITaskContext(
         task_id=task.task_id,
         request_id=uuid.uuid4().hex,
@@ -3535,6 +3579,13 @@ async def generate_profile_narrative_handler(
         return None
 
     # 6. 写入 ai_profile_summary
+    await db.execute(
+        text(
+            "UPDATE ai_task SET stage = 'writing_summary', updated_at = UTC_TIMESTAMP() "
+            "WHERE task_id = :task_id"
+        ),
+        {"task_id": task.task_id},
+    )
     summary_json = result.model_dump_json(ensure_ascii=False)
     content_hash = hashlib.sha256(summary_json.encode("utf-8")).hexdigest()
     await db.execute(

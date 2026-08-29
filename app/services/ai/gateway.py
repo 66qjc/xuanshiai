@@ -141,10 +141,41 @@ class AIGateway:
         self._timeout_seconds = timeout_seconds
         # Token usage / cost hooks; phase 1 mock reports none.
         self._cost_hook: Any | None = None
+        # Narrative 专用 provider（可选）。当 ai_narrative_provider 配置非空时，
+        # 为重推理的 generate_narrative 单独构造一个更快的 provider 实例，
+        # 其余方法仍走主 provider。为空时回退到主 provider。
+        self._narrative_provider = self._build_narrative_provider()
 
     def set_provider(self, provider: AIProvider) -> None:
         """Swap the provider at runtime (used by tests and future config)."""
         self._provider = provider
+
+    def _build_narrative_provider(self) -> AIProvider | None:
+        """Construct an optional narrative-only provider override.
+
+        When ``ai_narrative_provider`` is set, a separate provider instance is
+        created from that provider's api_key/base_url, then its model and
+        max_tokens are overridden with ``ai_narrative_model`` /
+        ``ai_narrative_max_tokens``.  This lets the heavy narrative task use a
+        fast non-reasoning model while extract/search/reply keep the main
+        provider.  Returns ``None`` to fall back to the main provider.
+        """
+        narr_provider_name = settings.ai_narrative_provider
+        if not narr_provider_name:
+            return None
+        try:
+            narr_provider = get_provider(narr_provider_name)
+        except KeyError:
+            logger.warning(
+                "ai_narrative_provider_unknown provider=%s, falling back to main",
+                narr_provider_name,
+            )
+            return None
+        if settings.ai_narrative_model:
+            narr_provider._model = settings.ai_narrative_model
+        if settings.ai_narrative_max_tokens > 0:
+            narr_provider._max_tokens = settings.ai_narrative_max_tokens
+        return narr_provider
 
     async def invoke(
         self,
@@ -152,6 +183,7 @@ class AIGateway:
         method: str,
         *args: Any,
         response_type: type[T] | None = None,
+        provider: AIProvider | None = None,
     ) -> InvokeOutcome[T]:
         """Run one provider call and normalise the outcome.
 
@@ -159,10 +191,15 @@ class AIGateway:
         or ``moderate_text``.  The provider's typed result is validated with
         ``response_type`` when provided, turning schema violations into a
         non-retryable ``AI_INPUT_INVALID``.
+
+        ``provider`` overrides ``self._provider`` for this single call; used by
+        ``generate_narrative`` to route the heavy narrative task to an optional
+        narrative-only provider without affecting other methods.
         """
+        active_provider = provider or self._provider
         started = time.monotonic()
         try:
-            handler = getattr(self._provider, method)
+            handler = getattr(active_provider, method)
             raw_result = await handler(*args)
             record = self._record(
                 context, method, started, error_code=None, succeeded=True
@@ -347,9 +384,14 @@ class AIGateway:
     async def generate_narrative(
         self, context: AITaskContext, request: Any
     ) -> InvokeOutcome[NarrativeResult]:
+        # 优先用 narrative 专用 provider（配置了 ai_narrative_provider 时），
+        # 否则回退到主 provider。
         return await self.invoke(
-            context, "generate_narrative", request,
+            context,
+            "generate_narrative",
+            request,
             response_type=NarrativeResult,
+            provider=self._narrative_provider,
         )
 
     async def generate_reply(

@@ -584,6 +584,25 @@ async def test_start_task_rejects_foreign_lease_owner(task_store) -> None:
 
 
 @pytest.mark.asyncio
+async def test_start_task_rejects_expired_lease(task_store) -> None:
+    db = task_store.session
+    task = await task_store.seed(
+        status="leased",
+        lease_owner="worker-1",
+        lease_until="2026-08-07T07:59:00Z",
+    )
+
+    with pytest.raises(TaskError) as excinfo:
+        await start_task(db, task.task_id, "worker-1")
+
+    assert excinfo.value.code == "TASK_NOT_FOUND"
+    assert excinfo.value.status_code == 404
+    stored = await task_store.get(task.task_id)
+    assert stored is not None
+    assert stored.status is AiTaskStatus.LEASED
+
+
+@pytest.mark.asyncio
 async def test_heartbeat_lease_renews_running_task_owned_by_worker(task_store) -> None:
     db = task_store.session
     now = _utc(2026, 8, 7, 8, 0)
@@ -796,7 +815,16 @@ async def test_complete_task_supersedes_when_version_changed(task_store) -> None
         status="running",
         lease_owner="worker-1",
         source_revision_json=dict(_FULL_REVISION),
+        consent_snapshot_json={
+            "scope": "profile_text_extract",
+            "version": "",
+        },
     )
+    hook_calls = 0
+
+    async def before_supersede() -> None:
+        nonlocal hook_calls
+        hook_calls += 1
 
     superseded = await complete_task(
         db,
@@ -804,10 +832,21 @@ async def test_complete_task_supersedes_when_version_changed(task_store) -> None
         "worker-1",
         "res-old",
         revisions=RevisionVector(profile=2, policy=1),
+        before_supersede=before_supersede,
     )
 
     assert superseded.status is AiTaskStatus.SUPERSEDED
     assert superseded.result_ref is None
+    assert hook_calls == 1
+    completion_sql = [sql for sql, _params in db.calls]
+    assert any(
+        "FROM user_revision_state" in sql and "FOR UPDATE" in sql
+        for sql in completion_sql
+    )
+    assert any(
+        "FROM ai_consent_grant" in sql and "FOR UPDATE" in sql
+        for sql in completion_sql
+    )
 
 
 @pytest.mark.asyncio

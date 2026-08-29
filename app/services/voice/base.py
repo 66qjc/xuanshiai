@@ -123,6 +123,45 @@ class PartialTranscript:
     confidence: float = 1.0
 
 
+# ----------------------------------------------------------------------
+# 流式语音合成（streaming TTS，cosyvoice WS）
+# ----------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class StreamSynthesizeRequest:
+    """流式语音合成输入。
+
+    与 :class:`SynthesizeRequest` 不同：流式模式由编排器按句切分后逐句
+    合成，每句独立建连、独立落盘成小音频文件，前端链式播放以降低首音
+    延迟。``voice`` / ``audio_format`` / ``sample_rate`` 与 cosyvoice WS
+    StartSynthesis 指令的 payload 字段对齐。
+    """
+
+    app_key: str
+    text: str
+    voice: str = "longxiaochun"
+    audio_format: str = "mp3"
+    sample_rate: int = DEFAULT_SAMPLE_RATE
+    speed: float = 1.0
+
+
+@dataclass(frozen=True)
+class SynthesizeChunk:
+    """流式合成的一个分句切片结果。
+
+    一次 :meth:`VoiceProvider.stream_synthesize` 调用会 yield 多个
+    :class:`SynthesizeChunk`，每个对应一句话的独立音频文件。前端按
+    ``seq`` 顺序链式播放。``total=0`` 表示流式、总数未知（后端逐句推
+    时用）；``total>0`` 表示整段回退（单条，seq=1）。
+    """
+
+    audio_url: str
+    duration_ms: int = 0
+    seq: int = 1
+    total: int = 0
+
+
 class SynthesizeResult(BaseModel):
     """Typed provider result for text-to-speech.
 
@@ -148,6 +187,10 @@ class VoiceProvider(Protocol):
 
     ``stream_transcribe`` is optional (real-time half-duplex conversation,
     P-04b): providers that do not support streaming may omit it.
+
+    ``stream_synthesize`` is optional (streaming TTS via cosyvoice WS,
+    P-04c): providers that do not support streaming TTS may omit it; the
+    orchestrator falls back to the non-streaming ``synthesize`` method.
     """
 
     async def transcribe(
@@ -163,6 +206,11 @@ class VoiceProvider(Protocol):
         request: StreamTranscribeRequest,
         on_partial: Any,
     ) -> AsyncIterator[PartialTranscript]: ...
+
+    async def stream_synthesize(
+        self,
+        request: StreamSynthesizeRequest,
+    ) -> AsyncIterator[SynthesizeChunk]: ...
 
 
 __all__ = [
@@ -181,6 +229,8 @@ __all__ = [
     "SynthesizeResult",
     "StreamTranscribeRequest",
     "PartialTranscript",
+    "StreamSynthesizeRequest",
+    "SynthesizeChunk",
     "VoiceProvider",
     "ProviderError",
     "ProviderErrorKind",

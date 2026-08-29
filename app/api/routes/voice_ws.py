@@ -14,6 +14,8 @@ WebSocket 不经过 HTTP 中间件，需自行 JWT 鉴权（从 query 参数取 
     {"type": "audio_start"}
     {"type": "audio_chunk", "data": "<base64 PCM>", "seq": 1}
     {"type": "audio_end"}
+    {"type": "revise_text", "text": "..."}
+    {"type": "listen"}
     {"type": "cancel"}
 
 后端 → 前端::
@@ -21,9 +23,17 @@ WebSocket 不经过 HTTP 中间件，需自行 JWT 鉴权（从 query 参数取 
     {"type": "partial_transcript", "text": "我今年28岁"}
     {"type": "final_transcript", "text": "我今年28岁，在北京工作"}
     {"type": "ai_thinking"}
+    {"type": "ai_reasoning", "text": "..."}
+    {"type": "ai_content", "text": "..."}
     {"type": "ai_reply", "text": "...", "field_key": "city"}
-    {"type": "tts_audio", "audio_url": "...", "duration_ms": 3000}
+    {"type": "tts_audio", "audio_url": "...", "duration_ms": 3000, "seq": 1, "total": 0}
+    {"type": "tts_audio_done", "total": 2}
     {"type": "error", "code": "AI_TEMPORARILY_UNAVAILABLE", "message": "..."}
+
+流式 TTS 消息：``listen`` 后按句切片逐句推 ``tts_audio``，``seq`` 从 1
+递增，``total=0`` 表示流式（总数未知）。全部到齐后推一条
+``tts_audio_done``（``total`` 为实际句数）。流式失败时自动回退整段模式：
+推单条 ``tts_audio``（``seq=1, total=1``）+ ``tts_audio_done``。
 
 审计规范：日志和审计记录不含原始音频、原始文本内容、密钥。复用
 :class:`GatewayCallRecord`。
@@ -49,7 +59,10 @@ from app.services.voice.base import (
     STREAM_CHUNK_MAX_BYTES,
     StreamTranscribeRequest,
 )
-from app.services.voice.conversation import VoiceConversationOrchestrator
+from app.services.voice.conversation import (
+    ConversationState,
+    VoiceConversationOrchestrator,
+)
 from app.services.voice.gateway import VoiceGateway
 from app.services.voice.providers import (
     _AliyunVoiceError,
@@ -119,6 +132,44 @@ async def _send_error(
             "message": message,
         },
     )
+
+
+async def _push_streamed_reply(
+    ws: WebSocket,
+    orchestrator: VoiceConversationOrchestrator,
+    transcript: str,
+    *,
+    user_id: int,
+    request_id: str,
+    field_key: str,
+) -> bool:
+    """流式推 reasoning/content，再推完整 ai_reply。被取消时返回 False。
+
+    不合成 TTS；调用方另发 ``listen`` 才播报。
+    """
+    gen_id = orchestrator.bump_generation()
+    full_content = ""
+    async for kind, text in orchestrator.stream_reply_events(
+        transcript, user_id=user_id, request_id=request_id
+    ):
+        if gen_id != orchestrator._generation_id:
+            return False
+        if kind == "reasoning":
+            await _send_json(ws, {"type": "ai_reasoning", "text": text})
+        elif kind == "content":
+            full_content += text
+            await _send_json(ws, {"type": "ai_content", "text": text})
+    if gen_id != orchestrator._generation_id:
+        return False
+    await _send_json(
+        ws,
+        {
+            "type": "ai_reply",
+            "text": orchestrator._last_reply_text or full_content,
+            "field_key": orchestrator._field_key or field_key,
+        },
+    )
+    return True
 
 
 @router.websocket("/conversation")
@@ -309,45 +360,107 @@ async def voice_conversation(
                             "text": final_transcript,
                         },
                     )
-                # 画像抽取 → 回复 → TTS。
                 await _send_json(ws, {"type": "ai_thinking"})
                 try:
-                    turn_result = await orchestrator.process_transcript(
+                    await _push_streamed_reply(
+                        ws,
+                        orchestrator,
                         final_transcript,
                         user_id=user_id,
                         request_id=request_id,
+                        field_key=field_key,
                     )
                 except AIProviderError as exc:
                     await _send_error(ws, exc.code, exc.message)
-                    continue
-                if turn_result.error_code:
-                    await _send_error(
-                        ws,
-                        turn_result.error_code,
-                        turn_result.error_message or "对话处理失败",
-                    )
-                    continue
-                await _send_json(
-                    ws,
-                    {
-                        "type": "ai_reply",
-                        "text": turn_result.ai_reply,
-                        "field_key": turn_result.field_key or field_key,
-                    },
-                )
-                if turn_result.tts_audio_url:
-                    await _send_json(
-                        ws,
-                        {
-                            "type": "tts_audio",
-                            "audio_url": turn_result.tts_audio_url,
-                            "duration_ms": turn_result.tts_duration_ms,
-                        },
-                    )
                 asr_client = None
 
+            elif msg_type == "listen":
+                if orchestrator is None or not orchestrator._last_reply_text:
+                    continue
+                # 优先走流式 TTS（按句切片，逐句推 tts_audio）；失败时
+                # 自动回退到整段 HTTP 合成（synthesize_current），用户无感。
+                try:
+                    seq = 0
+                    async for url, dur in orchestrator.synthesize_streaming():
+                        seq += 1
+                        await _send_json(
+                            ws,
+                            {
+                                "type": "tts_audio",
+                                "audio_url": url,
+                                "duration_ms": dur,
+                                "seq": seq,
+                                "total": 0,
+                            },
+                        )
+                    if seq == 0:
+                        # 无文本可合成（空回复），推一条空 tts_audio_done。
+                        await _send_json(
+                            ws, {"type": "tts_audio_done", "total": 0}
+                        )
+                    else:
+                        await _send_json(
+                            ws, {"type": "tts_audio_done", "total": seq}
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "voice_ws_streaming_tts_fallback request_id=%s "
+                        "err=%s, 回退整段模式",
+                        request_id,
+                        type(exc).__name__,
+                    )
+                    # 回退整段 HTTP 合成（单条 tts_audio，旧格式兼容）。
+                    spoken = await orchestrator.synthesize_current()
+                    if spoken.error_code:
+                        await _send_error(
+                            ws,
+                            spoken.error_code,
+                            spoken.error_message or "播报失败",
+                        )
+                        continue
+                    if spoken.tts_audio_url:
+                        await _send_json(
+                            ws,
+                            {
+                                "type": "tts_audio",
+                                "audio_url": spoken.tts_audio_url,
+                                "duration_ms": spoken.tts_duration_ms,
+                                "seq": 1,
+                                "total": 1,
+                            },
+                        )
+                        await _send_json(
+                            ws, {"type": "tts_audio_done", "total": 1}
+                        )
+
+            elif msg_type == "revise_text":
+                text = str(message.get("text", "")).strip()
+                if not text:
+                    await _send_error(ws, "AI_INPUT_INVALID", "改写文本为空")
+                    continue
+                if orchestrator is None:
+                    await _send_error(
+                        ws, "AI_INPUT_INVALID", "未先发送 session_start"
+                    )
+                    continue
+                orchestrator.bump_generation()
+                if orchestrator.state != ConversationState.LISTENING:
+                    orchestrator.state = ConversationState.LISTENING
+                await _send_json(ws, {"type": "ai_thinking"})
+                try:
+                    await _push_streamed_reply(
+                        ws,
+                        orchestrator,
+                        text,
+                        user_id=user_id,
+                        request_id=request_id,
+                        field_key=field_key,
+                    )
+                except AIProviderError as exc:
+                    await _send_error(ws, exc.code, exc.message)
+
             elif msg_type == "cancel":
-                # 取消当前轮次：清理 ASR client。
+                # 取消当前轮次：清理 ASR client，丢弃在途生成。
                 if asr_client is not None:
                     try:
                         await asr_client.finish()
@@ -358,10 +471,45 @@ async def voice_conversation(
                     partial_task.cancel()
                     partial_task = None
                 if orchestrator is not None:
+                    orchestrator.bump_generation()
                     orchestrator.reset()
                 logger.info(
                     "voice_ws_cancelled request_id=%s", request_id
                 )
+
+            elif msg_type == "finish":
+                # 对话结束：批量抽取全部转写，推给前端确认。
+                if orchestrator is None:
+                    continue
+                await _send_json(ws, {"type": "extracting"})
+                try:
+                    extracted = await orchestrator.extract_all(
+                        user_id=user_id,
+                        request_id=request_id,
+                    )
+                    fields_out = [
+                        {"field_key": f.field_key, "value": f.value}
+                        for f in extracted.fields
+                    ]
+                    await _send_json(
+                        ws,
+                        {
+                            "type": "extract_result",
+                            "fields": fields_out,
+                        },
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "voice_ws_extract_failed request_id=%s err=%s",
+                        request_id,
+                        type(exc).__name__,
+                    )
+                    await _send_error(
+                        ws,
+                        "AI_TEMPORARILY_UNAVAILABLE",
+                        "画像抽取失败",
+                    )
+                orchestrator.clear_transcripts()
 
     except WebSocketDisconnect:
         logger.info(

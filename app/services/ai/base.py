@@ -250,7 +250,7 @@ class ReplyResult(BaseModel):
     """Typed provider result for one conversational reply.
 
     ``reply_text`` is spoken aloud via TTS — length is capped to keep the
-    spoken turn short (prompt asks for ≤50 chars; 200 is a hard guard).
+    spoken turn short (prompt asks for ≤30 chars; 200 is a hard guard).
     """
 
     model_config = ConfigDict(extra="forbid")

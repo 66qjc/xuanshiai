@@ -51,3 +51,6 @@ docs/婚恋小程序验收清单.md
 docs/待完成事项.md
 restar.md
 outputs
+
+# local worktrees
+.worktrees/

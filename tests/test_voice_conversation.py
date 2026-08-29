@@ -160,7 +160,7 @@ async def test_process_transcript_full_flow(monkeypatch: pytest.MonkeyPatch) -> 
     )
     orch.start_listening(session_id="s1", field_key="age")
     result = await orch.process_transcript(
-        "我今年28岁", user_id=1, request_id="req1"
+        "我今年28岁", user_id=1, request_id="req1", synthesize=True
     )
     assert result.final_transcript == "我今年28岁"
     assert result.extracted_field_key == "age"
@@ -174,9 +174,38 @@ async def test_process_transcript_full_flow(monkeypatch: pytest.MonkeyPatch) -> 
 
 
 @pytest.mark.asyncio
+async def test_process_transcript_does_not_synthesize_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings_dev()
+    monkeypatch.setattr("app.services.voice.conversation.settings", settings)
+    extract = _make_extract_result(field_key="age")
+    voice = _make_mock_voice_gateway(
+        synth_result=SynthesizeResult(
+            audio_url="/storage/voice/tts/test.mp3",
+            audio_format="mp3",
+            duration_ms=3000,
+        )
+    )
+    orch = VoiceConversationOrchestrator(
+        ai_gateway=_make_mock_ai_gateway(extract_result=extract, reply_text="记下了，你在哪座城市？"),
+        voice_gateway=voice,
+    )
+    orch.start_listening(session_id="s1", field_key="age")
+    result = await orch.process_transcript("我今年28岁", user_id=1, request_id="req1")
+    assert result.ai_reply
+    assert result.tts_audio_url is None
+    voice.synthesize.assert_not_called()
+    spoken = await orch.synthesize_current()
+    assert spoken.tts_audio_url == "/storage/voice/tts/test.mp3"
+    voice.synthesize.assert_called_once()
+
+
+@pytest.mark.asyncio
 async def test_process_transcript_extract_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """抽取失败不打断口语回复。"""
     settings = _settings_dev()
     monkeypatch.setattr("app.services.voice.conversation.settings", settings)
     extract_error = ProviderError(
@@ -190,8 +219,8 @@ async def test_process_transcript_extract_failure(
     )
     orch.start_listening(session_id="s1")
     result = await orch.process_transcript("text", user_id=1)
-    assert result.error_code == "AI_TEMPORARILY_UNAVAILABLE"
-    assert result.ai_reply == ""
+    assert result.error_code is None
+    assert result.ai_reply  # 非空：抽取失败仍继续口语回复
     assert result.tts_audio_url is None
     assert orch.state == ConversationState.IDLE
 
@@ -214,10 +243,12 @@ async def test_process_transcript_tts_failure(
     )
     orch.start_listening(session_id="s1")
     result = await orch.process_transcript("text", user_id=1)
-    # TTS 失败：ai_reply 已生成但无音频。
+    # TTS 失败：先拼回复，再单独合成。
     assert result.ai_reply  # 回复已生成
-    assert result.error_code == "AI_QUOTA_EXCEEDED"
     assert result.tts_audio_url is None
+    spoken = await orch.synthesize_current()
+    assert spoken.error_code == "AI_QUOTA_EXCEEDED"
+    assert spoken.tts_audio_url is None
     assert orch.state == ConversationState.IDLE
 
 
@@ -246,8 +277,10 @@ async def test_reset_restores_idle(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     orch.start_listening(session_id="s1")
     orch.state = ConversationState.PROCESSING
+    orch._last_reply_text = "上一轮回复"
     orch.reset()
     assert orch.state == ConversationState.IDLE
+    assert orch._last_reply_text == ""
 
 
 @pytest.mark.asyncio
@@ -347,7 +380,37 @@ async def test_llm_reply_exception_falls_back_to_template(
         voice_gateway=_make_mock_voice_gateway(synth_result=synth),
     )
     orch.start_listening(session_id="s1", field_key="age")
-    result = await orch.process_transcript("28岁", user_id=1)
+    result = await orch.process_transcript("28岁", user_id=1, synthesize=True)
     assert result.ai_reply  # 非空：降级模板
     assert result.error_code is None  # 回复失败被吞，不阻断流程
     assert result.tts_audio_url == "/tts.mp3"
+
+
+@pytest.mark.asyncio
+async def test_stream_reply_events_emits_reasoning_then_content(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings_dev()
+    monkeypatch.setattr("app.services.voice.conversation.settings", settings)
+
+    async def fake_stream(messages, json_mode=False):
+        yield ("reasoning", "先接住年龄")
+        yield ("content", "记下了，你在哪座城市？")
+        yield ("finish", "stop")
+
+    provider = MagicMock()
+    provider.stream_chat = fake_stream
+    extract = _make_extract_result(field_key="age")
+    orch = VoiceConversationOrchestrator(
+        ai_gateway=_make_mock_ai_gateway(extract_result=extract),
+        voice_gateway=_make_mock_voice_gateway(),
+        reply_streamer=provider.stream_chat,
+    )
+    orch.start_listening(session_id="s1", field_key="age")
+    events = [item async for item in orch.stream_reply_events("我今年28岁", user_id=1)]
+    kinds = [k for k, _ in events]
+    assert "reasoning" in kinds
+    assert "content" in kinds
+    assert events[-1][0] == "finish"
+    assert orch._last_reply_text == "记下了，你在哪座城市？"
+    assert orch.state == ConversationState.IDLE

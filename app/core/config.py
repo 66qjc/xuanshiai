@@ -147,6 +147,15 @@ class Settings(BaseSettings):
     ai_dots_model: str = "dots3-note-prev"
     ai_dots_max_tokens: int = Field(default=4096, gt=0, le=8192)
 
+    # Narrative 专用模型覆盖（可选）。画像叙事层 generate_narrative 是重推理
+    # 任务，默认走主 provider 的模型。若主 provider 是推理模型（如 dots3-note-prev），
+    # 生成耗时可达数十秒；通过此项指定一个更快的非推理模型 + 配套 provider 来
+    # 单独驱动 narrative，其余方法（抽取/搜索/回复）不受影响。
+    # 为空时回退到主 provider 默认模型。需要配套的 provider key 可用。
+    ai_narrative_provider: Literal["", "deepseek", "dots"] = ""
+    ai_narrative_model: str = ""
+    ai_narrative_max_tokens: int = Field(default=0, ge=0, le=8192)
+
     # ==================== 语音（STT/TTS）功能开关与配置 ====================
     # P-04 / Phase 4。默认关闭。生产启用需满足三道审批门禁 + AccessKey 配置
     # （见 _validate_ai_feature_gates 的 fail-closed 检查）。

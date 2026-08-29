@@ -311,6 +311,30 @@ class MockAIProvider:
         self._check_failure("generate_reply")
         return ReplyResult(reply_text="好的，记下啦。那你现在生活在哪个城市呀？")
 
+    async def stream_chat(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        json_mode: bool = False,
+    ):
+        """开发对话台用的确定性流：先推理片段，再正文。"""
+        self._check_failure("stream_chat")
+        last_user = ""
+        for item in reversed(messages):
+            if item.get("role") == "user":
+                last_user = item.get("content") or ""
+                break
+        preview = last_user.replace("\n", " ").strip()[:24] or "（空输入）"
+        yield ("reasoning", "mock 不调用外网，按当前输入回放一段固定回复。")
+        if json_mode:
+            yield (
+                "content",
+                '{"reply_text":"好的，记下啦。那你现在生活在哪个城市呀？"}',
+            )
+        else:
+            yield ("content", f"这是 mock 回复。你刚才说：{preview}")
+        yield ("finish", "stop")
+
     # ------------------------------------------------------------------
     # Deterministic fixture accessor (used by the acceptance test)
     # ------------------------------------------------------------------
@@ -436,6 +460,24 @@ _MODERATION_SYSTEM = (
     "色情、暴力、诈骗或其它违规内容。以 JSON 格式输出："
     "{\"allowed\": true 或 false, \"reason_code\": 违规类型或 null}。"
 )
+
+
+def _delta_reasoning_and_content(delta: Any) -> tuple[str, str]:
+    """从流式 delta 或完整 message 取出推理文本与正文。
+
+    dots3-note-prev 等推理模型会把思维链放在 ``reasoning_content``，
+    正式回复在 ``content``。其它供应商通常只有 content。
+    """
+    content = getattr(delta, "content", None) or ""
+    reasoning = (
+        getattr(delta, "reasoning_content", None)
+        or getattr(delta, "reasoning", None)
+        or ""
+    )
+    extra = getattr(delta, "model_extra", None)
+    if not reasoning and isinstance(extra, dict):
+        reasoning = extra.get("reasoning_content") or extra.get("reasoning") or ""
+    return str(reasoning or ""), str(content or "")
 
 
 def _safe_confidence(value: Any) -> float:
@@ -635,50 +677,70 @@ class _OpenAICompatProvider:
         )
         return self._client
 
+    def _map_openai_exception(self, exc: Exception) -> ProviderError:
+        """把 OpenAI SDK 异常映射为稳定的 ProviderError。"""
+        if isinstance(exc, _RateLimitError):
+            return ProviderError(
+                code="AI_QUOTA_EXCEEDED",
+                message=str(exc),
+                kind=ProviderErrorKind.RETRYABLE,
+                retry_after_ms=2000,
+            )
+        if isinstance(exc, (_APITimeoutError, _APIConnectionError)):
+            return ProviderError(
+                code="AI_TEMPORARILY_UNAVAILABLE",
+                message=str(exc),
+                kind=ProviderErrorKind.RETRYABLE,
+            )
+        if isinstance(exc, (_AuthenticationError, _PermissionDeniedError, _BadRequestError)):
+            return ProviderError(
+                code="AI_INPUT_INVALID",
+                message=str(exc),
+                kind=ProviderErrorKind.NON_RETRYABLE,
+            )
+        if isinstance(exc, _APIStatusError):
+            return ProviderError(
+                code="AI_TEMPORARILY_UNAVAILABLE",
+                message=str(exc),
+                kind=ProviderErrorKind.RETRYABLE,
+            )
+        if isinstance(exc, _APIError):
+            return ProviderError(
+                code="AI_TEMPORARILY_UNAVAILABLE",
+                message=str(exc),
+                kind=ProviderErrorKind.RETRYABLE,
+            )
+        return ProviderError(
+            code="AI_TEMPORARILY_UNAVAILABLE",
+            message=str(exc),
+            kind=ProviderErrorKind.RETRYABLE,
+        )
+
     async def _chat_json(self, prompt: str) -> Any:
         """调用 OpenAI 兼容 chat API 并返回解析后的 JSON 对象。"""
+        return await self._chat_json_with_max(prompt, self._max_tokens)
+
+    async def _chat_json_with_max(self, prompt: str, max_tokens: int) -> Any:
+        """调用 OpenAI 兼容 chat API 并返回解析后的 JSON 对象（自定义 max_tokens）。"""
         client = self._ensure_client()
         try:
             response = await client.chat.completions.create(
                 model=self._model,
                 messages=[{"role": "user", "content": prompt}],
                 response_format={"type": "json_object"},
-                max_tokens=self._max_tokens,
+                max_tokens=max_tokens,
             )
-        except _RateLimitError as exc:
-            raise ProviderError(
-                code="AI_QUOTA_EXCEEDED",
-                message=str(exc),
-                kind=ProviderErrorKind.RETRYABLE,
-                retry_after_ms=2000,
-            ) from exc
-        except (_APITimeoutError, _APIConnectionError) as exc:
-            raise ProviderError(
-                code="AI_TEMPORARILY_UNAVAILABLE",
-                message=str(exc),
-                kind=ProviderErrorKind.RETRYABLE,
-            ) from exc
-        except (_AuthenticationError, _PermissionDeniedError, _BadRequestError) as exc:
-            # 4xx 认证/权限/请求格式错误是永久性配置问题，重试无意义。
-            raise ProviderError(
-                code="AI_INPUT_INVALID",
-                message=str(exc),
-                kind=ProviderErrorKind.NON_RETRYABLE,
-            ) from exc
-        except _APIStatusError as exc:
-            # 其余带状态码的错误（主要为 5xx）视为可重试。
-            raise ProviderError(
-                code="AI_TEMPORARILY_UNAVAILABLE",
-                message=str(exc),
-                kind=ProviderErrorKind.RETRYABLE,
-            ) from exc
-        except _APIError as exc:
-            # 无状态码的非 4xx/5xx SDK 错误，保守视为可重试。
-            raise ProviderError(
-                code="AI_TEMPORARILY_UNAVAILABLE",
-                message=str(exc),
-                kind=ProviderErrorKind.RETRYABLE,
-            ) from exc
+        except (
+            _RateLimitError,
+            _APITimeoutError,
+            _APIConnectionError,
+            _AuthenticationError,
+            _PermissionDeniedError,
+            _BadRequestError,
+            _APIStatusError,
+            _APIError,
+        ) as exc:
+            raise self._map_openai_exception(exc) from exc
 
         if not response.choices:
             raise ProviderError(
@@ -688,6 +750,99 @@ class _OpenAICompatProvider:
             )
         content = response.choices[0].message.content
         return _parse_json_response(content)
+
+    async def stream_chat(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        json_mode: bool = False,
+    ):
+        """流式调用 OpenAI 兼容 chat API，产出 (kind, text) 片段。
+
+        kind 为 ``reasoning`` / ``content`` / ``finish``。仅开发对话台使用，
+        不进入生产 Protocol。JSON 模式若供应商拒绝 stream+json_object，
+        会回退到一次非流式调用，再把完整正文作为单段 content 产出。
+        """
+        client = self._ensure_client()
+        kwargs: dict[str, Any] = {
+            "model": self._model,
+            "messages": messages,
+            "max_tokens": self._max_tokens,
+            "stream": True,
+        }
+        if json_mode:
+            kwargs["response_format"] = {"type": "json_object"}
+        try:
+            stream = await client.chat.completions.create(**kwargs)
+        except _BadRequestError as exc:
+            if json_mode:
+                async for item in self._stream_json_fallback(client, messages):
+                    yield item
+                return
+            raise self._map_openai_exception(exc) from exc
+        except (
+            _RateLimitError,
+            _APITimeoutError,
+            _APIConnectionError,
+            _AuthenticationError,
+            _PermissionDeniedError,
+            _APIStatusError,
+            _APIError,
+        ) as exc:
+            raise self._map_openai_exception(exc) from exc
+
+        finish_reason = "stop"
+        async for chunk in stream:
+            choices = getattr(chunk, "choices", None) or []
+            if not choices:
+                continue
+            choice = choices[0]
+            reason = getattr(choice, "finish_reason", None)
+            if reason:
+                finish_reason = str(reason)
+            delta = getattr(choice, "delta", None)
+            if delta is None:
+                continue
+            reasoning, content = _delta_reasoning_and_content(delta)
+            if reasoning:
+                yield ("reasoning", reasoning)
+            if content:
+                yield ("content", content)
+        yield ("finish", finish_reason)
+
+    async def _stream_json_fallback(self, client: Any, messages: list[dict[str, str]]):
+        """供应商不支持 stream+json_object 时的非流式回退。"""
+        try:
+            response = await client.chat.completions.create(
+                model=self._model,
+                messages=messages,
+                response_format={"type": "json_object"},
+                max_tokens=self._max_tokens,
+            )
+        except (
+            _RateLimitError,
+            _APITimeoutError,
+            _APIConnectionError,
+            _AuthenticationError,
+            _PermissionDeniedError,
+            _BadRequestError,
+            _APIStatusError,
+            _APIError,
+        ) as exc:
+            raise self._map_openai_exception(exc) from exc
+        if not response.choices:
+            raise ProviderError(
+                code="AI_INPUT_INVALID",
+                message="provider 返回空 choices",
+                kind=ProviderErrorKind.NON_RETRYABLE,
+            )
+        message = response.choices[0].message
+        reasoning, content = _delta_reasoning_and_content(message)
+        if reasoning:
+            yield ("reasoning", reasoning)
+        if content:
+            yield ("content", content)
+        yield ("finish", "stop")
 
     # ------------------------------------------------------------------
     # AIProvider Protocol
@@ -807,7 +962,8 @@ class _OpenAICompatProvider:
             request.field_key,
             request.known_fields,
         )
-        data = await self._chat_json(prompt)
+        # 语音回复极短（≤30字），用小 max_tokens 加速生成
+        data = await self._chat_json_with_max(prompt, 128)
         # 回复是自由文本，模型偶发输出超长/空串：schema 漂移转为可重试
         # 错误，由调用方（对话编排器）降级到模板回复，对话不中断。
         try:

@@ -99,42 +99,111 @@ async def _run_with_heartbeat(
     still recovers the task (fallback, not the happy path).  On cancellation
     the child handler task is cancelled too.
 
-    When ``session_provider`` is set, the handler runs in its own session but
-    its business writes are **not** committed here.  Instead the result is a
-    ``(outcome, finalize_handler)`` pair where ``finalize_handler`` is an
-    awaitable closure the caller (:func:`_process`) must ``await`` to either
-    commit (argument truthy) or roll back (argument falsy) the handler's
-    business side effects — but only after :func:`complete_task`'s
-    consent/revision gate has been evaluated.  If the gate supersedes the task
-    the caller finalizes with ``False`` so a consent revoked between handler
-    run and finalize cannot leak business writes (AI-P0-07).  When
-    ``session_provider`` is ``None`` the result is simply ``outcome``.
+    When ``session_provider`` is set, the handler runs in its own session and
+    an inner savepoint protects its business writes until completion's gate has
+    run.  The result is a ``(outcome, finalize_handler)`` pair where
+    ``finalize_handler`` accepts either no completion operation (rollback /
+    discard) or an async operation receiving ``handler_db``.  Completion and
+    handler writes then share one outer commit.  When the gate supersedes the
+    task, the nested savepoint is rolled back before the terminal task update
+    is written, so consent revocation cannot leak business writes (AI-P0-07).
+    When ``session_provider`` is ``None`` the result is simply ``outcome``.
     """
     async def invoke_handler() -> Any:
         if session_provider is None:
             return await handler(db, task, worker_id)
         handler_db_cm = session_provider()
         handler_db = await handler_db_cm.__aenter__()
-        finalized = False
+        if hasattr(handler_db, "begin_nested"):
+            handler_nested = handler_db.begin_nested()
+            await handler_nested.start()
+        else:
+            # Test doubles and legacy session adapters may not expose
+            # SQLAlchemy's savepoint API.  Rolling back the whole session is
+            # the safe fallback; supersede then writes the terminal task state
+            # in a fresh transaction before the outer commit.
+            class _FallbackNested:
+                is_active = True
 
-        async def finalize_handler(should_commit: bool) -> None:
+                async def start(self) -> "_FallbackNested":
+                    return self
+
+                async def rollback(self) -> None:
+                    if not self.is_active:
+                        return
+                    await handler_db.rollback()
+                    self.is_active = False
+
+                async def commit(self) -> None:
+                    self.is_active = False
+                    return None
+
+            handler_nested = _FallbackNested()
+        finalized = False
+        handler_writes_discarded = False
+        supersede_update_pending = False
+
+        async def rollback_handler_writes() -> None:
+            nonlocal handler_writes_discarded
+            if handler_writes_discarded:
+                return
+            handler_writes_discarded = True
+            if getattr(handler_nested, "is_active", True):
+                await handler_nested.rollback()
+
+        async def rollback_before_supersede() -> None:
+            nonlocal supersede_update_pending
+            supersede_update_pending = True
+            await rollback_handler_writes()
+
+        async def finalize_handler(
+            completion_operation: Callable[[Any], Awaitable[Any]] | None = None,
+        ) -> Any:
             nonlocal finalized
             if finalized:
-                return
+                return None
             finalized = True
             try:
-                if should_commit:
+                if completion_operation is None:
+                    await rollback_handler_writes()
+                    await handler_db.rollback()
+                    return None
+                completed = await completion_operation(handler_db)
+                status = getattr(completed, "status", None)
+                if (
+                    status is AiTaskStatus.SUCCEEDED
+                    and not handler_writes_discarded
+                    and getattr(handler_nested, "is_active", True)
+                ):
+                    await handler_nested.commit()
+                    await handler_db.commit()
+                elif status is AiTaskStatus.SUPERSEDED and supersede_update_pending:
+                    # ``complete_task`` invokes before_supersede before its
+                    # guarded terminal update, leaving only that update in the
+                    # outer transaction for this commit.
                     await handler_db.commit()
                 else:
+                    await rollback_handler_writes()
                     await handler_db.rollback()
+                return completed
+            except BaseException:
+                await handler_db.rollback()
+                raise
             finally:
                 await handler_db_cm.__aexit__(None, None, None)
+
+        # ``_process`` builds the completion operation after receiving this
+        # closure.  Keep the savepoint callback on the closure so that the
+        # operation can pass it to ``complete_task`` without exposing the
+        # transaction object in the public handler result tuple.
+        setattr(finalize_handler, "before_supersede", rollback_before_supersede)
+        setattr(finalize_handler, "before_not_applied", rollback_handler_writes)
 
         try:
             outcome = await handler(handler_db, task, worker_id)
             return outcome, finalize_handler
         except BaseException:
-            await finalize_handler(False)
+            await finalize_handler()
             raise
 
     async def renew_lease() -> None:
@@ -251,10 +320,9 @@ async def _process(
         emit_ai_metric("retry_rate", 1, {"task_type": started.task_type})
         return "failed"
     # _run_with_heartbeat returns either a bare outcome (no session_provider)
-    # or a (outcome, finalize_handler) pair where finalize_handler must be
-    # awaited with should_commit to either durably commit the handler's
-    # business writes or roll them back.  finalize_handler is None when no
-    # session_provider is used.
+    # or a (outcome, finalize_handler) pair.  The handler finalizer owns the
+    # completion operation, savepoint release/rollback and exactly one outer
+    # commit.  finalize_handler is None when no session_provider is used.
     if session_provider is None:
         outcome = heartbeat_result
         finalize_handler = None
@@ -266,7 +334,7 @@ async def _process(
         # re-records the failure via a separate finalize_db, and the handler's
         # business writes are discarded.
         if finalize_handler is not None:
-            await finalize_handler(False)
+            await finalize_handler()
         await finish_in_session(
             lambda finalize_db: fail_task(
                 finalize_db,
@@ -279,25 +347,27 @@ async def _process(
         emit_ai_metric("retry_rate", 1, {"task_type": started.task_type})
         return "failed"
     result_ref, revisions = outcome
-    # Run the consent/revision gate in a separate finalize_db session.  The
-    # returned task record tells us whether the gate passed (SUCCEEDED) or the
-    # task was superseded (SUPERSEDED — consent revoked / revision changed).
-    completed = await finish_in_session(
-        lambda finalize_db: complete_task(
-            finalize_db, started.task_id, worker_id, result_ref, revisions
+    async def complete_in_handler(handler_db: Any) -> Any:
+        before_supersede = getattr(finalize_handler, "before_supersede", None)
+        before_not_applied = getattr(finalize_handler, "before_not_applied", None)
+        return await complete_task(
+            handler_db,
+            started.task_id,
+            worker_id,
+            result_ref,
+            revisions,
+            before_supersede=before_supersede,
+            before_not_applied=before_not_applied,
         )
-    )
-    if completed.status is AiTaskStatus.SUCCEEDED:
-        # Gate passed: now it is safe to durably commit the handler's business
-        # side effects (draft rows, session status flips).
-        if finalize_handler is not None:
-            await finalize_handler(True)
-        return "completed"
-    # Gate superseded the task (consent revoked / revision changed) or the task
-    # was otherwise finalized in a non-success terminal state: the handler's
-    # business writes must NOT become visible.  Roll them back.
-    if finalize_handler is not None:
-        await finalize_handler(False)
+
+    if finalize_handler is None:
+        await finish_in_session(
+            lambda finalize_db: complete_task(
+                finalize_db, started.task_id, worker_id, result_ref, revisions
+            )
+        )
+    else:
+        await finalize_handler(complete_in_handler)
     return "completed"
 
 

@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -336,7 +337,7 @@ async def _load_current_completion_context(
         text(
             "SELECT profile_revision, preference_revision, privacy_revision, "
             "relationship_revision, policy_revision "
-            "FROM user_revision_state WHERE user_id = :user_id"
+            "FROM user_revision_state WHERE user_id = :user_id FOR UPDATE"
         ),
         {"user_id": task.owner_user_id},
     )
@@ -358,7 +359,7 @@ async def _load_current_completion_context(
                 "SELECT version, policy_revision, granted_at "
                 "FROM ai_consent_grant "
                 "WHERE user_id = :user_id AND scope = :scope AND revoked_at IS NULL "
-                "ORDER BY granted_at DESC LIMIT 1"
+                "ORDER BY granted_at DESC LIMIT 1 FOR UPDATE"
             ),
             {"user_id": task.owner_user_id, "scope": scope},
         )
@@ -708,6 +709,9 @@ async def complete_task(
     worker_id: str,
     result_ref: str,
     revisions: Any = None,
+    *,
+    before_supersede: Callable[[], Awaitable[None]] | None = None,
+    before_not_applied: Callable[[], Awaitable[None]] | None = None,
 ) -> AiTaskRecord:
     """Write a result only when the task is still owned, uncancelled and current.
 
@@ -715,16 +719,27 @@ async def complete_task(
     a row lock before the result is committed.  Version invalidation funnels a
     ``running`` task into ``superseded`` instead of overwriting newer state.
     """
+    async def supersede() -> AiTaskRecord:
+        if before_supersede is not None:
+            await before_supersede()
+        return await _supersede_guarded(db, task)
+
+    async def not_applied() -> AiTaskRecord:
+        """Discard caller-staged output when this call cannot own finalization."""
+        if before_not_applied is not None:
+            await before_not_applied()
+        return task
+
     task = await _get_by_id(db, task_id, for_update=True)
     if task is None:
         raise TaskError(code="TASK_NOT_FOUND", message="任务不存在", status_code=404)
     if task.status in _TERMINAL:
-        return task
+        return await not_applied()
     if task.status not in {AiTaskStatus.RUNNING, AiTaskStatus.LEASED}:
-        return task
+        return await not_applied()
     if task.lease_owner is not None and task.lease_owner != worker_id:
         # Worker 已失去租约；结果交由新持有者处理，不覆盖。
-        return task
+        return await not_applied()
     # 安全复查（consent 复查、版本向量对比）必须无条件执行：不能依赖
     # 驱动是否支持嵌套事务（savepoint），否则不支持 begin_nested 的驱动
     # 会完全跳过完成门禁，导致旧版本/已撤回 consent 的结果覆盖新状态。
@@ -734,20 +749,20 @@ async def complete_task(
         await _load_current_completion_context(db, task)
     )
     if not feature_enabled or not consent_matches:
-        return await _supersede_guarded(db, task)
+        return await supersede()
     if task.source_revision_json and (
         task.source_revision_json != current_revision.as_dict()
     ):
-        return await _supersede_guarded(db, task)
+        return await supersede()
     if revisions is not None and _revision_dict(revisions) != current_revision.as_dict():
-        return await _supersede_guarded(db, task)
+        return await supersede()
     if _revisions_changed(task.source_revision_json, revisions):
         if task.status is AiTaskStatus.RUNNING:
-            return await _supersede_guarded(db, task)
-        return task
+            return await supersede()
+        return await not_applied()
     if task.status is not AiTaskStatus.RUNNING:
         # 未启动的任务不能直接完成（leased -> succeeded 非法）。
-        return task
+        return await not_applied()
     assert_transition(task.status, AiTaskStatus.SUCCEEDED)
     now = _now_utc()
     await db.execute(

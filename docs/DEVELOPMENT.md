@@ -154,7 +154,10 @@ python main.py
 健康检查： http://127.0.0.1:8000/api/v1/health
 Swagger：   http://127.0.0.1:8000/docs
 ReDoc：     http://127.0.0.1:8000/redoc
+听写台：   http://127.0.0.1:8000/ai-playground
 ```
+
+听写台只在 `development` / `testing` 且本机可开，直接对话当前 `.env` 的 `AI_PROVIDER`（dots / deepseek / mock）。推理文本、正式回复和耗时会以 SSE 实时落墨。生产环境该页与 `/api/v1/ai/playground*` 一律 404。契约见 `docs/api/AI开发对话台.md`。
 
 指定其他端口：
 
