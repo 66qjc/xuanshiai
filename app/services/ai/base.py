@@ -212,6 +212,27 @@ class SearchParseResult(BaseModel):
 
 
 @dataclass(frozen=True)
+class SearchSuggestRequest:
+    """WP-S3：猜你喜欢的输入投影（最小化，不含原文/ID）。
+
+    ``context_lines`` 由服务层从用户双投影（interest/lifestyle 标签、
+    ideal_partner 结构化字段、entry_digest）折成的摘要行；LLM 只准基于
+    这些行归纳搜索词（faithfulness），禁止编造用户没有的偏好。
+    """
+
+    context_lines: tuple[str, ...] = ()
+    consent_version: str = "consent-v1"
+    policy_revision: str = "ai-policy-v1"
+
+
+class SearchSuggestResult(BaseModel):
+    """Typed provider result for AI 猜你喜欢（3~5 条自然语言搜索词）。"""
+
+    schema_version: str = Field(default="search-suggest-v1", min_length=1, max_length=32)
+    suggestions: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class ModerationRequest:
     """Text to moderate; the Gateway never logs the raw text."""
 
@@ -329,6 +350,10 @@ class AIProvider(Protocol):
     async def generate_reply(
         self, request: ReplyRequest
     ) -> ReplyResult: ...
+
+    async def generate_search_suggestions(
+        self, request: SearchSuggestRequest
+    ) -> SearchSuggestResult: ...
 
 
 @dataclass(frozen=True)

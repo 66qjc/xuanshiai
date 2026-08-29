@@ -196,7 +196,20 @@ class SearchFieldAllowlist(BaseModel):
 
 
 class SearchSuggestionRead(BaseModel):
-    """Editable tag suggestions; empty array when nothing is confirmed."""
+    """Editable tag suggestions; empty array when nothing is confirmed.
+
+    WP-S3：source='ai' 表示来自猜你喜欢 AI 归纳缓存；'tags' 为既有标签回显。
+    """
 
     items: list[str] = Field(default_factory=list)
     page: CursorMeta = Field(default_factory=CursorMeta)
+    source: str = Field(default="tags", pattern="^(ai|tags)$")
+
+
+class SearchSuggestGenerateRead(BaseModel):
+    """WP-S3：生成请求的 202 出参（degraded=无投影降级，未建任务）。"""
+
+    task_id: str = ""
+    status: str = Field(default="queued")
+    source: str = Field(default="ai", pattern="^(ai|tags)$")
+    replayed: bool = False

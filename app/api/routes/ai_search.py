@@ -39,10 +39,11 @@ from app.schemas.ai_search import (
     SearchDraftRead,
     SearchResultPageRead,
     SearchSnapshotAccepted,
+    SearchSuggestGenerateRead,
     SearchSuggestionRead,
 )
 from app.services.ai.flags import AiFeature, AiFeatureDisabledError, require_ai_feature
-from app.services.ai.profile import DraftVersionConflict
+from app.services.ai.profile import AIInputError, DraftVersionConflict
 from app.services.ai.search import (
     SearchConsentRequired,
     SearchDraftNotConfirmed,
@@ -55,6 +56,7 @@ from app.services.ai.search import (
     confirm_search_draft,
     create_search_draft,
     delete_search_snapshot,
+    generate_search_suggestions,
     get_search_suggestions,
     load_search_draft,
     patch_search_draft,
@@ -285,6 +287,32 @@ async def confirm_search_draft_route(
         condition_schema_version=snapshot.condition_schema_version,
         degraded=snapshot.degraded,
     )
+
+
+@router.post(
+    "/search-suggestions/generate",
+    response_model=SearchSuggestGenerateRead,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="生成 AI 猜你喜欢搜索词（异步任务，24h 缓存与频控）",
+)
+async def generate_search_suggestions_route(
+    current: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> SearchSuggestGenerateRead:
+    """WP-S3：基于用户投影归纳搜索词；无投影降级返回标签口径（不建任务）。"""
+    _require_search_feature()
+    _check_idempotency_key(idempotency_key)
+    try:
+        result = await generate_search_suggestions(db, current.id, idempotency_key or "")
+    except AIInputError as exc:
+        raise _error_response(exc.code, exc.message, exc.status_code) from exc
+    except TaskError as exc:
+        raise _error_response(
+            exc.code, exc.message, exc.status_code, retryable=exc.retryable
+        ) from exc
+    await db.commit()
+    return result
 
 
 @router.get(

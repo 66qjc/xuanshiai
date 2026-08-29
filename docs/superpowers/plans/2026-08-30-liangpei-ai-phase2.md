@@ -229,10 +229,10 @@ replaces_field_key VARCHAR(64) DEFAULT NULL     -- entry 改写时指向被替�
 - 出参校验：AI 词为非空字符串数组、≤5 条、去重；越界丢弃并记审计。
 
 **Steps:**
-- [ ] RED（单测）：fake LLM 产词 → 任务 succeeded 且 payload 含 3~5 词；24h 内二次 generate 幂等回放；超频控 `AI_INPUT_INVALID`；空投影直接 tags 降级。
-- [ ] GREEN：实现 handler/服务/路由/注册。
-- [ ] RED（集成）：真库 generate → 轮询 succeeded → `GET /search-suggestions` 返回 source='ai' 结果；rollback-then-assert 审计行。
-- [ ] 全量回归。
+- [x] RED（单测）：fake LLM 产词 → 任务 succeeded 且 payload 含 3~5 词；24h 内二次 generate 幂等回放；超频控 `AI_INPUT_INVALID`；空投影直接 tags 降级。
+- [x] GREEN：实现 handler/服务/路由/注册。
+- [x] RED（集成）：真库 generate → 轮询 succeeded → `GET /search-suggestions` 返回 source='ai' 结果；rollback-then-assert 审计行。
+- [x] 全量回归。
 
 **验收（方案 WP-S3 验收原文）：** 有丰富投影的用户拿到 3 条以上与自身兴趣强相关的搜索词；空投影用户降级返回标签回显；每用户生成有频控。
 **Commit:** `feat(search): AI 猜你喜欢（search_suggest 任务+24h缓存+频控+降级）`

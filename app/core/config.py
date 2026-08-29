@@ -206,6 +206,8 @@ class Settings(BaseSettings):
     ai_lease_seconds: int = Field(default=300, gt=0, le=3600)
     ai_max_attempts: int = Field(default=3, gt=0, le=10)
     ai_search_parse_rate_per_minute: int = Field(default=5, gt=0, le=60)
+    # WP-S3：猜你喜欢 AI 生成频控（每用户 24h 窗口内的任务数上限）。
+    ai_search_suggest_daily_limit: int = Field(default=5, gt=0, le=50)
     ai_profile_session_expire_days: int = Field(default=7, gt=0)
     ai_search_draft_expire_hours: int = Field(default=24, gt=0)
     ai_compatibility_snapshot_ttl_minutes: int = Field(default=10, gt=0)

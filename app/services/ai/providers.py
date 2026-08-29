@@ -25,6 +25,8 @@ from app.services.ai.base import (
     ExtractedEntry,
     ExtractedField,
     ExtractedPatch,
+    SearchSuggestRequest,
+    SearchSuggestResult,
     ModerationRequest,
     ModerationResult,
     NarrativeDimension,
@@ -287,6 +289,24 @@ class MockAIProvider:
             conditions=conditions,
             unknown=unknown,
         )
+
+    async def generate_search_suggestions(
+        self, request: SearchSuggestRequest
+    ) -> SearchSuggestResult:
+        """确定性建议：直接归纳输入投影行（不调外部模型，单测/联调可用）。"""
+        self._check_failure("generate_search_suggestions")
+        if "schema_invalid" in self._failures or (
+            "generate_search_suggestions:schema_invalid" in self._failures
+        ):
+            raise ProviderError(
+                "AI_TEMPORARILY_UNAVAILABLE",
+                "mock provider schema invalid",
+                kind=ProviderErrorKind.NON_RETRYABLE,
+            )
+        suggestions = tuple(
+            line for line in request.context_lines if line.strip()
+        )[:5]
+        return SearchSuggestResult(suggestions=suggestions)
 
     async def moderate_text(
         self, request: ModerationRequest
@@ -986,6 +1006,35 @@ class _OpenAICompatProvider:
             schema_version=_SEARCH_SCHEMA_VERSION,
             conditions=tuple(conditions),
         )
+
+    async def generate_search_suggestions(
+        self, request: SearchSuggestRequest
+    ) -> SearchSuggestResult:
+        """WP-S3：基于用户投影行归纳 3~5 条自然语言搜索词（LLM JSON mode）。
+
+        faithfulness 硬约束写在 prompt：只准基于给定资料归纳，禁止编造。
+        出参去重、取前 5 条；非法行整条丢弃。
+        """
+        context_block = "\n".join(request.context_lines) or "（暂无画像资料）"
+        prompt = (
+            "你是一个婚恋搜索助手。基于用户已有画像资料，归纳 3 到 5 条适合"
+            "直接用于搜索的自然语言搜索词。规则：\n"
+            "  - 只准基于下面给出的用户资料归纳，禁止编造用户没有的兴趣或偏好；\n"
+            "  - 每条 6 到 24 个字，口语化、可直接输入搜索框；\n"
+            '  - 以 JSON 输出：{"suggestions": ["..."]}。\n\n'
+            f"用户画像资料：\n{context_block}"
+        )
+        data = await self._chat_json(prompt)
+        raw = data.get("suggestions", []) if isinstance(data, dict) else []
+        suggestions: list[str] = []
+        for item in raw:
+            if isinstance(item, str) and item.strip():
+                text = item.strip()
+                if text not in suggestions:
+                    suggestions.append(text)
+            if len(suggestions) >= 5:
+                break
+        return SearchSuggestResult(suggestions=tuple(suggestions))
 
     async def moderate_text(
         self, request: ModerationRequest

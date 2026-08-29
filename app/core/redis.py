@@ -41,7 +41,10 @@ class LoopAwareRedis:
         loop = asyncio.get_running_loop()
         client = self._clients.get(loop)
         if client is None or loop.is_closed():
-            client = Redis.from_url(self._url, decode_responses=True)
+            # 每次新建 client 时读取当前 settings.redis_url：测试环境通过
+            # monkeypatch 切换测试 Redis（compose.ai-test.yml 6380）后，
+            # 本模块的延迟建连才能跟随 settings，而不是停留在导入期 URL。
+            client = Redis.from_url(settings.redis_url, decode_responses=True)
             # When the loop is GC'd, best-effort close the client pool so its
             # sockets are not left dangling.  aclose() is a coroutine; schedule
             # it on the loop if still running, otherwise skip (loop already

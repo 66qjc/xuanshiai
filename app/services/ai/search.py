@@ -56,15 +56,21 @@ from app.schemas.ai_search import (
     SearchDraftStatus,
     SearchResultItemRead,
     SearchResultPageRead,
+    SearchSuggestGenerateRead,
     SearchSuggestionRead,
 )
 from app.schemas.discovery import DiscoveryFilters
-from app.services.ai.base import AITaskContext, SearchParseRequest
+from app.services.ai.base import (
+    AITaskContext,
+    SearchParseRequest,
+    SearchSuggestRequest,
+)
 from app.services.ai.gateway import AIGateway
-from app.services.ai.profile import CleanupTask, DraftVersionConflict
+from app.services.ai.profile import AIInputError, CleanupTask, DraftVersionConflict
 from app.services.ai.tasks import (
     AiTaskRecord,
     TaskError,
+    _find_by_idempotency,
     enqueue_task,
     fail_task,
 )
@@ -94,6 +100,7 @@ SEARCH_PROMPT_VERSION = "search-parse-prompt-v1"
 SEARCH_POLICY_REVISION = "ai-policy-2026-08-07-v1"
 SEARCH_CONSENT_SCOPE = "search_parse"
 SEARCH_PARSE_TASK_TYPE = "search_parse"
+SEARCH_SUGGEST_TASK_TYPE = "search_suggest"
 SEARCH_EXECUTE_TASK_TYPE = "search_execute"
 SEARCH_CLEANUP_TASK_TYPE = "cleanup"
 # 结果证据 TTL：与统一方案 §8.3 示例的 result_expires_at（10 分钟）一致。
@@ -2441,8 +2448,22 @@ async def get_search_suggestions(
     """只读本人已确认且允许搜索的标签（interest_tags/lifestyle_tags）。
 
     数据源为 ``personal_searchable`` 特征投影（仅已确认字段）；无投影时返回
-    空数组。
+    空数组。WP-S3：猜你喜欢 AI 建议缓存（24h TTL）优先——命中时 source='ai'；
+    未命中或 Redis 不可用时回退标签回显（source='tags'，前端无感）。
     """
+    try:
+        cached = await redis_client.get(_suggest_cache_key(owner_user_id))
+        if cached:
+            items = json.loads(cached)
+            if isinstance(items, list) and items:
+                return SearchSuggestionRead(
+                    items=[str(item) for item in items][: _SEARCH_SUGGEST_MAX_ITEMS],
+                    source="ai",
+                )
+    except Exception:  # noqa: BLE001 - 缓存是尽力而为：Redis 不可用时回退标签
+        logger.warning(
+            "search_suggest_cache_read_failed user_id=%s", owner_user_id
+        )
     result = await db.execute(
         text(
             "SELECT subject_user_id, fields_json, status, expires_at "
@@ -2534,4 +2555,242 @@ def register_search_handlers() -> None:
     )
 
 
+
+# ----------------------------------------------------------------------
+# WP-S3：猜你喜欢 AI 化（search_suggest 任务 + 24h Redis 缓存 + 频控 + 降级）
+# ----------------------------------------------------------------------
+#
+# 生成：POST /search-suggestions/generate 建 search_suggest 任务（同日幂等
+# 回放 + 24h 窗口频控）；读取：GET /search-suggestions 优先取 Redis 中的
+# AI 建议缓存（24h TTL），未命中回退既有标签回显（source='tags'）。Redis
+# 不可用一律优雅降级为标签回显，绝不阻塞读取。
+
+_SEARCH_SUGGEST_MAX_ITEMS = 5
+_SUGGEST_CACHE_TTL_SECONDS = 24 * 3600
+
+
+def _suggest_cache_key(owner_user_id: int) -> str:
+    return f"ai:search_suggest:{owner_user_id}"
+
+
+async def _load_suggest_context_lines(
+    db: AsyncSession, owner_user_id: int
+) -> list[str]:
+    """从双投影折出建议归纳的上下文行（不含原文/ID，供 LLM faithfulness）。"""
+    result = await db.execute(
+        text(
+            "SELECT projection_kind, fields_json, entry_digest "
+            "FROM ai_feature_projection "
+            "WHERE subject_user_id = :user_id "
+            "AND projection_kind IN ('personal_searchable', "
+            "'ideal_partner_preference') AND status = 'active' "
+            "AND (expires_at IS NULL OR expires_at > UTC_TIMESTAMP()) "
+            "ORDER BY id DESC"
+        ),
+        {"user_id": owner_user_id},
+    )
+    rows = result.mappings().all()
+    by_kind: dict[str, dict[str, Any]] = {}
+    entry_digest: str | None = None
+    for row in rows:
+        kind = str(row["projection_kind"])
+        if kind not in by_kind:
+            by_kind[kind] = _maybe_json(row.get("fields_json")) or {}
+            if kind == "personal_searchable" and row.get("entry_digest"):
+                entry_digest = str(row["entry_digest"])
+    lines: list[str] = []
+    personal = by_kind.get("personal_searchable") or {}
+    for key in ("interest_tags", "lifestyle_tags"):
+        value = personal.get(key)
+        values = value if isinstance(value, list) else [value]
+        for item in values:
+            if isinstance(item, str) and item.strip():
+                lines.append(f"兴趣/生活方式标签：{item.strip()}")
+    ideal = by_kind.get("ideal_partner_preference") or {}
+    for key, value in ideal.items():
+        if value is None:
+            continue
+        rendered = ", ".join(str(v) for v in value) if isinstance(value, list) else str(value)
+        if rendered.strip():
+            lines.append(f"理想型条件 {key}：{rendered.strip()}")
+    if entry_digest:
+        for line in entry_digest.splitlines():
+            if line.strip():
+                lines.append(f"条目：{line.strip()}")
+    return lines
+
+
+async def generate_search_suggestions(
+    db: AsyncSession, owner_user_id: int, idempotency_key: str
+) -> SearchSuggestGenerateRead:
+    """WP-S3：生成 AI 猜你喜欢搜索词（异步任务，同日幂等 + 频控 + 降级）。
+
+    用户无可归纳投影时不建任务直接降级（source='tags'）；同日重复请求回放
+    既有任务（幂等键 search-suggest-{user}-{YYYYMMDD}，缓存即回放）；24h
+    窗口内生成次数达 settings.ai_search_suggest_daily_limit 时 400。不 commit。
+    """
+    context_lines = await _load_suggest_context_lines(db, owner_user_id)
+    if not context_lines:
+        return SearchSuggestGenerateRead(
+            task_id="", status="degraded", source="tags", replayed=False
+        )
+    date_key = f"search-suggest-{owner_user_id}-{_now_utc():%Y%m%d}"
+    existing = await _find_by_idempotency(
+        db, owner_user_id, SEARCH_SUGGEST_TASK_TYPE, date_key
+    )
+    if existing is not None:
+        return SearchSuggestGenerateRead(
+            task_id=existing.task_id,
+            status=existing.status.value,
+            source="ai",
+            replayed=True,
+        )
+    count_result = await db.execute(
+        text(
+            "SELECT COUNT(*) AS n FROM ai_task "
+            "WHERE owner_user_id = :user_id AND task_type = :task_type "
+            "AND created_at > UTC_TIMESTAMP() - INTERVAL 24 HOUR"
+        ),
+        {"user_id": owner_user_id, "task_type": SEARCH_SUGGEST_TASK_TYPE},
+    )
+    count_row = await _first_row(count_result)
+    if (
+        count_row is not None
+        and int(count_row.get("n") or 0) >= settings.ai_search_suggest_daily_limit
+    ):
+        raise AIInputError("今日猜你喜欢生成次数已达上限")
+    task = await enqueue_task(
+        db=db,
+        owner_user_id=owner_user_id,
+        task_type=SEARCH_SUGGEST_TASK_TYPE,
+        idempotency_key=date_key,
+        request_hash=hash_suggest_request(owner_user_id),
+        revisions=await _load_owner_revision_vector(db, owner_user_id),
+        consent=None,
+    )
+    await db.execute(
+        text(
+            "UPDATE ai_task SET payload_summary = :payload_summary, "
+            "updated_at = UTC_TIMESTAMP() WHERE task_id = :task_id"
+        ),
+        {
+            "payload_summary": json.dumps(
+                {"user_id": owner_user_id}, ensure_ascii=False
+            ),
+            "task_id": task.task_id,
+        },
+    )
+    return SearchSuggestGenerateRead(
+        task_id=task.task_id, status=task.status.value, source="ai", replayed=False
+    )
+
+
+async def _load_owner_revision_vector(
+    db: AsyncSession, owner_user_id: int
+) -> RevisionVector:
+    """读取用户当前五维版本向量（入队与 finalize 版本复核用）。"""
+    row = await _first_row(
+        await db.execute(
+            text(
+                "SELECT profile_revision, preference_revision, privacy_revision, "
+                "relationship_revision, policy_revision FROM user_revision_state "
+                "WHERE user_id = :user_id"
+            ),
+            {"user_id": owner_user_id},
+        )
+    )
+    if row is None:
+        return RevisionVector()
+    return RevisionVector(
+        profile=int(row.get("profile_revision") or 0),
+        preference=int(row.get("preference_revision") or 0),
+        privacy=int(row.get("privacy_revision") or 0),
+        relationship=int(row.get("relationship_revision") or 0),
+        policy=int(row.get("policy_revision") or 0),
+    )
+
+
+def hash_suggest_request(owner_user_id: int) -> str:
+    """稳定请求摘要：同用户同日内容恒定，跨用户不同。"""
+    payload = json.dumps({"user_id": int(owner_user_id)}, sort_keys=True)
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+async def search_suggest_handler(
+    db: AsyncSession, task: AiTaskRecord, worker_id: str
+) -> tuple[str, RevisionVector] | None:
+    """``search_suggest`` Worker handler：归纳搜索词并写 24h Redis 缓存。
+
+    LLM 失败/Redis 不可用按可重试失败处理（GET 自动回退标签回显，前端
+    无感）。建议出参去重并截断到 _SEARCH_SUGGEST_MAX_ITEMS 条。不 commit。
+    """
+    payload = task.payload_summary or {}
+    user_id = payload.get("user_id")
+    if not user_id:
+        await fail_task(
+            db, task.task_id, worker_id,
+            error_code="AI_INPUT_INVALID", retryable=False,
+        )
+        return None
+    context_lines = await _load_suggest_context_lines(db, int(user_id))
+    if not context_lines:
+        await fail_task(
+            db, task.task_id, worker_id,
+            error_code="AI_INPUT_INVALID", retryable=False,
+        )
+        return None
+    context = AITaskContext(
+        task_id=task.task_id,
+        request_id=uuid.uuid4().hex,
+        scene="search_suggest",
+        provider=settings.ai_provider_name,
+        model=settings.ai_model_name,
+        schema_version="search-suggest-v1",
+    )
+    request = SearchSuggestRequest(context_lines=tuple(context_lines))
+    gateway = AIGateway(timeout_seconds=settings.ai_gateway_timeout_seconds)
+    outcome = await gateway.generate_search_suggestions(context, request)
+    if outcome.result is None:
+        await fail_task(
+            db, task.task_id, worker_id,
+            error_code=outcome.error_code or "AI_TEMPORARILY_UNAVAILABLE",
+            retryable=outcome.retryable,
+        )
+        return None
+    suggestions: list[str] = []
+    for item in outcome.result.suggestions:
+        if isinstance(item, str) and item.strip() and item.strip() not in suggestions:
+            suggestions.append(item.strip())
+        if len(suggestions) >= _SEARCH_SUGGEST_MAX_ITEMS:
+            break
+    if not suggestions:
+        await fail_task(
+            db, task.task_id, worker_id,
+            error_code="AI_TEMPORARILY_UNAVAILABLE", retryable=True,
+        )
+        return None
+    try:
+        await redis_client.set(
+            _suggest_cache_key(int(user_id)),
+            json.dumps(suggestions, ensure_ascii=False),
+            ex=_SUGGEST_CACHE_TTL_SECONDS,
+        )
+    except Exception:  # noqa: BLE001 - Redis 不可用按可重试失败，GET 回退标签
+        logger.warning(
+            "search_suggest_cache_write_failed task_id=%s", task.task_id
+        )
+        await fail_task(
+            db, task.task_id, worker_id,
+            error_code="AI_TEMPORARILY_UNAVAILABLE", retryable=True,
+        )
+        return None
+    revisions = (
+        RevisionVector(**task.source_revision_json)
+        if task.source_revision_json
+        else RevisionVector()
+    )
+    return f"search-suggest:{len(suggestions)}", revisions
+
+# 模块末尾注册：保证上方全部任务类型/handler 符号已定义，避免与
+# ai_worker 的相互导入在半初始化状态下取不到新符号（WP-S3）。
 register_search_handlers()

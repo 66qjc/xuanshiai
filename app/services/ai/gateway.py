@@ -32,6 +32,7 @@ from app.services.ai.base import (
     ProviderErrorKind,
     ReplyResult,
     SearchParseResult,
+    SearchSuggestResult,
     StructuredExtractResult,
 )
 from app.services.ai.providers import get_provider
@@ -392,6 +393,14 @@ class AIGateway:
             request,
             response_type=NarrativeResult,
             provider=self._narrative_provider,
+        )
+
+    async def generate_search_suggestions(
+        self, context: AITaskContext, request: Any
+    ) -> InvokeOutcome[SearchSuggestResult]:
+        return await self.invoke(
+            context, "generate_search_suggestions", request,
+            response_type=SearchSuggestResult,
         )
 
     async def generate_reply(
