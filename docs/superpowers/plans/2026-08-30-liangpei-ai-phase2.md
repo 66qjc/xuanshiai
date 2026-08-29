@@ -202,9 +202,9 @@ replaces_field_key VARCHAR(64) DEFAULT NULL     -- entry 改写时指向被替�
 - `extract_all` 批量结果落库时按 turn 归属拆分，保证 `source_turn_ids` 溯源不断。
 
 **Steps:**
-- [ ] RED（集成）：语音模式建会话（input_mode='voice'）→ 模拟 3 轮转写抽取 → draft_field 落库 → `POST /mode` 切 text → 进度与已确认字段延续 → 重连（同 session_id）不丢。
-- [ ] GREEN：实现三处接线。
-- [ ] 全量回归（voice 相关用户 WIP 红除外，须逐条确认未新增红）。
+- [x] RED（集成）：语音模式建会话（input_mode='voice'）→ 模拟 3 轮转写抽取 → draft_field 落库 → `POST /mode` 切 text → 进度与已确认字段延续 → 重连（同 session_id）不丢。
+- [x] GREEN：实现三处接线。
+- [x] 全量回归（voice 相关用户 WIP 红除外，须逐条确认未新增红）。
 
 **验收（方案 WP-P5 验收原文）：** 语音答 3 题→切文字→进度与已确认字段延续；语音会话产生的字段出现在 draft；断线重连（恢复聊天）不丢。
 **Commit:** `feat(voice): 语音抽取落库画像状态机+双模式互切`

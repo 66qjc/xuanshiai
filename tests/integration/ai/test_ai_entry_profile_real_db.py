@@ -953,3 +953,155 @@ async def test_real_published_fields_is_new_across_two_revisions(
         )
         await cleanup_db.commit()
         await _clean(cleanup_db, user_id)
+
+
+@pytest.mark.asyncio
+async def test_real_voice_mode_switch_and_extract_persistence(
+    real_db_session: AsyncSession,
+    real_db_engine: AsyncEngine,
+) -> None:
+    """WP-P5 真库：voice 模式切换与语音抽取落库走文字模式同一状态机。"""
+    from app.services.ai.base import (
+        ExtractedEntry,
+        ExtractedField,
+        StructuredExtractResult,
+    )
+    from app.services.ai.profile import (
+        _load_field_keys,
+        create_profile_session,
+        persist_voice_extract_result,
+        submit_profile_turn,
+        update_session_input_mode,
+    )
+
+    user_id = 9_880_000_501
+    await _clean(real_db_session, user_id)
+    factory = async_sessionmaker(real_db_engine, expire_on_commit=False)
+
+    async with factory() as seed_db:
+        await seed_db.execute(
+            text(
+                "INSERT INTO user_revision_state "
+                "(user_id, profile_revision, preference_revision, privacy_revision, "
+                "relationship_revision, policy_revision) VALUES (:user_id, 0, 0, 0, 0, 0)"
+            ),
+            {"user_id": user_id},
+        )
+        await grant_consent(
+            seed_db,
+            user_id,
+            "profile_text_extract",
+            AiConsentGrantRequest(
+                consent_version=CONSENT_VERSION,
+                policy_revision=POLICY_REVISION,
+            ),
+            "voice-grant-501",
+            0,
+        )
+        await seed_db.commit()
+        session = await create_profile_session(
+            seed_db, user_id, ProfileSubject.PERSONAL, CONSENT_VERSION,
+            "voice-session-501",
+        )
+        await submit_profile_turn(
+            seed_db, session.session_id, user_id,
+            "voice-text-turn-501", "周末喜欢旅行和看展。",
+            "voice-text-extract-501",
+        )
+        await seed_db.commit()
+        session_id = session.session_id
+
+    voice_result = StructuredExtractResult(
+        schema_version=profile_module.PROFILE_SCHEMA_VERSION,
+        fields=(
+            ExtractedField(
+                field_key="city_code",
+                subject=ProfileSubject.PERSONAL,
+                value="330100",
+                source_quote="我住在杭州",
+                confidence=0.9,
+                schema_version=profile_module.PROFILE_SCHEMA_VERSION,
+                prompt_version=profile_module.PROFILE_PROMPT_VERSION,
+                policy_revision=POLICY_REVISION,
+            ),
+        ),
+        entries=(
+            ExtractedEntry(
+                category="interests",
+                content="喜欢户外和摄影，常去西湖徒步",
+                subject=ProfileSubject.PERSONAL,
+                source_quote="周末常去西湖徒步拍照",
+                confidence=0.85,
+                schema_version=profile_module.PROFILE_SCHEMA_VERSION,
+                prompt_version=profile_module.PROFILE_PROMPT_VERSION,
+                policy_revision=POLICY_REVISION,
+            ),
+        ),
+    )
+
+    async with factory() as voice_db:
+        reloaded = await update_session_input_mode(
+            voice_db, session_id, user_id, "voice"
+        )
+        assert reloaded.input_mode == "voice"
+        draft_id = await persist_voice_extract_result(
+            voice_db, session_id, user_id,
+            "我住在杭州，周末常去西湖徒步拍照。",
+            "voice-finish-501-001",
+            voice_result,
+        )
+        await voice_db.commit()
+        assert draft_id
+
+    async with factory() as check_db:
+        row = (
+            await check_db.execute(
+                text(
+                    "SELECT status, input_mode FROM ai_profile_session "
+                    "WHERE session_id = :session_id"
+                ),
+                {"session_id": session_id},
+            )
+        ).one()
+        assert row[0] == "awaiting_confirmation"
+        assert row[1] == "voice"
+        turn_row = (
+            await check_db.execute(
+                text(
+                    "SELECT source_type, role FROM ai_profile_turn "
+                    "WHERE session_id = :session_id "
+                    "AND source_type = 'voice_transcript'"
+                ),
+                {"session_id": session_id},
+            )
+        ).one()
+        assert turn_row[1] == "user"
+        entry_rows = (
+            await check_db.execute(
+                text(
+                    "SELECT field_kind FROM ai_profile_draft_field "
+                    "WHERE draft_id = :draft_id"
+                ),
+                {"draft_id": draft_id},
+            )
+        ).all()
+        assert {r[0] for r in entry_rows} == {"structured", "entry"}
+        # 重复 finish（同 client_turn_id）幂等：不产生第二份草稿。
+        draft_id_2 = await persist_voice_extract_result(
+            check_db, session_id, user_id,
+            "我住在杭州，周末常去西湖徒步拍照。",
+            "voice-finish-501-001",
+            voice_result,
+        )
+        assert draft_id_2 == draft_id
+        # 切回 text：进度与已确认字段延续（同一行状态机）。
+        reloaded = await update_session_input_mode(
+            check_db, session_id, user_id, "text"
+        )
+        assert reloaded.input_mode == "text"
+        _field_keys, _confirmed = await _load_field_keys(check_db, session_id)
+        assert "city_code" in _field_keys
+
+    # 共享测试库纪律：清场。
+    async with factory() as cleanup_db:
+        await _clean(cleanup_db, user_id)

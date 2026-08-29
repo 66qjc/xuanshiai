@@ -145,6 +145,9 @@ _RESUMABLE = frozenset(
 _SESSION_TRANSITIONS: dict[ProfileSessionStatus, set[ProfileSessionStatus]] = {
     ProfileSessionStatus.DRAFT: {
         ProfileSessionStatus.EXTRACTING,
+        # WP-P5：语音抽取结果同步落库后直接进入待确认（无异步任务中转，
+        # 与文字模式"提交→任务→待确认"两段式不同，这里一步到位）。
+        ProfileSessionStatus.AWAITING_CONFIRMATION,
         ProfileSessionStatus.PAUSED,
         ProfileSessionStatus.CANCELLED,
         ProfileSessionStatus.STALE,
@@ -1228,6 +1231,99 @@ async def create_update_session(
     return session, submission
 
 
+async def update_session_input_mode(
+    db: AsyncSession,
+    session_id: str,
+    owner_user_id: int,
+    input_mode: str,
+) -> ProfileSession:
+    """WP-P5：双模式互切——同一会话内切换 text/voice。
+
+    属主校验 + 活动状态校验后更新 ``input_mode``（列已存在，零迁移）。
+    进度、草稿与已确认字段自然延续（同一行状态机）。paused 会话也允许
+    切换（恢复后按新模式继续）；终态会话 404。不 commit。
+    """
+    if input_mode not in {"text", "voice"}:
+        raise AIInputError("input_mode 只能是 text 或 voice")
+    session = await load_owned_active_session(db, session_id, owner_user_id)
+    if session.input_mode == input_mode:
+        return session
+    await db.execute(
+        text(
+            "UPDATE ai_profile_session SET input_mode = :input_mode, "
+            "updated_at = UTC_TIMESTAMP() WHERE session_id = :session_id"
+        ),
+        {"input_mode": input_mode, "session_id": session_id},
+    )
+    reloaded = await load_owned_session(db, session_id, owner_user_id)
+    return reloaded
+
+
+async def persist_voice_extract_result(
+    db: AsyncSession,
+    session_id: str,
+    owner_user_id: int,
+    transcript: str,
+    client_turn_id: str,
+    result: Any,
+) -> str:
+    """WP-P5：把语音抽取结果写入与文字模式相同的画像状态机。
+
+    转写原文作为 user turn 落库（source_type='voice_transcript'，与文字模式
+    同表同审核）；抽取结果复用 ``_write_draft`` 同一草稿写入路径（structured
+    字段 + entry 条目 + 来源证据 + 草稿滚动），会话推进 awaiting_confirmation。
+    空结果（无字段无条目）时与 build 抽取的 fallback tag 语义对齐：当前问题
+    是标签字段时把转写记为 suggested 候选。幂等：同 client_turn_id 已存在则
+    直接回放该草稿定位（不重复落库）。不 commit——调用方（WS finish）持有
+    事务边界。
+    """
+    session = await load_owned_active_session(db, session_id, owner_user_id)
+    existing = await find_turn_by_client_id(db, session_id, client_turn_id)
+    if existing is not None:
+        draft_id = await _load_active_draft_id_for_session(db, session_id)
+        return draft_id or ""
+    normalized = normalize_profile_answer(transcript)
+    moderation = await moderate_text(db, normalized, field="画像语音转写")
+    if moderation.action == "reject":
+        raise AIInputError("转写内容包含违规信息，已忽略本轮抽取")
+    if moderation.action == "replace" and moderation.display_content:
+        normalized = moderation.display_content
+    try:
+        turn = await _insert_turn(
+            db, session_id, owner_user_id, client_turn_id, normalized,
+            source_type="voice_transcript",
+        )
+    except IntegrityError:
+        # 并发重连重复 finish：回读已有 turn，不产生第二份草稿。
+        turn = await find_turn_by_client_id(db, session_id, client_turn_id)
+        if turn is None:
+            raise
+        draft_id = await _load_active_draft_id_for_session(db, session_id)
+        return draft_id or ""
+    # 空结果（无字段无条目）时与 build 抽取的 fallback tag 语义对齐：
+    # 当前问题是标签字段时把转写记为 suggested 候选；仍为空则不建草稿。
+    if not getattr(result, "fields", ()) and not getattr(result, "entries", ()):
+        fallback = _fallback_tag_field(session, turn)
+        if fallback is not None:
+            result = result.model_copy(update={"fields": (fallback,)})
+    if not getattr(result, "fields", ()) and not getattr(result, "entries", ()):
+        return ""
+    draft_id = await _write_draft(db, session, turn, result)
+    # 语音落库一步到位进入待确认：DRAFT（正常路径）或 EXTRACTING（同会话
+    # 还有未完成的文字抽取任务时）均为合法来源边。
+    if session.status in (
+        ProfileSessionStatus.DRAFT,
+        ProfileSessionStatus.EXTRACTING,
+    ):
+        assert_session_transition(
+            session.status, ProfileSessionStatus.AWAITING_CONFIRMATION
+        )
+        await _update_session_status(
+            db, session_id, ProfileSessionStatus.AWAITING_CONFIRMATION
+        )
+    return draft_id
+
+
 async def load_owned_session(
     db: AsyncSession, session_id: str, owner_user_id: int
 ) -> ProfileSession:
@@ -1314,7 +1410,12 @@ async def find_turn_by_client_id(
 
 
 async def _insert_turn(
-    db: AsyncSession, session_id: str, user_id: int, client_turn_id: str, answer_text: str
+    db: AsyncSession,
+    session_id: str,
+    user_id: int,
+    client_turn_id: str,
+    answer_text: str,
+    source_type: str = "user_answer",
 ) -> ProfileTurn:
     turn_id = uuid.uuid4().hex
     # turn_no 经 ``COUNT(*)+1`` 计算，同一会话两个并发 turn（不同 client_turn_id）
@@ -1344,7 +1445,7 @@ async def _insert_turn(
             "(turn_id, session_id, client_turn_id, user_id, turn_no, role, "
             " answer_text, status, source_type, created_at) "
             "VALUES (:turn_id, :session_id, :client_turn_id, :user_id, :turn_no, "
-            " 'user', :answer_text, 'saved', 'user_answer', UTC_TIMESTAMP())"
+            " 'user', :answer_text, 'saved', :source_type, UTC_TIMESTAMP())"
         ),
         {
             "turn_id": turn_id,
@@ -1353,6 +1454,7 @@ async def _insert_turn(
             "user_id": user_id,
             "turn_no": turn_no,
             "answer_text": answer_text,
+            "source_type": source_type,
         },
     )
     return ProfileTurn(

@@ -52,9 +52,18 @@ from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 
 from app.core.config import settings
 from app.core.security import decode_access_token
+from app.db.session import session_factory as _db_session_factory
 from app.services.ai.flags import AiFeature, require_ai_feature
 from app.services.ai.gateway import AIGateway
 from app.services.ai.base import ProviderError as AIProviderError
+from app.services.ai.profile import (
+    AIInputError as _ProfileAIInputError,
+    AIConsentRequired as _ProfileAIConsentRequired,
+    ProfileSessionNotFound as _ProfileSessionNotFound,
+    ProfileSessionStale as _ProfileSessionStale,
+    persist_voice_extract_result as _persist_voice_extract_result,
+    update_session_input_mode as _update_session_input_mode,
+)
 from app.services.voice.base import (
     STREAM_CHUNK_MAX_BYTES,
     StreamTranscribeRequest,
@@ -221,6 +230,7 @@ async def voice_conversation(
     partial_task: asyncio.Task[None] | None = None
     session_id = ""
     field_key = ""
+    profile_session_id = ""
 
     try:
         while True:
@@ -245,6 +255,35 @@ async def voice_conversation(
             if msg_type == "session_start":
                 session_id = str(message.get("session_id", ""))
                 field_key = str(message.get("field_key", ""))
+                # WP-P5：可选绑定 ai_profile_session（双模式互切）。绑定后
+                # input_mode 置 voice；断线重连携带同一 profile_session_id
+                # 即复用同一画像状态机（属主/活动校验在服务内，幂等）。
+                profile_session_id = str(message.get("profile_session_id", ""))
+                if profile_session_id and _db_session_factory is not None:
+                    try:
+                        async with _db_session_factory() as bind_db:
+                            await _update_session_input_mode(
+                                bind_db, profile_session_id, user_id, "voice"
+                            )
+                            await bind_db.commit()
+                    except (
+                        _ProfileSessionNotFound,
+                        _ProfileSessionStale,
+                        _ProfileAIInputError,
+                        _ProfileAIConsentRequired,
+                    ) as exc:
+                        logger.warning(
+                            "voice_ws_profile_bind_failed user_id=%s session=%s code=%s",
+                            user_id,
+                            profile_session_id,
+                            getattr(exc, "code", type(exc).__name__),
+                        )
+                        profile_session_id = ""
+                        await _send_error(
+                            ws,
+                            getattr(exc, "code", "AI_INPUT_INVALID"),
+                            "画像会话绑定失败，本轮抽取仅在内存回显",
+                        )
                 # 初始化编排器（mock provider 用于开发联调）。
                 orchestrator = VoiceConversationOrchestrator(
                     ai_gateway=AIGateway(),
@@ -498,6 +537,46 @@ async def voice_conversation(
                             "fields": fields_out,
                         },
                     )
+                    # WP-P5：绑定画像会话时，把抽取结果写入与文字模式相同的
+                    # 草稿/状态机（同一 _write_draft 路径）；WS 仅做实时回显，
+                    # 持久化失败不中断对话，仅告知前端未落库（draft_id 为空）。
+                    if profile_session_id and _db_session_factory is not None:
+                        transcript_text = orchestrator.transcript_text()
+                        if transcript_text.strip():
+                            try:
+                                async with _db_session_factory() as persist_db:
+                                    draft_id = await _persist_voice_extract_result(
+                                        persist_db,
+                                        profile_session_id,
+                                        user_id,
+                                        transcript_text,
+                                        f"voice-{profile_session_id[:16]}-{request_id[:16]}",
+                                        extracted,
+                                    )
+                                    await persist_db.commit()
+                                await _send_json(
+                                    ws,
+                                    {
+                                        "type": "extract_persisted",
+                                        "profile_session_id": profile_session_id,
+                                        "draft_id": draft_id,
+                                    },
+                                )
+                            except _ProfileAIInputError as exc:
+                                await _send_error(ws, exc.code, exc.message)
+                            except Exception:  # noqa: BLE001
+                                logger.warning(
+                                    "voice_ws_extract_persist_failed request_id=%s",
+                                    request_id,
+                                )
+                                await _send_json(
+                                    ws,
+                                    {
+                                        "type": "extract_persisted",
+                                        "profile_session_id": profile_session_id,
+                                        "draft_id": "",
+                                    },
+                                )
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(
                         "voice_ws_extract_failed request_id=%s err=%s",

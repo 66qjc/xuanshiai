@@ -48,6 +48,7 @@ from app.schemas.ai_profile import (
     ProfileUpdateIntentAccepted,
     ProfileUpdateIntentRequest,
     ProfilePublishedFieldsPage,
+    ProfileSessionModeRequest,
     ProfileSessionRead,
     ProfileSkipQuestionRequest,
     ProfileSubject,
@@ -72,6 +73,7 @@ from app.services.ai.profile import (
     create_profile_session,
     create_update_session,
     list_published_profile_fields,
+    update_session_input_mode,
     delete_ai_profile,
     delete_ai_profile_field,
     delete_profile_session,
@@ -295,6 +297,34 @@ async def create_update_session_route(
         turn_id=submission.turn_id,
         status=submission.status,
     )
+
+
+@router.post(
+    "/profile-sessions/{session_id}/mode",
+    response_model=ProfileSessionRead,
+    status_code=status.HTTP_200_OK,
+    summary="切换画像会话输入模式（text/voice，进度与已确认字段延续）",
+)
+async def update_session_mode_route(
+    session_id: str = Path(..., min_length=1, max_length=64, pattern=r"^[a-z0-9_]+$"),
+    body: ProfileSessionModeRequest = Body(...),
+    current: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> ProfileSessionRead:
+    """WP-P5：双模式互切——同一会话更新 input_mode（同一行状态机）。"""
+    _require_profile_feature()
+    try:
+        session = await update_session_input_mode(
+            db, session_id, current.id, body.input_mode
+        )
+    except AIInputError as exc:
+        raise _error_response(exc.code, exc.message, exc.status_code) from exc
+    except ProfileSessionNotFound as exc:
+        raise _error_response(exc.code, exc.message, exc.status_code) from exc
+    except ProfileSessionStale as exc:
+        raise _error_response(exc.code, exc.message, exc.status_code) from exc
+    await db.commit()
+    return _to_session_read(session)
 
 
 @router.get(

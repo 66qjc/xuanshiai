@@ -256,6 +256,12 @@ class ProfileSessionCreateRequest(BaseModel):
     input_mode: Literal["text"] = "text"
 
 
+class ProfileSessionModeRequest(BaseModel):
+    """WP-P5：双模式互切入参。"""
+
+    input_mode: Literal["text", "voice"] = "text"
+
+
 class ProfileUpdateIntentRequest(BaseModel):
     """WP-P4：对话式追加会话入参——自然语言期望 + 画像方向。"""
 

@@ -484,6 +484,10 @@ class VoiceConversationOrchestrator:
         )
         return result
 
+    def transcript_text(self) -> str:
+        """全部累积转写的合并文本（WP-P5 finish 落库用；clear 后为空）。"""
+        return "\n".join(self._all_transcripts)
+
     def clear_transcripts(self) -> None:
         """清空累积转写（新对话开始时调用）。"""
         self._all_transcripts.clear()

@@ -714,6 +714,8 @@ class ProfileStore:
             row["status"] = str(params["status"])
         elif "skipped_field_keys = :skipped_field_keys" in sql:
             row["skipped_field_keys"] = params.get("skipped_field_keys")
+        elif "input_mode = :input_mode" in sql:
+            row["input_mode"] = str(params["input_mode"])
         else:
             raise AssertionError(f"unhandled session update: {sql}")
         row["updated_at"] = _now()
