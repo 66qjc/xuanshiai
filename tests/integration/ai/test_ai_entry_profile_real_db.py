@@ -1,0 +1,414 @@
+"""WP-P1b entry 条目链路真实库集成测试。
+
+用真库验证三件事（fake 单测覆盖不到的持久化与 SQL 过滤语义）：
+1. 抽取 handler 在网关注入 entry 结果后，草稿落出 field_kind='entry' 行
+   （value_json 恒 NULL、正文在 content），structured 行不受影响；
+2. entry 确认/编辑走真实 PATCH 事务并持久化（commit 后新会话重读成立）；
+3. ``_load_field_keys`` 与发布门槛对 entry 的过滤防回归——entry 确认数
+   不计入题目推进、进度与发布门槛（Global Constraint）。
+"""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime
+
+import pytest
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
+
+from app.schemas.ai_common import AiConsentGrantRequest
+from app.schemas.ai_profile import (
+    ProfileDraftFieldPatchRequest,
+    ProfileFieldPatchAction,
+    ProfileSubject,
+)
+from app.services.ai import profile as profile_module
+from app.services.ai.base import ExtractedEntry, ExtractedField
+from app.services.ai.consents import grant_consent
+from app.services.ai.profile import (
+    _load_field_keys,
+    confirm_profile_draft,
+    create_profile_session,
+    extract_profile_turn,
+    publish_profile_draft,
+    submit_profile_turn,
+)
+from app.services.ai.tasks import AiTaskRecord, claim_tasks, start_task
+
+POLICY_REVISION = "ai-policy-2026-08-07-v1"
+CONSENT_VERSION = "profile-text-v1"
+USER_EXTRACT = 9_880_000_101
+USER_EDIT = 9_880_000_102
+
+
+def _now() -> datetime:
+    return datetime.now(UTC).replace(tzinfo=None, microsecond=0)
+
+
+async def _clean(db: AsyncSession, user_id: int) -> None:
+    for statement in (
+        "DELETE FROM ai_profile_draft_field WHERE draft_id IN (SELECT draft_id FROM ai_profile_draft WHERE user_id = :user_id)",
+        "DELETE FROM ai_profile_draft WHERE user_id = :user_id",
+        "DELETE FROM ai_profile_turn WHERE user_id = :user_id",
+        "DELETE FROM ai_profile_session WHERE user_id = :user_id",
+        "DELETE FROM ai_profile_summary WHERE user_id = :user_id",
+        "DELETE FROM ai_profile_revision_field WHERE revision_id IN (SELECT id FROM ai_profile_revision WHERE user_id = :user_id)",
+        "DELETE FROM ai_profile_revision WHERE user_id = :user_id",
+        "DELETE FROM ai_task WHERE owner_user_id = :user_id",
+        "DELETE FROM ai_consent_operation WHERE user_id = :user_id",
+        "DELETE FROM ai_consent_grant WHERE user_id = :user_id",
+        "DELETE FROM derivation_outbox WHERE aggregate_id = :user_id",
+        "DELETE FROM user_revision_state WHERE user_id = :user_id",
+    ):
+        await db.execute(text(statement), {"user_id": user_id})
+    await db.commit()
+
+
+class _FakeOutcome:
+    def __init__(self, result: object) -> None:
+        self.result = result
+        self.error_code = None
+        self.retryable = False
+
+
+class _FakeEntryGateway:
+    """注入 entry+structured 固定结果，替代 AIGateway.structured_extract。"""
+
+    def __init__(self, timeout_seconds: float | None = None) -> None:
+        del timeout_seconds
+
+    async def structured_extract(self, context: object, request: object) -> _FakeOutcome:
+        del context, request
+        return _FakeOutcome(_build_result())
+
+
+def _build_result():
+    from app.services.ai.base import StructuredExtractResult
+
+    return StructuredExtractResult(
+        schema_version=profile_module.PROFILE_SCHEMA_VERSION,
+        fields=(
+            ExtractedField(
+                field_key="interest_tags",
+                subject=ProfileSubject.PERSONAL,
+                value=["旅行"],
+                source_quote="周末喜欢旅行",
+                confidence=0.9,
+                schema_version=profile_module.PROFILE_SCHEMA_VERSION,
+                prompt_version=profile_module.PROFILE_PROMPT_VERSION,
+                policy_revision=POLICY_REVISION,
+            ),
+        ),
+        entries=(
+            ExtractedEntry(
+                category="values",
+                content="欣赏阳光开朗、品行端正的人",
+                subject=ProfileSubject.PERSONAL,
+                source_quote="我喜欢阳光开朗品行端正的",
+                confidence=0.88,
+                schema_version=profile_module.PROFILE_SCHEMA_VERSION,
+                prompt_version=profile_module.PROFILE_PROMPT_VERSION,
+                policy_revision=POLICY_REVISION,
+            ),
+        ),
+    )
+
+
+async def _seed_session_with_turn(
+    db: AsyncSession, user_id: int, idem_prefix: str
+) -> tuple[str, str]:
+    """Seed revision state + consent + session + turn; return (session_id, task_id)."""
+    await db.execute(
+        text(
+            "INSERT INTO user_revision_state "
+            "(user_id, profile_revision, preference_revision, privacy_revision, "
+            "relationship_revision, policy_revision) "
+            "VALUES (:user_id, 0, 0, 0, 0, 0)"
+        ),
+        {"user_id": user_id},
+    )
+    await grant_consent(
+        db,
+        user_id,
+        "profile_text_extract",
+        AiConsentGrantRequest(
+            consent_version=CONSENT_VERSION,
+            policy_revision=POLICY_REVISION,
+        ),
+        f"{idem_prefix}-grant-{user_id}",
+        0,
+    )
+    await db.commit()
+    session = await create_profile_session(
+        db, user_id, ProfileSubject.PERSONAL, CONSENT_VERSION, f"{idem_prefix}-session-{user_id}"
+    )
+    accepted = await submit_profile_turn(
+        db,
+        session.session_id,
+        user_id,
+        f"{idem_prefix}-turn-{user_id}",
+        "周末喜欢旅行，我欣赏阳光开朗品行端正的人。",
+        f"{idem_prefix}-extract-{user_id}",
+    )
+    await db.commit()
+    return session.session_id, str(accepted.task_id)
+
+
+async def _claim_and_start(
+    factory: async_sessionmaker[AsyncSession], worker_id: str
+) -> AiTaskRecord:
+    async with factory() as claim_db:
+        claimed = await claim_tasks(claim_db, worker_id, _now(), 10)
+        await claim_db.commit()
+    assert len(claimed) == 1
+    async with factory() as start_db:
+        started = await start_task(start_db, claimed[0].task_id, worker_id)
+        await start_db.commit()
+    return started
+
+
+@pytest.mark.asyncio
+async def test_real_extract_persists_entry_rows(
+    real_db_session: AsyncSession,
+    real_db_engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _clean(real_db_session, USER_EXTRACT)
+    factory = async_sessionmaker(real_db_engine, expire_on_commit=False)
+    async with factory() as seed_db:
+        session_id, _task_id = await _seed_session_with_turn(seed_db, USER_EXTRACT, "entry-x")
+
+    started = await _claim_and_start(factory, "worker-entry-a")
+
+    async with factory() as handler_db:
+        monkeypatch.setattr(profile_module, "AIGateway", _FakeEntryGateway)
+        result = await extract_profile_turn(handler_db, started, "worker-entry-a")
+        assert result is not None
+        result_ref, _revisions = result
+        assert result_ref.startswith("profile-draft:")
+        draft_id = result_ref.split(":", 1)[1]
+        # handler 不 commit；提交由 worker finalize 承担——此处显式提交等价。
+        await handler_db.commit()
+
+    async with factory() as check_db:
+        entry_row = (
+            await check_db.execute(
+                text(
+                    "SELECT field_kind, category, content, value_json, display_value, "
+                    "confirmation_status FROM ai_profile_draft_field "
+                    "WHERE draft_id = :draft_id AND field_kind = 'entry'"
+                ),
+                {"draft_id": draft_id},
+            )
+        ).one()
+        assert entry_row[0] == "entry"
+        assert entry_row[1] == "values"
+        assert entry_row[2] == "欣赏阳光开朗、品行端正的人"
+        assert entry_row[3] is None
+        assert entry_row[4] == entry_row[2]
+        assert entry_row[5] == "suggested"
+        structured_row = (
+            await check_db.execute(
+                text(
+                    "SELECT field_kind, value_json FROM ai_profile_draft_field "
+                    "WHERE draft_id = :draft_id AND field_key = 'interest_tags'"
+                ),
+                {"draft_id": draft_id},
+            )
+        ).one()
+        assert structured_row[0] == "structured"
+        assert structured_row[1] is not None
+        # entry 不进入题目推进/进度口径（_load_field_keys 的 SQL 过滤）。
+        field_keys, confirmed_keys = await _load_field_keys(check_db, session_id)
+        entry_keys = {k for k in field_keys if k.startswith("entry_")}
+        assert not entry_keys
+        assert "interest_tags" in field_keys
+        assert "interest_tags" not in confirmed_keys  # 仍是 suggested
+
+    # 共享测试库纪律：清掉本测试的全部行（含 running 态 task），否则
+    # 迁移 down 守卫（refusing down while AI tasks are active）与其他
+    # 测试的 claim 断言会被残留行污染。
+    async with factory() as cleanup_db:
+        await _clean(cleanup_db, USER_EXTRACT)
+
+
+@pytest.mark.asyncio
+async def test_real_entry_edit_and_publish_threshold(
+    real_db_session: AsyncSession,
+    real_db_engine: AsyncEngine,
+) -> None:
+    await _clean(real_db_session, USER_EDIT)
+    factory = async_sessionmaker(real_db_engine, expire_on_commit=False)
+    draft_id = f"dr-entry-{USER_EDIT % 100000}"
+    session_id = f"sess-entry-{USER_EDIT % 100000}"
+
+    async with factory() as seed_db:
+        await seed_db.execute(
+            text(
+                "INSERT INTO user_revision_state "
+                "(user_id, profile_revision, preference_revision, privacy_revision, "
+                "relationship_revision, policy_revision) VALUES (:user_id, 0, 0, 0, 0, 0)"
+            ),
+            {"user_id": USER_EDIT},
+        )
+        await seed_db.execute(
+            text(
+                "INSERT INTO ai_profile_session "
+                "(session_id, user_id, subject, status, input_mode, consent_version, "
+                " policy_revision, active_status, created_at, updated_at) "
+                "VALUES (:session_id, :user_id, 'personal', 'awaiting_confirmation', "
+                " 'text', :consent_version, :policy_revision, 1, UTC_TIMESTAMP(), UTC_TIMESTAMP())"
+            ),
+            {
+                "session_id": session_id,
+                "user_id": USER_EDIT,
+                "consent_version": CONSENT_VERSION,
+                "policy_revision": POLICY_REVISION,
+            },
+        )
+        await seed_db.execute(
+            text(
+                "INSERT INTO ai_profile_draft "
+                "(draft_id, user_id, subject, session_id, status, expected_revision, "
+                " policy_revision, schema_version, created_at, updated_at) "
+                "VALUES (:draft_id, :user_id, 'personal', :session_id, 'draft', 0, "
+                " :policy_revision, 'profile-extract-v1', UTC_TIMESTAMP(), UTC_TIMESTAMP())"
+            ),
+            {
+                "draft_id": draft_id,
+                "user_id": USER_EDIT,
+                "session_id": session_id,
+                "policy_revision": POLICY_REVISION,
+            },
+        )
+        structured = [
+            ("interest_tags", '["看展"]', "看展", "confirmed"),
+            ("city_code", '"330100"', "杭州", "confirmed"),
+            ("occupation_group", '"technology"', "互联网", "confirmed"),
+            ("education_level", "4", "本科", "confirmed"),
+            ("height_cm", "175", "175", "confirmed"),
+            ("income_band", '"high"', "高", "confirmed"),
+            ("marriage_status", '"single"', "单身", "suggested"),
+        ]
+        for key, value_json, display, status in structured:
+            await seed_db.execute(
+                text(
+                    "INSERT INTO ai_profile_draft_field "
+                    "(draft_id, field_key, subject, field_kind, value_json, display_value, "
+                    " confidence, content_hash, confirmation_status, created_at, updated_at) "
+                    "VALUES (:draft_id, :field_key, 'personal', 'structured', :value_json, "
+                    " :display_value, 0.9, :content_hash, :status, UTC_TIMESTAMP(), UTC_TIMESTAMP())"
+                ),
+                {
+                    "draft_id": draft_id,
+                    "field_key": key,
+                    "value_json": value_json,
+                    "display_value": display,
+                    "content_hash": f"hash-{key}",
+                    "status": status,
+                },
+            )
+        for idx, category in enumerate(("values", "interests", "life_plan")):
+            await seed_db.execute(
+                text(
+                    "INSERT INTO ai_profile_draft_field "
+                    "(draft_id, field_key, subject, field_kind, category, content, "
+                    " value_json, display_value, confidence, content_hash, "
+                    " confirmation_status, created_at, updated_at) "
+                    "VALUES (:draft_id, :field_key, 'personal', 'entry', :category, :content, "
+                    " NULL, :content, 0.88, :content_hash, 'suggested', "
+                    " UTC_TIMESTAMP(), UTC_TIMESTAMP())"
+                ),
+                {
+                    "draft_id": draft_id,
+                    "field_key": f"entry_{category}_0000000{idx}",
+                    "category": category,
+                    "content": f"条目内容 {idx}",
+                    "content_hash": f"hash-entry-{idx}",
+                },
+            )
+        await seed_db.commit()
+
+    # 确认 + 编辑两个 entry：走真实 PATCH 事务（成功路径由本测试显式提交）。
+    async with factory() as act_db:
+        await confirm_profile_draft(
+            act_db,
+            draft_id,
+            USER_EDIT,
+            [
+                ProfileDraftFieldPatchRequest(
+                    field_key="entry_values_00000000",
+                    action=ProfileFieldPatchAction.CONFIRM,
+                    expected_revision=0,
+                ),
+                ProfileDraftFieldPatchRequest(
+                    field_key="entry_interests_00000001",
+                    action=ProfileFieldPatchAction.REPLACE,
+                    value="喜欢户外、露营和看展",
+                    expected_revision=0,
+                ),
+            ],
+            expected_revision=0,
+        )
+        await act_db.commit()
+
+    async with factory() as check_db:
+        rows = (
+            await check_db.execute(
+                text(
+                    "SELECT field_key, confirmation_status, content, content_hash "
+                    "FROM ai_profile_draft_field WHERE draft_id = :draft_id "
+                    "AND field_kind = 'entry' ORDER BY field_key"
+                ),
+                {"draft_id": draft_id},
+            )
+        ).all()
+        by_key = {row[0]: row for row in rows}
+        assert by_key["entry_values_00000000"][1] == "confirmed"
+        assert by_key["entry_values_00000000"][2] == "条目内容 0"
+        assert by_key["entry_interests_00000001"][1] == "confirmed"
+        assert by_key["entry_interests_00000001"][2] == "喜欢户外、露营和看展"
+        assert by_key["entry_interests_00000001"][3] != "hash-entry-1"
+        # 已确认的 entry 仍不出现在进度/门槛口径（_load_field_keys 过滤）。
+        _field_keys, confirmed_keys = await _load_field_keys(check_db, session_id)
+        assert not {k for k in confirmed_keys if k.startswith("entry_")}
+        assert confirmed_keys == {
+            "interest_tags",
+            "city_code",
+            "occupation_group",
+            "education_level",
+            "height_cm",
+            "income_band",
+        }
+
+    # 6 个 structured 确认 + 2 个 entry 确认：门槛不满足（entry 不计入）。
+    async with factory() as gate_db:
+        with pytest.raises(profile_module.AIInputError):
+            await publish_profile_draft(
+                gate_db, draft_id, USER_EDIT, expected_revision=1,
+                idempotency_key="entry-gate-publish",
+            )
+        # 补齐第 7 个 structured 确认后发布成立。
+        await confirm_profile_draft(
+            gate_db,
+            draft_id,
+            USER_EDIT,
+            [
+                ProfileDraftFieldPatchRequest(
+                    field_key="marriage_status",
+                    action=ProfileFieldPatchAction.CONFIRM,
+                    expected_revision=1,
+                )
+            ],
+            expected_revision=1,
+        )
+        submission = await publish_profile_draft(
+            gate_db, draft_id, USER_EDIT, expected_revision=2,
+            idempotency_key="entry-ok-publish",
+        )
+        await gate_db.commit()
+        assert submission.task_id
+
+    # 同上：发布入队的 projection/cleanup 任务一并清理，不留活跃任务。
+    async with factory() as cleanup_db:
+        await _clean(cleanup_db, USER_EDIT)

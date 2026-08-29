@@ -22,6 +22,7 @@ from app.core.config import settings
 from app.schemas.ai_profile import ProfileSubject
 from app.services.ai.base import (
     AIProvider,
+    ExtractedEntry,
     ExtractedField,
     ModerationRequest,
     ModerationResult,
@@ -879,9 +880,34 @@ class _OpenAICompatProvider:
                     policy_revision=request.policy_revision,
                 )
             )
+        # WP-P1：条目通道。category/content 由 ExtractedEntry 的 Pydantic
+        # 校验把关（9 枚举 + ≤200 字）；非法条目整条丢弃，不让坏数据进草稿。
+        entries_data = data.get("entries", []) if isinstance(data, dict) else []
+        entries: list[ExtractedEntry] = []
+        for item in entries_data:
+            if not isinstance(item, dict):
+                continue
+            try:
+                entries.append(
+                    ExtractedEntry(
+                        category=item.get("category", ""),
+                        content=item.get("content", ""),
+                        subject=subject,
+                        source_quote=item.get("source_quote"),
+                        confidence=_safe_confidence(item.get("confidence")),
+                        needs_confirmation=True,
+                        confirmation_status="suggested",
+                        schema_version=_PROFILE_SCHEMA_VERSION,
+                        prompt_version=_PROFILE_PROMPT_VERSION,
+                        policy_revision=request.policy_revision,
+                    )
+                )
+            except ValidationError:
+                continue
         return StructuredExtractResult(
             schema_version=_PROFILE_SCHEMA_VERSION,
             fields=tuple(fields),
+            entries=tuple(entries),
         )
 
     async def parse_search_query(

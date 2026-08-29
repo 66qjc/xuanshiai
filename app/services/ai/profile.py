@@ -56,6 +56,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.schemas.ai_common import AI_FIELD_ALLOWLIST, AiTaskStatus, ProjectionKind
 from app.schemas.ai_profile import (
+    PROFILE_ENTRY_CATEGORIES,
+    PROFILE_ENTRY_CONTENT_MAX_LENGTH,
     ProfileFieldConfirmationStatus,
     ProfileFieldPatchAction,
     ProfileQuestion,
@@ -67,6 +69,7 @@ from app.schemas.ai_profile import (
 )
 from app.services.ai.base import (
     AITaskContext,
+    ExtractedEntry,
     ExtractedField,
     NarrativeRequest,
     StructuredExtractRequest,
@@ -258,7 +261,8 @@ _DRAFT_COLUMNS = (
     "expires_at, created_at, updated_at"
 )
 _DRAFT_FIELD_COLUMNS = (
-    "draft_id, field_key, subject, value_json, display_value, source_type, "
+    "draft_id, field_key, subject, field_kind, category, content, "
+    "replaces_field_key, value_json, display_value, source_type, "
     "source_turn_ids, source_span, confidence, visibility, consent_scope, schema_version, "
     "prompt_version, content_hash, confirmation_status, created_at, updated_at"
 )
@@ -510,6 +514,12 @@ class ProfileDraftField:
 
     field_key: str
     subject: str
+    # WP-P1：条目语义。structured 行恒为默认值，旧调用方零感知；entry 行
+    # value 恒为 None，正文在 content，category 受 9 枚举约束。
+    field_kind: str = "structured"
+    category: str | None = None
+    content: str | None = None
+    replaces_field_key: str | None = None
     value: Any = None
     display_value: str | None = None
     source_type: str | None = None
@@ -787,13 +797,20 @@ async def _load_revision_vector(db: AsyncSession, user_id: int) -> RevisionVecto
 async def _load_field_keys(
     db: AsyncSession, session_id: str
 ) -> tuple[frozenset[str], frozenset[str]]:
-    """Return (non-deleted field keys, confirmed field keys) of a session draft."""
+    """Return (non-deleted field keys, confirmed field keys) of a session draft.
+
+    只统计 structured 字段：entry 条目不计入题目推进（field_keys）与进度/
+    门槛（confirmed_keys）——条目是丰富度增强，不改变建构门槛边界（WP-P1
+    Global Constraint；集成测试在 _load_field_keys 消费处防回归）。
+    """
     result = await db.execute(
         text(
             "SELECT df.field_key, df.confirmation_status "
             "FROM ai_profile_draft_field df "
             "JOIN ai_profile_draft d ON d.draft_id = df.draft_id "
-            "WHERE d.session_id = :session_id AND df.confirmation_status <> 'deleted'"
+            "WHERE d.session_id = :session_id "
+            "AND df.confirmation_status <> 'deleted' "
+            "AND df.field_kind = 'structured'"
         ),
         {"session_id": session_id},
     )
@@ -1346,6 +1363,26 @@ def _incoming_extract_fields(result: Any) -> tuple[Any, ...]:
     return tuple(getattr(result, "fields", ()) or ())
 
 
+def _incoming_extract_entries(result: Any) -> tuple[Any, ...]:
+    return tuple(getattr(result, "entries", ()) or ())
+
+
+def validate_entry_content(content: Any) -> str:
+    """entry 正文校验：1..200 字非空白文本，超限/类型错误 AI_INPUT_INVALID。
+
+    服务层校验与 DB VARCHAR(200) 构成双保险；strip 后落库，保证
+    entry_digest 与读取端拿到的是归一化正文。
+    """
+    if not isinstance(content, str):
+        raise AIInputError("entry content 必须是文本")
+    normalized = content.strip()
+    if not 1 <= len(normalized) <= PROFILE_ENTRY_CONTENT_MAX_LENGTH:
+        raise AIInputError(
+            f"entry content 长度须为 1..{PROFILE_ENTRY_CONTENT_MAX_LENGTH} 字"
+        )
+    return normalized
+
+
 def _fallback_tag_field(session: ProfileSession, turn: ProfileTurn) -> ExtractedField | None:
     """口语化回答抽不出字段时，把本轮所问的标签字段写成 suggested。"""
     question = session.current_question
@@ -1384,10 +1421,12 @@ async def _copy_unreplaced_draft_fields(
         await db.execute(
             text(
                 "INSERT INTO ai_profile_draft_field "
-                "(draft_id, field_key, subject, value_json, display_value, source_type, "
+                "(draft_id, field_key, subject, field_kind, category, content, "
+                " replaces_field_key, value_json, display_value, source_type, "
                 " source_turn_ids, source_span, confidence, visibility, consent_scope, schema_version, "
                 " prompt_version, content_hash, confirmation_status, created_at, updated_at) "
-                "VALUES (:draft_id, :field_key, :subject, :value_json, :display_value, "
+                "VALUES (:draft_id, :field_key, :subject, :field_kind, :category, :content, "
+                " :replaces_field_key, :value_json, :display_value, "
                 " :source_type, :source_turn_ids, :source_span, :confidence, :visibility, "
                 " :consent_scope, :schema_version, :prompt_version, :content_hash, "
                 " :confirmation_status, UTC_TIMESTAMP(), UTC_TIMESTAMP())"
@@ -1396,6 +1435,10 @@ async def _copy_unreplaced_draft_fields(
                 "draft_id": target_draft_id,
                 "field_key": field_key,
                 "subject": row.get("subject"),
+                "field_kind": row.get("field_kind") or "structured",
+                "category": row.get("category"),
+                "content": row.get("content"),
+                "replaces_field_key": row.get("replaces_field_key"),
                 "value_json": (
                     row.get("value_json")
                     if isinstance(row.get("value_json"), str)
@@ -1502,6 +1545,48 @@ async def _write_draft(
             },
         )
         written_keys.add(field.field_key)
+    # WP-P1：条目候选写入。entry 的 field_key 在写入层生成（provider 不产出），
+    # 形如 entry_{category}_{8hex}，满足 (draft_id, field_key) 唯一键；
+    # value_json 恒 NULL，正文在 content，门槛/进度不消费（_load_field_keys 过滤）。
+    for entry in _incoming_extract_entries(result):
+        subject = session.subject.value
+        content = validate_entry_content(getattr(entry, "content", None))
+        category = getattr(entry, "category", "")
+        if category not in PROFILE_ENTRY_CATEGORIES:
+            raise AIInputError("entry category 非法")
+        entry_key = f"entry_{category}_{uuid.uuid4().hex[:8]}"
+        entry_turn_ids = (turn.turn_id,)
+        await db.execute(
+            text(
+                "INSERT INTO ai_profile_draft_field "
+                "(draft_id, field_key, subject, field_kind, category, content, "
+                " value_json, display_value, source_type, "
+                " source_turn_ids, source_span, confidence, visibility, consent_scope, "
+                " schema_version, prompt_version, content_hash, confirmation_status, "
+                " created_at, updated_at) "
+                "VALUES (:draft_id, :field_key, :subject, 'entry', :category, :content, "
+                " NULL, :display_value, 'user_answer', :source_turn_ids, :source_span, "
+                " :confidence, 'self', :consent_scope, :schema_version, :prompt_version, "
+                " :content_hash, 'suggested', UTC_TIMESTAMP(), UTC_TIMESTAMP())"
+            ),
+            {
+                "draft_id": draft_id,
+                "field_key": entry_key,
+                "subject": subject,
+                "category": category,
+                "content": content,
+                "display_value": content,
+                "source_turn_ids": json.dumps(list(entry_turn_ids), ensure_ascii=False),
+                "source_span": getattr(entry, "source_span", None)
+                or getattr(entry, "source_quote", None),
+                "confidence": float(entry.confidence),
+                "consent_scope": consent_scope,
+                "schema_version": getattr(entry, "schema_version", None)
+                or PROFILE_SCHEMA_VERSION,
+                "prompt_version": PROFILE_PROMPT_VERSION,
+                "content_hash": _content_hash(entry_key, subject, content, entry_turn_ids),
+            },
+        )
     previous_draft_id = session.draft_id
     if previous_draft_id:
         await _copy_unreplaced_draft_fields(
@@ -1636,7 +1721,45 @@ async def extract_profile_turn(
                 raise ValueError("provider confirmation status is not suggested")
             if not field.needs_confirmation:
                 raise ValueError("provider field does not require confirmation")
-        if not fields:
+        # entry 与 structured 字段同一套边界复核纪律：provider 适配器可能用
+        # model_construct 绕过校验，写入层绝不静默放行非法条目。
+        entries = tuple(outcome.result.entries)
+        for entry in entries:
+            if not isinstance(entry.subject, ProfileSubject):
+                raise TypeError("provider subject is not typed")
+            if entry.subject is not expected_subject:
+                raise ValueError("provider subject does not match session")
+            if entry.schema_version != PROFILE_SCHEMA_VERSION:
+                raise ValueError("provider schema version does not match")
+            if entry.prompt_version != PROFILE_PROMPT_VERSION:
+                raise ValueError("provider prompt version does not match")
+            if entry.policy_revision != expected_policy_revision:
+                raise ValueError("provider policy revision does not match")
+            if entry.category not in PROFILE_ENTRY_CATEGORIES:
+                raise ValueError("provider entry category is not in the allowlist")
+            validate_entry_content(entry.content)
+            if isinstance(entry.confidence, bool):
+                raise TypeError("provider confidence must be numeric")
+            confidence = float(entry.confidence)
+            if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
+                raise ValueError("provider confidence is outside the allowed range")
+            entry_span = getattr(entry, "source_span", None)
+            entry_quote = getattr(entry, "source_quote", None)
+            if entry_span is not None and not isinstance(entry_span, str):
+                raise ValueError("provider source span must be text")
+            if entry_quote is not None and not isinstance(entry_quote, str):
+                raise ValueError("provider source quote must be text")
+            if (
+                entry_span is not None
+                and entry_quote is not None
+                and entry_span != entry_quote
+            ):
+                raise ValueError("provider source evidence does not agree")
+            if entry.confirmation_status != ProfileFieldConfirmationStatus.SUGGESTED.value:
+                raise ValueError("provider entry confirmation status is not suggested")
+            if not entry.needs_confirmation:
+                raise ValueError("provider entry does not require confirmation")
+        if not fields and not entries:
             fallback = _fallback_tag_field(session, turn)
             if fallback is None:
                 raise ValueError("provider returned no extractable fields")
@@ -2017,6 +2140,10 @@ def _draft_field_from_row(row: dict[str, Any]) -> ProfileDraftField:
     return ProfileDraftField(
         field_key=str(row["field_key"]),
         subject=str(row["subject"]),
+        field_kind=str(row.get("field_kind") or "structured"),
+        category=row.get("category"),
+        content=row.get("content"),
+        replaces_field_key=row.get("replaces_field_key"),
         value=_maybe_json(row.get("value_json")),
         display_value=row.get("display_value"),
         source_type=str(row.get("source_type") or "user_answer"),
@@ -2056,6 +2183,10 @@ def _draft_response_payload(draft: ProfileDraft) -> dict[str, Any]:
             {
                 "field_key": item.field_key,
                 "subject": item.subject,
+                "field_kind": item.field_kind,
+                "category": item.category,
+                "content": item.content,
+                "replaces_field_key": item.replaces_field_key,
                 "value": item.value,
                 "display_value": item.display_value,
                 "source_type": item.source_type,
@@ -2217,9 +2348,17 @@ async def confirm_profile_draft(
     for action in actions:
         if action.expected_revision != draft.revision:
             raise DraftVersionConflict()
-        if action.field_key not in AI_FIELD_ALLOWLIST:
+        existing_field = next(
+            (f for f in draft.fields if f.field_key == action.field_key), None
+        )
+        is_entry = existing_field is not None and existing_field.field_kind == "entry"
+        # entry 的 field_key 由服务端生成（entry_{category}_{hex}），不在
+        # structured allowlist；其可编辑性只取决于该键是否存在于当前草稿。
+        if is_entry:
+            pass
+        elif action.field_key not in AI_FIELD_ALLOWLIST:
             raise AIInputError(f"field {action.field_key} 不在可编辑字段白名单内")
-        if action.field_key not in known:
+        elif action.field_key not in known:
             raise AIInputError(f"field {action.field_key} 不存在于当前草稿")
         if action.action is ProfileFieldPatchAction.CONFIRM:
             await _update_draft_field_status(
@@ -2227,6 +2366,34 @@ async def confirm_profile_draft(
             )
             applied += 1
         elif action.action is ProfileFieldPatchAction.REPLACE:
+            if is_entry:
+                # entry 编辑 = 改 content 并重算 content_hash（WP-P1）；分类
+                # 不可改——改分类语义等于删除+新增，走显式 delete/add 流程。
+                new_content = validate_entry_content(action.value)
+                new_hash = _content_hash(
+                    action.field_key,
+                    draft.subject,
+                    new_content,
+                    existing_field.source_turn_ids,
+                )
+                await db.execute(
+                    text(
+                        "UPDATE ai_profile_draft_field "
+                        "SET content = :content, display_value = :display_value, "
+                        "content_hash = :content_hash, "
+                        "confirmation_status = 'confirmed', updated_at = UTC_TIMESTAMP() "
+                        "WHERE draft_id = :draft_id AND field_key = :field_key"
+                    ),
+                    {
+                        "content": new_content,
+                        "display_value": new_content,
+                        "content_hash": new_hash,
+                        "draft_id": draft_id,
+                        "field_key": action.field_key,
+                    },
+                )
+                applied += 1
+                continue
             normalized_value = _validate_and_normalize_replace_value(
                 draft.subject, action.field_key, action.value
             )
@@ -2417,16 +2584,29 @@ async def insert_immutable_profile_revision(
     for field in fields:
         if field.confirmation_status != ProfileFieldConfirmationStatus.CONFIRMED.value:
             raise AIInputError("only confirmed fields can be published")
-        if field.subject != subject or field.field_key not in AI_FIELD_ALLOWLIST:
+        is_entry = field.field_kind == "entry"
+        if is_entry:
+            # entry 的 field_key 是服务端生成的 entry_{category}_{hex}，不在
+            # structured allowlist；合法性由抽取/编辑边界的分类与 200 字校验
+            # 承担，发布层只复核主体一致与正文存在（WP-P1）。
+            if field.subject != subject or field.category not in PROFILE_ENTRY_CATEGORIES:
+                raise AIInputError(
+                    "published entry is outside the draft subject/category contract"
+                )
+            if not field.content:
+                raise AIInputError("published entry is missing content")
+        elif field.subject != subject or field.field_key not in AI_FIELD_ALLOWLIST:
             raise AIInputError("published field is outside the draft subject allowlist")
         changed_keys.append(field.field_key)
         await db.execute(
             text(
                 "INSERT INTO ai_profile_revision_field "
-                "(revision_id, field_key, subject, value_json, display_value, confidence, "
+                "(revision_id, field_key, subject, field_kind, category, content, "
+                " replaces_field_key, value_json, display_value, confidence, "
                 " source_type, source_turn_ids, source_span, content_hash, schema_version, prompt_version, "
                 " created_at) "
-                "VALUES (:revision_id, :field_key, :subject, :value_json, :display_value, "
+                "VALUES (:revision_id, :field_key, :subject, :field_kind, :category, :content, "
+                " :replaces_field_key, :value_json, :display_value, "
                 " :confidence, :source_type, :source_turn_ids, :source_span, :content_hash, "
                 " :schema_version, :prompt_version, :created_at)"
             ),
@@ -2434,7 +2614,15 @@ async def insert_immutable_profile_revision(
                 "revision_id": revision_id,
                 "field_key": field.field_key,
                 "subject": subject,
-                "value_json": json.dumps(field.value, ensure_ascii=False),
+                "field_kind": field.field_kind,
+                "category": field.category,
+                "content": field.content,
+                "replaces_field_key": field.replaces_field_key,
+                # entry 的 value_json 恒为 NULL（正文在 content），structured
+                # 行保持既有 JSON 序列化不变。
+                "value_json": (
+                    None if is_entry else json.dumps(field.value, ensure_ascii=False)
+                ),
                 "display_value": field.display_value,
                 "confidence": field.confidence,
                 "source_type": field.source_type or "user_answer",
@@ -2583,7 +2771,12 @@ async def publish_profile_draft(
     ensure_revision(draft.revision, expected_revision)
     fields = confirmed_fields(draft)
     min_fields = min_confirmed_fields_to_publish()
-    if len(fields) < min_fields:
+    # WP-P1 锁定语义：发布门槛只数 structured 确认字段，entry 条目不计入
+    # （条目是丰富度增强，不改变建构门槛边界；测试在消费处防回归）。
+    structured_confirmed_count = sum(
+        1 for field in fields if field.field_kind == "structured"
+    )
+    if structured_confirmed_count < min_fields:
         raise AIInputError(
             f"at least {min_fields} confirmed fields are required"
         )

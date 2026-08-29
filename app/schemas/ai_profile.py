@@ -25,6 +25,45 @@ class ProfileSubject(str, Enum):
     IDEAL_PARTNER = "ideal_partner"
 
 
+# ----------------------------------------------------------------------
+# WP-P1 / F4：条目（entry）分类契约
+# ----------------------------------------------------------------------
+# 分类冻结为 9 个 slug，前后端与 prompt 共用同一常量；越界一律
+# AI_INPUT_INVALID（服务层）或 ValidationError（provider 边界）。
+# entry 不计入发布门槛与进度——条目是丰富度增强，不改变建构门槛边界。
+PROFILE_ENTRY_CATEGORIES: frozenset[str] = frozenset(
+    {
+        "basics",
+        "occupation",
+        "appearance",
+        "personality",
+        "values",
+        "interests",
+        "routine",
+        "diet",
+        "life_plan",
+    }
+)
+
+# 分类中文标签：读取端分组展示与 entry_digest 摘要行前缀共用。
+PROFILE_ENTRY_CATEGORY_LABELS: Mapping[str, str] = MappingProxyType(
+    {
+        "basics": "基本情况",
+        "occupation": "工作状态",
+        "appearance": "外形特征",
+        "personality": "性格特征",
+        "values": "价值观",
+        "interests": "兴趣爱好",
+        "routine": "作息习惯",
+        "diet": "饮食习惯",
+        "life_plan": "生活规划",
+    }
+)
+
+# entry 单条正文上限：服务层校验 + DB VARCHAR(200) 双保险。
+PROFILE_ENTRY_CONTENT_MAX_LENGTH = 200
+
+
 class NumericPreferenceRange(BaseModel):
     """One-sided or two-sided numeric preference, always serialized as min/max."""
 
@@ -265,6 +304,12 @@ class ProfileDraftFieldRead(BaseModel):
     needs_confirmation: bool = True
     confirmation_status: ProfileFieldConfirmationStatus
     content_hash: str | None = None
+    # WP-P1 加法字段：条目（entry）语义。structured 字段恒为默认值，
+    # 旧前端零感知；entry 行带 category/content，value 恒为 None。
+    field_kind: str = Field(default="structured", pattern="^(structured|entry)$")
+    category: str | None = None
+    content: str | None = None
+    replaces_field_key: str | None = None
 
 
 class ProfileDraftRead(BaseModel):

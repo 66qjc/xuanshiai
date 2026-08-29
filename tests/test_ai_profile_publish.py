@@ -556,6 +556,12 @@ class ProfileStore(Task7ProfileStore):
                     field["display_value"] = params.get("display_value")
                     field["content_hash"] = params.get("content_hash")
                     field["confirmation_status"] = "confirmed"
+                elif "SET content = :content" in sql:
+                    # WP-P1 entry 编辑：改 content/display_value 并重算 content_hash。
+                    field["content"] = params.get("content")
+                    field["display_value"] = params.get("display_value")
+                    field["content_hash"] = params.get("content_hash")
+                    field["confirmation_status"] = "confirmed"
                 field["updated_at"] = _now()
                 return True
         return False

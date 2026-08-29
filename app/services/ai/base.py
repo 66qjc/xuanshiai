@@ -15,6 +15,8 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.schemas.ai_common import AI_FIELD_ALLOWLIST
 from app.schemas.ai_profile import (
+    PROFILE_ENTRY_CATEGORIES,
+    PROFILE_ENTRY_CONTENT_MAX_LENGTH,
     ProfileFieldConfirmationStatus,
     ProfileSubject,
     normalize_profile_extracted_value,
@@ -71,11 +73,55 @@ class ExtractedField(BaseModel):
         return self
 
 
+class ExtractedEntry(BaseModel):
+    """One free-text profile entry candidate（WP-P1 条目模型）.
+
+    与 ``ExtractedField`` 同一套 provenance 纪律：只准从用户原话归纳
+    （faithfulness），必须携带 source_quote/span 证据并等待用户确认。
+    ``category`` 受 9 枚举冻结约束；``content`` ≤200 字（DB VARCHAR(200)
+    双保险）。entry 的 ``field_key`` 由草稿写入层生成，provider 不产出。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    category: str = Field(..., min_length=1, max_length=32)
+    content: str = Field(..., min_length=1, max_length=PROFILE_ENTRY_CONTENT_MAX_LENGTH)
+    subject: ProfileSubject
+    source_quote: str | None = None
+    source_span: str | None = Field(default=None, max_length=500)
+    source_turn_ids: tuple[str, ...] = ()
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+    needs_confirmation: bool = True
+    confirmation_status: str = Field(
+        default=ProfileFieldConfirmationStatus.SUGGESTED.value,
+        pattern="^suggested$",
+    )
+    schema_version: str = Field(default="profile-extract-v1", min_length=1, max_length=32)
+    prompt_version: str = Field(default="profile-extract-prompt-v1", min_length=1, max_length=32)
+    policy_revision: str = Field(default="ai-policy-2026-08-07-v1", min_length=1, max_length=64)
+
+    @model_validator(mode="after")
+    def validate_entry_category_and_provenance(self) -> ExtractedEntry:
+        if self.category not in PROFILE_ENTRY_CATEGORIES:
+            raise ValueError("entry category is not in the frozen allowlist")
+        if not self.content.strip():
+            raise ValueError("entry content must not be blank")
+        if self.source_span is None:
+            self.source_span = self.source_quote
+        elif self.source_quote is not None and self.source_quote != self.source_span:
+            raise ValueError("source_quote and source_span must agree")
+        if not self.needs_confirmation:
+            raise ValueError("provider entries must require confirmation")
+        return self
+
+
 class StructuredExtractResult(BaseModel):
     """Typed provider result for profile extraction (统一方案 §6.2 shape)."""
 
     schema_version: str = "profile-extract-v1"
     fields: tuple[ExtractedField, ...] = ()
+    # WP-P1 加法通道：条目候选。默认空 tuple，既有 provider/fake 零感知。
+    entries: tuple[ExtractedEntry, ...] = ()
     unknown_or_ambiguous: tuple[str, ...] = ()
 
 

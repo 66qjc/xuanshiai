@@ -101,10 +101,10 @@ replaces_field_key VARCHAR(64) DEFAULT NULL     -- entry 改写时指向被替�
 - **entry 不计入 publish 门槛与进度**（见 Global Constraints；在 `confirmed_fields` / `progress_value` 消费处加断言测试防回归）。
 
 **Steps:**
-- [ ] RED（单测）：fake 抽取产出 entry → 出现于草稿候选；确认后 `confirmation_status='confirmed'`；编辑 201 字返回 `AI_INPUT_INVALID`；非法分类返回 `AI_INPUT_INVALID`；`progress_value` 不受 entry confirmed 影响（门槛断言）。
-- [ ] GREEN：实现抽取/确认/编辑路径。
-- [ ] RED（集成）：真库写入 entry 字段行 → confirm → rollback 后重读持久化成立（沿用阶段0+1 的 rollback-then-assert 模式）。
-- [ ] 全量回归（重点 `tests/test_ai_profile*.py` structured 路径零变化）。
+- [x] RED（单测）：fake 抽取产出 entry → 出现于草稿候选；确认后 `confirmation_status='confirmed'`；编辑 201 字返回 `AI_INPUT_INVALID`；非法分类返回 `AI_INPUT_INVALID`；`progress_value` 不受 entry confirmed 影响（门槛断言）。
+- [x] GREEN：实现抽取/确认/编辑路径。
+- [x] RED（集成）：真库写入 entry 字段行 → confirm → rollback 后重读持久化成立（沿用阶段0+1 的 rollback-then-assert 模式）。
+- [x] 全量回归（重点 `tests/test_ai_profile*.py` structured 路径零变化）。
 
 **验收（方案 WP-P1 前半）：** 创建会话→答出 entry（如"价值观：欣赏阳光开朗、品行端正的人"）→确认→草稿含该条目；单条可编辑且 200 字上限生效；旧结构化字段回归全绿。
 **Commit:** `feat(profile): entry 条目抽取、确认与编辑链路（200字上限+分类枚举）`

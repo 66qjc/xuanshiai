@@ -198,6 +198,12 @@ def _to_draft_read(draft: ProfileDraft) -> ProfileDraftRead:
                     field.confirmation_status
                 ),
                 content_hash=field.content_hash,
+                # WP-P1 加法透传：structured 行恒为默认值，entry 行带
+                # category/content，旧前端零感知。
+                field_kind=field.field_kind,
+                category=field.category,
+                content=field.content,
+                replaces_field_key=field.replaces_field_key,
             )
             for field in draft.fields
         ],

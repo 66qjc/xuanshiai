@@ -64,6 +64,32 @@ _JSON_FORMAT_INSTRUCTION = (
     "}"
 )
 
+# WP-P1：条目（entry）抽取通道。faithfulness 是硬约束——条目只能是对用户
+# 原话的归纳或原句摘录，禁止编造用户没有表达过的偏好、细节或推论。
+_ENTRY_GUIDE = (
+    "除 fields 外，你还可以输出 \"entries\" 数组，把无法落入预设字段、"
+    "但能体现用户特点的原话归纳为自由条目。规则：\n"
+    "  - category 只能取：basics（基本情况）/ occupation（工作状态）/ "
+    "appearance（外形特征）/ personality（性格特征）/ values（价值观）/ "
+    "interests（兴趣爱好）/ routine（作息习惯）/ diet（饮食习惯）/ "
+    "life_plan（生活规划）；\n"
+    "  - content 是对用户原话的紧凑归纳或原句摘录，1 到 200 字；\n"
+    "  - 只准基于用户本轮原话归纳，禁止编造、引申或补充用户没有说过的内容；\n"
+    "  - 同样必须附带 source_quote（用户原文片段）和 confidence；\n"
+    "  - 用户没有表达可归纳内容时 entries 输出空数组。\n"
+)
+
+_ENTRY_JSON_EXAMPLE = (
+    "  \"entries\": [\n"
+    "    {\n"
+    "      \"category\": \"values\",\n"
+    "      \"content\": \"欣赏阳光开朗、品行端正的人\",\n"
+    "      \"source_quote\": \"我喜欢阳光开朗品行端正的\",\n"
+    "      \"confidence\": 0.88\n"
+    "    }\n"
+    "  ]"
+)
+
 
 def build_profile_extract_prompt(
     subject: str,
@@ -105,6 +131,11 @@ def build_profile_extract_prompt(
         f"当前抽取目标：{subject_label}。\n"
         f"可抽取的字段及其值格式：\n{field_lines}\n\n"
         f"{target_block}"
-        f"{_JSON_FORMAT_INSTRUCTION}\n\n"
+        f"{_JSON_FORMAT_INSTRUCTION}\n"
+        "根对象还可以包含一个 \"entries\" 数组（可选），示例：\n"
+        "{\n"
+        f"{_ENTRY_JSON_EXAMPLE}\n"
+        "}\n\n"
+        f"{_ENTRY_GUIDE}\n\n"
         f"以下是用户的会话回答：\n{turn_block}"
     )
