@@ -47,6 +47,7 @@ from app.api.routes import (
     social,
     users,
     voice,
+    voice_moxiang,
     voice_ws,
 )
 
@@ -105,6 +106,9 @@ api_router.include_router(ai_search.router, prefix="/ai", tags=["AI"])
 api_router.include_router(ai_compatibility.router, prefix="/ai", tags=["AI"])
 api_router.include_router(voice.router, prefix="/voice", tags=["语音"])
 api_router.include_router(voice_ws.router, prefix="/voice", tags=["语音"])
+api_router.include_router(
+    voice_moxiang.router, prefix="/voice", tags=["语音"]
+)
 
 
 OPENAPI_TAGS = [
