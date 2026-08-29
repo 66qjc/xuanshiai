@@ -255,9 +255,9 @@ replaces_field_key VARCHAR(64) DEFAULT NULL     -- entry 改写时指向被替�
 - 快照过期/失效语义不变：partial 行随快照一起失效。
 
 **Steps:**
-- [ ] RED（集成）：confirm 后模拟任务推进至 30% → 结果端点返回 partial 集且 `is_fuzzy=true`、条目数 ≤50、全部满足 hard 条件；任务完成后同端点返回完整集 `is_fuzzy=false`；仅 soft 命中用户不在 partial 集中；partial 物化注入失败 → 主任务仍成功。
-- [ ] GREEN：实现迁移/worker/读取端。
-- [ ] 全量回归（搜索既有快照语义不变）。
+- [x] RED（集成）：confirm 后模拟任务推进至 30% → 结果端点返回 partial 集且 `is_fuzzy=true`、条目数 ≤50、全部满足 hard 条件；任务完成后同端点返回完整集 `is_fuzzy=false`；仅 soft 命中用户不在 partial 集中；partial 物化注入失败 → 主任务仍成功。
+- [x] GREEN：实现迁移/worker/读取端。
+- [x] 全量回归（搜索既有快照语义不变）。
 
 **验收（方案 WP-S2 验收原文）：** confirm 后立刻轮询结果端点：进度≥30% 时返回 partial 集合（is_fuzzy=true）；任务完成后同端点返回完整集合且 is_fuzzy=false；partial 集不含仅 soft 条件命中的用户。
 **Commit:** `feat(search): 中途模糊候选（partial 代次物化+is_fuzzy 读取端）`

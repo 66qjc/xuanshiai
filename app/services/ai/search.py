@@ -31,6 +31,7 @@
 from __future__ import annotations
 
 import base64
+import dataclasses
 import hashlib
 import hmac
 import json
@@ -121,6 +122,11 @@ _MATERIALIZED_CURSOR_VERSION = "ai-search-result-v2"
 # 用 generation 列 + ``MAX(generation) WHERE stale=0`` 派生 active generation。
 # 这样 snapshot 表无 DDL，generation 完全由 result 行派生。
 _SEARCH_RESULT_DEFAULT_GENERATION = 1
+# WP-S2：中途模糊候选集专用代次（generation=0）。完整集物化成功后由
+# DELETE WHERE generation < new_generation 统一清理，生命周期与快照一致。
+_SEARCH_PARTIAL_GENERATION = 0
+# WP-S2：模糊候选集上限（"先看到模糊符合的用户"最多 50 条）。
+_SEARCH_PARTIAL_LIMIT = 50
 
 # Task 1 冻结的 10 个 allowlist 字段 → operator/kind 静态映射（逐字，统一方案 §8.1）。
 FIELD_RULES: dict[str, dict[str, Any]] = {
@@ -610,7 +616,8 @@ _CONDITION_COLUMNS = (
 _SNAPSHOT_COLUMNS = (
     "id, snapshot_id, user_id, draft_id, snapshot_hash, status, "
     "condition_schema_version, policy_revision, consent_snapshot_json, "
-    "source_revision_json, result_total, degraded, expires_at, invalidated_at, created_at"
+    "source_revision_json, result_total, degraded, partial_visible, "
+    "expires_at, invalidated_at, created_at"
 )
 
 
@@ -2115,6 +2122,62 @@ async def _set_search_task_stage(
     )
 
 
+def _has_hard_conditions(condition_objects: list) -> bool:
+    """WP-S2：查询是否包含确定性 hard 条件（决定是否物化模糊候选集）。"""
+    return any(
+        condition.field_key in FIELD_RULES
+        and FIELD_RULES[condition.field_key]["kind"] == "hard"
+        and condition.user_action == SearchConditionUserAction.CONFIRMED
+        for condition in condition_objects
+    )
+
+
+async def _materialize_partial_results(
+    db: AsyncSession,
+    snapshot_id: str,
+    visible: list,
+    result_expires_at: "datetime",
+) -> int:
+    """WP-S2：filtering 收尾物化模糊候选初筛集（generation=0，上限 50）。
+
+    初筛集仅含 hard 确定性条件全部命中的候选（hard 过滤由 baseline 查询
+    保证）；evidence 的 matched/reason 只统计 hard 条件（脱敏出参与完整集
+    一致，绝不含仅 soft 命中者）。旧行不动、复用 _upsert_result_row。
+    不 commit。
+    """
+    partial_rows = visible[:_SEARCH_PARTIAL_LIMIT]
+    for rank_position, (_, row, evidence) in enumerate(partial_rows, start=1):
+        hard_keys = [
+            key
+            for key in evidence.matched_conditions
+            if FIELD_RULES.get(key, {}).get("kind") == "hard"
+        ]
+        hard_evidence = dataclasses.replace(
+            evidence,
+            matched_condition_count=len(hard_keys),
+            matched_conditions=hard_keys,
+            unknown_conditions=[],
+            reason_codes=(["HARD_CONDITION_MATCH"] if hard_keys else []),
+        )
+        await _upsert_result_row(
+            db,
+            snapshot_id,
+            int(row["user_id"]),
+            rank_position,
+            hard_evidence,
+            result_expires_at,
+            generation=_SEARCH_PARTIAL_GENERATION,
+        )
+    await db.execute(
+        text(
+            "UPDATE ai_search_snapshot SET partial_visible = 'partial', "
+            "updated_at = UTC_TIMESTAMP() WHERE snapshot_id = :snapshot_id"
+        ),
+        {"snapshot_id": snapshot_id},
+    )
+    return len(partial_rows)
+
+
 async def materialize_search_snapshot(
     db: AsyncSession,
     snapshot_id: str,
@@ -2193,6 +2256,21 @@ async def materialize_search_snapshot(
             row, condition_objects, compiled, projections.get(candidate_id)
         )
         visible.append((baseline_index, row, evidence))
+    # WP-S2：filtering 收尾（进度 30% 后）物化模糊候选初筛集。partial 是
+    # 纯增强：任何异常都不得中断主流程——失败降级为无 partial（读取端
+    # 继续等待完整集）。无 hard 条件的查询不物化，partial_visible 保持 none。
+    if _has_hard_conditions(condition_objects):
+        try:
+            partial_expires = _now_utc() + timedelta(
+                minutes=SEARCH_RESULT_TTL_MINUTES
+            )
+            await _materialize_partial_results(
+                db, snapshot_id, visible, partial_expires
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "partial_materialization_failed snapshot_id=%s", snapshot_id
+            )
     if task_id:
         await _set_search_task_stage(db, task_id, "ranking", progress=85)
     visible.sort(
@@ -2242,7 +2320,7 @@ async def materialize_search_snapshot(
     await db.execute(
         text(
             "UPDATE ai_search_snapshot SET status = :status, result_total = :result_total, "
-            "degraded = :degraded WHERE snapshot_id = :snapshot_id"
+            "degraded = :degraded, partial_visible = 'full' WHERE snapshot_id = :snapshot_id"
         ),
         {
             "snapshot_id": snapshot_id,
@@ -2313,12 +2391,20 @@ async def read_materialized_search_results(
         raise SearchSnapshotNotFound()
     # Task8 Step2：读 active generation，用于 cursor generation 校验。
     active_generation = await _load_active_generation(db, snapshot_id)
+    # WP-S2：快照 partial 阶段（进度≥30%、完整集未就绪）先读 generation=0
+    # 的模糊候选集并打 is_fuzzy 标记；'full' 后恢复 active generation。
+    partial_visible = str(snapshot.get("partial_visible") or "none")
+    read_generation = (
+        _SEARCH_PARTIAL_GENERATION
+        if partial_visible == "partial"
+        else active_generation
+    )
     # Validate a supplied cursor before returning a stale page.  A malformed or
     # cross-snapshot token is still a client error even when the snapshot is no
     # longer readable.  旧 v1 cursor 在 active generation >1 时失效。
     after_rank, cursor_target_user_id = (
         _decode_materialized_cursor(
-            snapshot_id, cursor, active_generation=active_generation
+            snapshot_id, cursor, active_generation=read_generation
         )
         if cursor
         else (0, 0)
@@ -2334,7 +2420,7 @@ async def read_materialized_search_results(
         return SearchResultPageRead(snapshot_id=snapshot_id, status="stale")
     stored_rows = await _load_materialized_result_rows(
         db, snapshot_id, after_rank, page_size + 1,
-        active_generation=active_generation,
+        active_generation=read_generation,
     )
     has_more = len(stored_rows) > page_size
     stored_rows = stored_rows[:page_size]
@@ -2368,6 +2454,7 @@ async def read_materialized_search_results(
                 reason_codes=_maybe_json(row.get("reason_codes")) or [],
                 profile_revision=int(row.get("profile_revision") or 0),
                 result_expires_at=row.get("result_expires_at"),
+                is_fuzzy=(partial_visible == "partial"),
             )
         )
     status_value = str(snapshot.get("status") or "completed")

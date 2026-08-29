@@ -176,6 +176,9 @@ class SearchResultItemRead(BaseModel):
     reason_codes: list[str] = Field(default_factory=list)
     profile_revision: int = 0
     result_expires_at: datetime | None = None
+    # WP-S2：true 表示来自中途模糊候选集（generation=0，仅 hard 确定性条件
+    # 命中），完整集就绪后该标记恢复 False。脱敏出参与完整集完全一致。
+    is_fuzzy: bool = False
 
 
 class SearchResultPageRead(BaseModel):

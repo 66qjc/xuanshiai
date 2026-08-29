@@ -319,6 +319,7 @@ AI_TABLES = {
             `source_revision_json` json DEFAULT NULL,
             `result_total` int unsigned NOT NULL DEFAULT '0',
             `degraded` tinyint NOT NULL DEFAULT '0',
+            `partial_visible` enum('none','partial','full') NOT NULL DEFAULT 'none' COMMENT 'WP-S2：模糊候选代次状态 none/partial(30%初筛可读)/full(完整集)',
             `expires_at` datetime DEFAULT NULL,
             `invalidated_at` datetime DEFAULT NULL,
             `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -614,6 +615,29 @@ def ensure_ai_profile_session_columns(cursor: Any) -> None:
     for column_name, column_def in AI_PROFILE_SESSION_REQUIRED_COLUMNS.items():
         if column_name not in existing:
             cursor.execute(f"ALTER TABLE `ai_profile_session` ADD COLUMN {column_def}")
+
+
+# ----------------------------------------------------------------------
+# WP-S2 / F10：搜索快照模糊候选代次补列（旧库幂等补列）
+# ----------------------------------------------------------------------
+AI_SEARCH_SNAPSHOT_REQUIRED_COLUMNS: dict[str, str] = {
+    "partial_visible": (
+        "`partial_visible` enum('none','partial','full') NOT NULL DEFAULT 'none' "
+        "COMMENT 'WP-S2：模糊候选代次状态（generation=0 初筛集可读窗口）'"
+    ),
+}
+
+
+def ensure_ai_search_snapshot_columns(cursor: Any) -> None:
+    """Idempotently add partial-visible column to ``ai_search_snapshot``。"""
+    try:
+        cursor.execute("SHOW COLUMNS FROM `ai_search_snapshot`")
+        existing = {row["Field"] for row in cursor.fetchall()}
+    except Exception:  # noqa: BLE001 - legacy bootstrap is best effort
+        return
+    for column_name, column_def in AI_SEARCH_SNAPSHOT_REQUIRED_COLUMNS.items():
+        if column_name not in existing:
+            cursor.execute(f"ALTER TABLE `ai_search_snapshot` ADD COLUMN {column_def}")
 
 
 # These additive columns keep an older bootstrap-created database readable until
