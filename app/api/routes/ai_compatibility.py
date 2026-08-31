@@ -22,6 +22,7 @@ import re
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Path, status
+from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies import CurrentUser, get_current_user
@@ -41,6 +42,7 @@ from app.services.ai.compatibility import (
     CompatibilityInputInvalid,
     CompatibilityResultStale,
     read_compatibility_snapshot,
+    request_compatibility_llm_refresh,
     request_compatibility_recompute,
 )
 from app.services.ai.flags import AiFeature, AiFeatureDisabledError, require_ai_feature
@@ -94,19 +96,19 @@ def _check_idempotency_key(idempotency_key: str | None) -> None:
 
 @router.get(
     "/compatibility/{target_user_id}",
-    response_model=CompatibilitySnapshotRead,
-    status_code=status.HTTP_200_OK,
-    summary="查询与目标用户的资料合拍参考",
+    summary="查询与目标用户的资料合拍参考（未命中可 202 触发 AI 精算）",
 )
 async def get_compatibility_route(
     target_user_id: int = Path(..., ge=1),
     current: CurrentUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
-) -> CompatibilitySnapshotRead:
-    """返回当前用户对目标用户的 shadow 资料合拍参考。
+):
+    """返回当前用户对目标用户的资料合拍参考。
 
-    每次读取重过可见性门禁与 revision 校验；不可见统一 404
-    ``CANDIDATE_NOT_VISIBLE``；版本/隐私变化或过期 → ``stale``。
+    快照命中（rule 秒回 / llm 已缓存）语义不变：200 + 快照读取模型。未命中
+    （无快照/已过期）且双方授权有效时，按 WP-C1 触发 ``compatibility_llm``
+    精算任务并返回 202 + 任务信息（前端用进度轮询承载，llm 计算约数秒）；
+    不可见统一 404 ``CANDIDATE_NOT_VISIBLE``。
     """
     _require_compatibility_feature()
     try:
@@ -116,8 +118,33 @@ async def get_compatibility_route(
     # 读取路径的 stale 落库标记（read_compatibility_snapshot → _mark_snapshot_stale
     # 的 UPDATE）在同一事务内执行；get_db 在请求结束时只关闭回滚、不提交。若不在此
     # 处显式 commit，文档承诺的「读取时同时将该快照落库标记为 stale」在生产永不生效
-    # （审查 I-1）。读路径仅有 SELECT 与该 stale UPDATE，无其它未决写入会被意外固化。
+    # （审查 I-1）。
+    accepted = None
+    if result.status in (
+        CompatibilitySnapshotStatus.COVERAGE_INSUFFICIENT,
+        CompatibilitySnapshotStatus.STALE,
+    ):
+        # WP-C1 触发口径：无可用快照 → 精算任务（同 pair 同日幂等，成本上限清晰）。
+        # 门禁未过（未授权等）返回 None → 维持 200 原结果，不报错。
+        try:
+            accepted = await request_compatibility_llm_refresh(
+                db, current.id, target_user_id
+            )
+        except CandidateNotVisible as exc:
+            raise _error_response(exc.code, exc.message, exc.status_code) from exc
     await db.commit()
+    if accepted is not None:
+        pending = CompatibilitySnapshotRecomputeRead(
+            snapshot_id=accepted.snapshot_id,
+            task_id=accepted.task_id,
+            status=CompatibilitySnapshotStatus(accepted.status),
+            poll_after_ms=accepted.poll_after_ms,
+            expires_at=accepted.expires_at,
+        )
+        return JSONResponse(
+            status_code=status.HTTP_202_ACCEPTED,
+            content=pending.model_dump(mode="json"),
+        )
     return result
 
 

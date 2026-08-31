@@ -408,6 +408,8 @@ AI_TABLES = {
             `consent_snapshot_pair_json` json DEFAULT NULL,
             `experiment_bucket` varchar(24) NOT NULL DEFAULT 'shadow',
             `display_eligible` tinyint NOT NULL DEFAULT '0',
+            `engine` varchar(32) NOT NULL DEFAULT 'rule-v1' COMMENT 'WP-C1：最近一次计算来源 rule-v1/llm-v1',
+            `brand_label` varchar(64) DEFAULT NULL COMMENT 'WP-C4：AI 算法标注（来自良配Ai算法）',
             `disclaimer` varchar(500) DEFAULT NULL,
             `calculated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
             `expires_at` datetime DEFAULT NULL,
@@ -422,6 +424,35 @@ AI_TABLES = {
             KEY `idx_ai_compat_snapshot_expires` (`expires_at`, `status`),
             CONSTRAINT `chk_ai_compat_viewer_not_target` CHECK (`viewer_user_id` <> `target_user_id`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='AI 双向资料合拍参考 shadow 快照'
+    """,
+    "ai_recommendation_snapshot": """
+        CREATE TABLE IF NOT EXISTS `ai_recommendation_snapshot` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `snapshot_id` varchar(64) NOT NULL COMMENT '本次物化批次 id，同批三视图共用',
+            `viewer_user_id` bigint unsigned NOT NULL,
+            `view_kind` ENUM('i_like','likes_me','similar') NOT NULL,
+            `target_user_id` bigint unsigned NOT NULL,
+            `score` decimal(5,2) DEFAULT NULL COMMENT '0..100 视图主分',
+            `coverage` decimal(5,4) DEFAULT NULL COMMENT '0..1 维度覆盖度',
+            `direction_json` json DEFAULT NULL COMMENT 'i_like/likes_me：单向分与理由明细',
+            `score_detail_json` json DEFAULT NULL COMMENT 'similar：分类权重明细',
+            `reason_codes` json DEFAULT NULL,
+            `rank_no` int unsigned NOT NULL COMMENT '1 起，score 降序（避开 MySQL 8 保留字 rank）',
+            `generation` int unsigned NOT NULL DEFAULT '1',
+            `engine` varchar(32) NOT NULL DEFAULT 'rule-v1' COMMENT 'rule-v1/llm-v1 打分来源',
+            `algorithm_version` varchar(32) NOT NULL DEFAULT 'recommend-rule-v1',
+            `source_hash` char(64) NOT NULL COMMENT 'viewer 投影 source_hash，失效锚',
+            `status` varchar(24) NOT NULL DEFAULT 'ready' COMMENT 'ready/superseded',
+            `calculated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `expires_at` datetime DEFAULT NULL,
+            `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`),
+            UNIQUE KEY `uk_ai_recommend_snapshot` (`viewer_user_id`, `view_kind`, `target_user_id`, `generation`),
+            KEY `idx_ai_recommend_read` (`viewer_user_id`, `view_kind`, `status`, `rank_no`),
+            KEY `idx_ai_recommend_expires` (`expires_at`, `status`),
+            CONSTRAINT `chk_ai_recommend_viewer_not_target` CHECK (`viewer_user_id` <> `target_user_id`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='AI 三类推荐快照（D4 预计算）'
     """,
 
     # ============ 语音转写结果（P-04 / Phase 4）============
@@ -638,6 +669,38 @@ def ensure_ai_search_snapshot_columns(cursor: Any) -> None:
     for column_name, column_def in AI_SEARCH_SNAPSHOT_REQUIRED_COLUMNS.items():
         if column_name not in existing:
             cursor.execute(f"ALTER TABLE `ai_search_snapshot` ADD COLUMN {column_def}")
+
+
+# ----------------------------------------------------------------------
+# WP-C1 / F11：兼容度快照 engine/brand_label 补列（旧库幂等补列）
+# ----------------------------------------------------------------------
+#
+# engine 默认 'rule-v1' 保证存量快照语义零变化（llm-v1 由 WP-C1c 写入）；
+# brand_label 允许 NULL（规则快照不标注，读取端出参可选下发）。
+COMPATIBILITY_ENGINE_REQUIRED_COLUMNS: dict[str, str] = {
+    "engine": (
+        "`engine` varchar(32) NOT NULL DEFAULT 'rule-v1' "
+        "COMMENT 'WP-C1：最近一次计算来源 rule-v1/llm-v1'"
+    ),
+    "brand_label": (
+        "`brand_label` varchar(64) DEFAULT NULL "
+        "COMMENT 'WP-C4：AI 算法标注（来自良配Ai算法）'"
+    ),
+}
+
+
+def ensure_ai_compatibility_engine_columns(cursor: Any) -> None:
+    """Idempotently add engine/brand_label columns to ``ai_compatibility_snapshot``。"""
+    try:
+        cursor.execute("SHOW COLUMNS FROM `ai_compatibility_snapshot`")
+        existing = {row["Field"] for row in cursor.fetchall()}
+    except Exception:  # noqa: BLE001 - legacy bootstrap is best effort
+        return
+    for column_name, column_def in COMPATIBILITY_ENGINE_REQUIRED_COLUMNS.items():
+        if column_name not in existing:
+            cursor.execute(
+                f"ALTER TABLE `ai_compatibility_snapshot` ADD COLUMN {column_def}"
+            )
 
 
 # These additive columns keep an older bootstrap-created database readable until

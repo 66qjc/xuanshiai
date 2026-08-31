@@ -355,6 +355,10 @@ class AIProvider(Protocol):
         self, request: SearchSuggestRequest
     ) -> SearchSuggestResult: ...
 
+    async def compare_compatibility(
+        self, request: CompatibilityCompareRequest
+    ) -> CompatibilityCompareResult: ...
+
 
 @dataclass(frozen=True)
 class ReplyRequest:
@@ -383,6 +387,42 @@ class ReplyResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     reply_text: str = Field(..., min_length=1, max_length=200)
+
+
+@dataclass(frozen=True)
+class CompatibilityCompareRequest:
+    """Input for one LLM 双向匹配度精算（WP-C1b）。
+
+    两侧均为**已发布投影的可读摘要**：结构化字段序列化文本 + 条目摘要
+    （entry_digest）。不含原始回答、用户 ID 或认证/会员信号。
+    """
+
+    viewer_personal: str
+    target_personal: str
+    viewer_ideal: str = ""
+    target_ideal: str = ""
+    viewer_personal_digest: str | None = None
+    viewer_ideal_digest: str | None = None
+    target_personal_digest: str | None = None
+    target_ideal_digest: str | None = None
+
+
+class CompatibilityCompareDirection(BaseModel):
+    """一个方向的精算结果：0-100 概率 + 恰好 3 条中文可解释理由。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    score: int = Field(..., ge=0, le=100)
+    reasons: tuple[str, ...] = Field(..., min_length=3, max_length=3)
+
+
+class CompatibilityCompareResult(BaseModel):
+    """Typed provider result for 双向匹配度精算（写入快照前原值 0-100）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    viewer_to_target: CompatibilityCompareDirection
+    target_to_viewer: CompatibilityCompareDirection
 
 
 class ProviderErrorKind(str, Enum):

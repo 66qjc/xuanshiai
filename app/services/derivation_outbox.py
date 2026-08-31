@@ -490,6 +490,19 @@ async def _mark_derived_results_stale(db: AsyncSession, user_id: int) -> None:
         {"user_id": user_id},
         table="ai_compatibility_snapshot",
     )
+    # WP-P6：推荐快照同样派生自画像/可见性——拉黑/注销/撤权事件后必须同步
+    # 失效（双向），否则被拉黑者在对方的推荐列表里最长滞留一个 TTL（24h）。
+    # 读取端只认 status='ready'，置 stale 即隐藏；下次重建（publish/GET
+    # miss/每日批量）按当时可见性重新物化。
+    await _mark_stale_best_effort(
+        db,
+        "UPDATE ai_recommendation_snapshot SET status = 'stale', "
+        "updated_at = UTC_TIMESTAMP() "
+        "WHERE (viewer_user_id = :user_id OR target_user_id = :user_id) "
+        "AND status = 'ready'",
+        {"user_id": user_id},
+        table="ai_recommendation_snapshot",
+    )
 
 
 def _is_missing_table_error(exc: Exception) -> bool:

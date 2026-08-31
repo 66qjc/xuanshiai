@@ -120,6 +120,7 @@ class Settings(BaseSettings):
     ai_profile_enabled: bool = False
     ai_search_enabled: bool = False
     ai_compatibility_shadow_enabled: bool = False
+    ai_recommend_enabled: bool = False
     # 画像发布门槛：至少确认多少个字段才允许 publish（提前建构阈值）。
     # 良配对齐：默认 7/10 ≈ 67%，"无需完成全部题目，进度 67% 左右可提前
     # 建构画像"。进度提示与发布硬门槛共用此值，避免两套数字漂移。
@@ -211,7 +212,14 @@ class Settings(BaseSettings):
     ai_profile_session_expire_days: int = Field(default=7, gt=0)
     ai_search_draft_expire_hours: int = Field(default=24, gt=0)
     ai_compatibility_snapshot_ttl_minutes: int = Field(default=10, gt=0)
+    # WP-C1：llm 精算快照 TTL（默认 7 天）——命中期内二次查看不再触发精算。
+    ai_compatibility_llm_ttl_minutes: int = Field(default=10080, gt=0)
     ai_gateway_timeout_seconds: float = Field(default=30.0, gt=0, le=120)
+
+    # WP-P6 三类推荐（D4 快照预计算）：物化有效期 / 候选池上限 / 每视图 top-N。
+    ai_recommendation_ttl_minutes: int = Field(default=1440, gt=0)
+    ai_recommendation_pool_limit: int = Field(default=200, gt=0)
+    ai_recommendation_top_n: int = Field(default=20, gt=0)
 
     # Task 12 审计/指标开关（非敏感，不影响 production fail-closed）。
     ai_audit_enabled: bool = True
@@ -341,6 +349,7 @@ class Settings(BaseSettings):
                 self.ai_profile_enabled,
                 self.ai_search_enabled,
                 self.ai_compatibility_shadow_enabled,
+                self.ai_recommend_enabled,
                 self.ai_voice_enabled,
             )
         )

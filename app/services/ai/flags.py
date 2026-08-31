@@ -22,6 +22,7 @@ class AiFeature(str, Enum):
     COMPATIBILITY_SHADOW = "compatibility_shadow"
     VOICE = "voice"
     VOICE_CONVERSATION = "voice_conversation"
+    RECOMMEND = "recommend"
 
 
 class AiFeatureDisabledError(Exception):
@@ -49,6 +50,8 @@ def is_ai_feature_enabled(feature: AiFeature, settings: Settings) -> bool:
         return settings.ai_compatibility_shadow_enabled
     if feature is AiFeature.VOICE:
         return settings.ai_voice_enabled
+    if feature is AiFeature.RECOMMEND:
+        return settings.ai_recommend_enabled
     if feature is AiFeature.VOICE_CONVERSATION:
         # 实时对话模式依赖基础语音门禁 + 对话开关同时打开。
         return settings.ai_voice_enabled and settings.ai_voice_conversation_enabled

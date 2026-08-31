@@ -8,6 +8,7 @@ from app.api.routes import (
     admin,
     ai_compatibility,
     ai_consents,
+    ai_recommend,
     ai_profile,
     ai_search,
     ai_tasks,
@@ -104,6 +105,7 @@ api_router.include_router(ai_consents.router, prefix="/ai", tags=["AI"])
 api_router.include_router(ai_profile.router, prefix="/ai", tags=["AI"])
 api_router.include_router(ai_search.router, prefix="/ai", tags=["AI"])
 api_router.include_router(ai_compatibility.router, prefix="/ai", tags=["AI"])
+api_router.include_router(ai_recommend.router, prefix="/ai", tags=["AI"])
 api_router.include_router(voice.router, prefix="/voice", tags=["语音"])
 api_router.include_router(voice_ws.router, prefix="/voice", tags=["语音"])
 api_router.include_router(

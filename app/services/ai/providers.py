@@ -25,6 +25,9 @@ from app.services.ai.base import (
     ExtractedEntry,
     ExtractedField,
     ExtractedPatch,
+    CompatibilityCompareDirection,
+    CompatibilityCompareRequest,
+    CompatibilityCompareResult,
     SearchSuggestRequest,
     SearchSuggestResult,
     ModerationRequest,
@@ -46,6 +49,7 @@ from app.services.ai.base import (
     StructuredExtractResult,
 )
 from app.services.ai.prompts.profile_extract import build_profile_extract_prompt, build_profile_update_clarify_prompt
+from app.services.ai.prompts.compatibility_compare import build_compatibility_compare_prompt
 from app.services.ai.prompts.profile_narrative import build_profile_narrative_prompt
 from app.services.ai.prompts.search_parse import build_search_parse_prompt
 from app.services.ai.prompts.voice_reply import build_voice_reply_prompt
@@ -239,6 +243,27 @@ _NARRATIVE_FIXTURE_IDEAL_PARTNER = NarrativeResult(
 )
 
 
+# WP-C1b：双向精算确定性 fixture——72/68 各 3 条理由（对齐良配截图示例语义）。
+_COMPARE_FIXTURE = CompatibilityCompareResult(
+    viewer_to_target=CompatibilityCompareDirection(
+        score=72,
+        reasons=(
+            "双方都期待以结婚为目标的稳定关系",
+            "年龄与所在城市正处在彼此可接受的范围内",
+            "兴趣标签有重叠，容易找到共同话题",
+        ),
+    ),
+    target_to_viewer=CompatibilityCompareDirection(
+        score=68,
+        reasons=(
+            "对方的关系期待与你的一致",
+            "学历与身高都在对方偏好区间内",
+            "部分兴趣不同，需要更多共同体验",
+        ),
+    ),
+)
+
+
 class MockAIProvider:
     """Deterministic fixture provider with failure injection.
 
@@ -332,6 +357,12 @@ class MockAIProvider:
     ) -> ReplyResult:
         self._check_failure("generate_reply")
         return ReplyResult(reply_text="好的，记下啦。那你现在生活在哪个城市呀？")
+
+    async def compare_compatibility(
+        self, request: CompatibilityCompareRequest
+    ) -> CompatibilityCompareResult:
+        self._check_failure("compare_compatibility")
+        return _COMPARE_FIXTURE
 
     async def stream_chat(
         self,
@@ -641,6 +672,55 @@ def _normalize_narrative_payload(data: Any) -> Any:
             normalized.append(item)
     data["ideal_weights"] = normalized
     return data
+
+
+def normalize_compatibility_compare_payload(data: Any) -> dict[str, Any]:
+    """把精算 JSON 的常见漂移归一为 schema 期望的形状（宽容映射）。
+
+    - score 允许 "72"/72.4 等写法 → clamp 成 0-100 整数；
+    - reasons 去空/去重/按序截断到 50 字；条数 ≠3 保持原样交由
+      pydantic min/max_length 拦截（转 RETRYABLE ProviderError 重试）。
+    """
+    if not isinstance(data, dict):
+        return data if isinstance(data, dict) else {}
+    normalized: dict[str, Any] = {}
+    for direction in ("viewer_to_target", "target_to_viewer"):
+        item = data.get(direction)
+        if not isinstance(item, dict):
+            continue
+        raw_score = item.get("score")
+        try:
+            score = int(round(float(raw_score)))
+        except (TypeError, ValueError):
+            # score 缺失/不可解析：fabricate 0 会把"匹配度 0%"写进快照（静默
+            # 错误结果）。schema 漂移走可重试 ProviderError，让 Worker 重新
+            # 生成或降级——与理由条数不足的升级路径一致。
+            raise ProviderError(
+                code="AI_TEMPORARILY_UNAVAILABLE",
+                message=f"compare score 不可解析: {raw_score!r}",
+                kind=ProviderErrorKind.RETRYABLE,
+            ) from None
+        normalized[direction] = {
+            "score": max(0, min(100, score)),
+            "reasons": _clean_reasons(item.get("reasons")),
+        }
+    return normalized
+
+
+def _clean_reasons(raw: Any) -> list[str]:
+    if not isinstance(raw, list):
+        return []
+    cleaned: list[str] = []
+    for item in raw:
+        if not isinstance(item, str):
+            continue
+        text = item.strip()
+        if not text:
+            continue
+        cleaned.append(text[:50])
+    seen: set[str] = set()
+    deduped = [text for text in cleaned if not (text in seen or seen.add(text))]
+    return deduped
 
 
 class _OpenAICompatProvider:
@@ -1096,6 +1176,24 @@ class _OpenAICompatProvider:
             raise ProviderError(
                 code="AI_TEMPORARILY_UNAVAILABLE",
                 message=f"reply 输出未通过 schema 校验: {exc}",
+                kind=ProviderErrorKind.RETRYABLE,
+            ) from exc
+
+    async def compare_compatibility(
+        self, request: CompatibilityCompareRequest
+    ) -> CompatibilityCompareResult:
+        prompt = build_compatibility_compare_prompt(request)
+        data = await self._chat_json(prompt)
+        # schema 漂移（理由条数不足/缺方向）转可重试错误，由 Worker 重新生成
+        # 或按降级路径写规则快照，读取端永远有可用结果。
+        try:
+            return CompatibilityCompareResult.model_validate(
+                normalize_compatibility_compare_payload(data)
+            )
+        except ValidationError as exc:
+            raise ProviderError(
+                code="AI_TEMPORARILY_UNAVAILABLE",
+                message=f"compatibility compare 输出未通过 schema 校验: {exc}",
                 kind=ProviderErrorKind.RETRYABLE,
             ) from exc
 

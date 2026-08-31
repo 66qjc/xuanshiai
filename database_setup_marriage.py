@@ -2613,6 +2613,7 @@ class DatabaseManager:
         from app.db.ai_schema import (
             AI_CONSENT_OPERATION_TABLE,
             AI_TABLES,
+            ensure_ai_compatibility_engine_columns,
             ensure_ai_legacy_columns,
             ensure_ai_profile_entry_columns,
             ensure_ai_profile_session_columns,
@@ -2682,6 +2683,9 @@ class DatabaseManager:
         ensure_ai_profile_session_columns(cursor)
         # WP-S2 / F10：旧库搜索快照幂等补 partial_visible（默认 'none'）。
         ensure_ai_search_snapshot_columns(cursor)
+        # WP-C1 / F11：旧库兼容度快照幂等补 engine/brand_label（engine 默认
+        # 'rule-v1'，存量快照语义零变化）。
+        ensure_ai_compatibility_engine_columns(cursor)
         # Task 2 additive AI fields are safe to backfill during bootstrap;
         # constraint/index changes remain in the reviewed migration runner.
         ensure_ai_legacy_columns(cursor)

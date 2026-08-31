@@ -3461,6 +3461,25 @@ async def publish_profile_draft(
         source_revision=published_vector,
         consent_snapshot=draft.consent_snapshot,
     )
+    # 入队三类推荐重建（WP-P6/D4）：与投影、narrative 任务并列发布后异步执行。
+    # fire-and-forget：不进入 publish 出参（契约不变），状态经推荐读取端观察；
+    # handler 有投影新鲜度门禁，投影任务未完成时自动可重试。
+    # 函数内延迟导入：ai_worker 初始化早期导入本模块，若此处模块级导入
+    # recommend（其模块级注册要读 ai_worker.TASK_HANDLERS）会成循环导入。
+    # request_digest 列为 char(64)：对"发布请求摘要+recommend 后缀"整体再哈希。
+    from app.services.ai.recommend import RECOMMEND_TASK_TYPE
+
+    await enqueue_task(
+        db=db,
+        owner_user_id=owner_user_id,
+        task_type=RECOMMEND_TASK_TYPE,
+        idempotency_key=idempotency_key + "-recommend",
+        request_hash=hashlib.sha256(
+            (request_hash + ":recommend").encode()
+        ).hexdigest(),
+        revisions=published_vector,
+        consent=draft.consent_snapshot or None,
+    )
     return TaskSubmission.accepted(task, revision, narrative_task.task_id)
 
 

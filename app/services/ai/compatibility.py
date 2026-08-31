@@ -48,6 +48,9 @@ from app.schemas.ai_compatibility import (
     CompatibilitySnapshotRead,
     CompatibilitySnapshotStatus,
 )
+from app.services.ai.base import CompatibilityCompareRequest
+from app.services.ai.gateway import AIGateway
+from app.services.ai.audit import emit_ai_metric
 from app.services.ai.tasks import (
     AiTaskRecord,
     enqueue_task,
@@ -90,6 +93,14 @@ REASON_GOAL = "RELATIONSHIP_GOAL_SHARED"
 REASON_UNKNOWN = "DIMENSION_UNKNOWN"
 REASON_COVERAGE = "COVERAGE_INSUFFICIENT"
 REASON_NOT_VISIBLE = "CANDIDATE_NOT_VISIBLE"
+REASON_LLM_FALLBACK = "LLM_FALLBACK_RULE"
+
+# WP-C1 / F11：混合引擎常量——规则粗排保留为缓存与兜底，llm 按需精算（D1）。
+COMPATIBILITY_LLM_TASK_TYPE = "compatibility_llm"
+ENGINE_RULE = "rule-v1"
+ENGINE_LLM = "llm-v1"
+SCORE_SEMANTICS_LLM = "llm_pairwise_probability"
+BRAND_LABEL = "来自良配Ai算法"
 
 # 原因码 → 证据字段 key（evidence_refs 只引用字段 key 与 revision，不含原文）。
 _EVIDENCE_FIELDS: dict[str, tuple[str, ...]] = {
@@ -108,7 +119,7 @@ _EVIDENCE_FIELDS: dict[str, tuple[str, ...]] = {
 
 # 原因码 → 可展示标记：只有双方可见已确认资料形成的相互满足码才可展示。
 _NON_DISPLAYABLE_REASONS = frozenset(
-    {REASON_UNKNOWN, REASON_COVERAGE, REASON_NOT_VISIBLE}
+    {REASON_UNKNOWN, REASON_COVERAGE, REASON_NOT_VISIBLE, REASON_LLM_FALLBACK}
 )
 
 # 原因码 → 限制说明（模板解释优先，§9.3）。
@@ -753,7 +764,7 @@ async def _load_projection_rows(
             "SELECT id, subject_user_id, projection_kind, fields_json, source_hash, "
             "source_revision_json, profile_revision, preference_revision, "
             "privacy_revision, relationship_revision, policy_revision, "
-            "consent_snapshot_json, status, expires_at "
+            "consent_snapshot_json, entry_digest, status, expires_at "
             "FROM ai_feature_projection "
             "WHERE subject_user_id IN (:uid_viewer, :uid_target) "
             "AND projection_kind IN ('personal_compatibility', "
@@ -897,7 +908,8 @@ _SNAPSHOT_INSERT_COLUMNS = (
     "status, score_semantics, compatibility_index, coverage, direction_json, "
     "reason_codes, evidence_json, profile_revision_pair_json, "
     "privacy_revision_pair_json, source_revision_pair_json, "
-    "consent_snapshot_pair_json, experiment_bucket, display_eligible, disclaimer, "
+    "consent_snapshot_pair_json, experiment_bucket, display_eligible, engine, "
+    "brand_label, disclaimer, "
     "calculated_at, expires_at, created_at"
 )
 
@@ -910,15 +922,23 @@ async def write_shadow_snapshot(
     revisions: tuple[RevisionVector, RevisionVector],
     consent: dict[str, Any] | None,
     snapshot_id: str | None = None,
+    *,
+    engine: str = ENGINE_RULE,
+    brand_label: str | None = None,
+    score_semantics: str = SCORE_SEMANTICS,
+    ttl_minutes: int | None = None,
+    direction_payload: dict[str, Any] | None = None,
 ) -> str:
     """把双向规则结果写入 ``ai_compatibility_snapshot``（shadow，永不覆盖旧字段）。
 
-    固定写 algorithm_version=compatibility-rule-v1、score_semantics=
-    rule_based_reference_shadow、experiment_bucket=shadow；display_eligible
-    默认 0，外显灰度打开后按 ``_resolve_display_eligible`` 写入；
-    保存 profile/privacy revision pair、expires_at 与 evidence_json。本函数绝不
-    触碰旧 ``match_score``/``match_reason`` 或推荐排序。``viewer_id`` 必须与
-    ``target_id`` 不同（数据库 CHECK 亦强制）。不 commit。
+    默认形参行为与混合引擎上线前逐字段一致（algorithm_version=
+    compatibility-rule-v1、score_semantics=rule_based_reference_shadow、
+    experiment_bucket=shadow、display_eligible 按灰度、TTL 走规则配置）。
+    WP-C1c 的 llm 精算路径经 ``engine='llm-v1'`` + ``brand_label`` +
+    ``ttl_minutes=ai_compatibility_llm_ttl_minutes`` 写入，engine 标记最近
+    一次计算来源。本函数绝不触碰旧 ``match_score``/``match_reason`` 或推荐
+    排序。``viewer_id`` 必须与 ``target_id`` 不同（数据库 CHECK 亦强制）。
+    不 commit。
     """
     if int(viewer_id) == int(target_id):
         raise CompatibilityInputInvalid("不能与自己计算资料合拍参考")
@@ -936,12 +956,16 @@ async def write_shadow_snapshot(
     snapshot_hash = _snapshot_hash(
         int(viewer_id), int(target_id), result, viewer_rev, target_rev
     )
-    expires_at = _now_utc() + timedelta(
-        minutes=settings.ai_compatibility_snapshot_ttl_minutes
+    effective_ttl = ttl_minutes if ttl_minutes is not None else (
+        settings.ai_compatibility_snapshot_ttl_minutes
     )
+    expires_at = _now_utc() + timedelta(minutes=effective_ttl)
     ready = result.status == CompatibilitySnapshotStatus.READY.value
     directions = None
-    if ready and result.pair_score is not None and result.directions[0] is not None:
+    if direction_payload is not None:
+        # llm-v1：调用方提供的双向明细（score + 中文理由）原样落库。
+        directions = direction_payload
+    elif ready and result.pair_score is not None and result.directions[0] is not None:
         directions = {
             "viewer_to_target": round(float(result.directions[0]), 2),
             "target_to_viewer": round(float(result.directions[1] or 0.0), 2),
@@ -955,10 +979,12 @@ async def write_shadow_snapshot(
             " :evidence_json, :profile_revision_pair_json, "
             " :privacy_revision_pair_json, :source_revision_pair_json, "
             " :consent_snapshot_pair_json, :experiment_bucket, :display_eligible, "
-            " :disclaimer, UTC_TIMESTAMP(), :expires_at, UTC_TIMESTAMP()) "
+            " :engine, :brand_label, :disclaimer, "
+            " UTC_TIMESTAMP(), :expires_at, UTC_TIMESTAMP()) "
             "ON DUPLICATE KEY UPDATE "
             " snapshot_id = VALUES(snapshot_id), "
             " status = VALUES(status), "
+            " score_semantics = VALUES(score_semantics), "
             " compatibility_index = VALUES(compatibility_index), "
             " coverage = VALUES(coverage), direction_json = VALUES(direction_json), "
             " reason_codes = VALUES(reason_codes), "
@@ -968,6 +994,8 @@ async def write_shadow_snapshot(
             " source_revision_pair_json = VALUES(source_revision_pair_json), "
             " consent_snapshot_pair_json = VALUES(consent_snapshot_pair_json), "
             " display_eligible = VALUES(display_eligible), "
+            " engine = VALUES(engine), "
+            " brand_label = VALUES(brand_label), "
             " calculated_at = VALUES(calculated_at), "
             " expires_at = VALUES(expires_at), "
             " invalidated_at = NULL, purge_after = NULL, "
@@ -980,7 +1008,7 @@ async def write_shadow_snapshot(
             "algorithm_version": COMPATIBILITY_ALGORITHM_VERSION,
             "snapshot_hash": snapshot_hash,
             "status": result.status,
-            "score_semantics": SCORE_SEMANTICS,
+            "score_semantics": score_semantics,
             "compatibility_index": (
                 round(float(result.pair_score), 2)
                 if ready and result.pair_score is not None
@@ -1009,6 +1037,8 @@ async def write_shadow_snapshot(
             ),
             "experiment_bucket": COMPATIBILITY_EXPERIMENT_BUCKET,
             "display_eligible": 1 if _resolve_display_eligible(int(viewer_id)) else 0,
+            "engine": engine,
+            "brand_label": brand_label,
             "disclaimer": DISCLAIMER,
             "expires_at": expires_at,
         },
@@ -1026,7 +1056,8 @@ _SNAPSHOT_READ_COLUMNS = (
     "snapshot_hash, status, score_semantics, compatibility_index, coverage, "
     "direction_json, reason_codes, evidence_json, profile_revision_pair_json, "
     "privacy_revision_pair_json, source_revision_pair_json, "
-    "consent_snapshot_pair_json, experiment_bucket, display_eligible, disclaimer, "
+    "consent_snapshot_pair_json, experiment_bucket, display_eligible, engine, "
+    "brand_label, disclaimer, "
     "calculated_at, expires_at, invalidated_at, created_at"
 )
 
@@ -1074,13 +1105,28 @@ async def _mark_snapshot_stale(
 def _snapshot_to_read(row: dict[str, Any], status: str) -> CompatibilitySnapshotRead:
     direction_json = _maybe_json(row.get("direction_json"))
     directions = None
+    reason_texts: dict[str, list[str]] = {}
     if status == CompatibilitySnapshotStatus.READY.value and isinstance(
         direction_json, dict
     ):
-        directions = CompatibilityDirectionScores(
-            viewer_to_target=float(direction_json.get("viewer_to_target") or 0.0),
-            target_to_viewer=float(direction_json.get("target_to_viewer") or 0.0),
-        )
+        first = direction_json.get("viewer_to_target")
+        second = direction_json.get("target_to_viewer")
+        if isinstance(first, dict) or isinstance(second, dict):
+            # llm-v1 形态：{"viewer_to_target": {"score": 72, "reasons": [...]}}
+            def _score(item: Any) -> float:
+                return float(item.get("score") or 0.0) if isinstance(item, dict) else 0.0
+
+            directions = CompatibilityDirectionScores(
+                viewer_to_target=_score(first), target_to_viewer=_score(second)
+            )
+            for key, item in (("viewer_to_target", first), ("target_to_viewer", second)):
+                if isinstance(item, dict) and isinstance(item.get("reasons"), list):
+                    reason_texts[key] = [str(r) for r in item["reasons"]]
+        else:
+            directions = CompatibilityDirectionScores(
+                viewer_to_target=float(first or 0.0),
+                target_to_viewer=float(second or 0.0),
+            )
     compatibility_index = row.get("compatibility_index")
     return CompatibilitySnapshotRead(
         snapshot_id=str(row["snapshot_id"]),
@@ -1100,12 +1146,15 @@ def _snapshot_to_read(row: dict[str, Any], status: str) -> CompatibilitySnapshot
         ),
         directions=directions,
         reason_codes=list(_maybe_json(row.get("reason_codes")) or []),
+        reason_texts=reason_texts,
         profile_revision_pair=_maybe_json(row.get("profile_revision_pair_json"))
         or {},
         privacy_revision_pair=_maybe_json(row.get("privacy_revision_pair_json"))
         or {},
         experiment_bucket=str(row.get("experiment_bucket") or "shadow"),
         display_eligible=bool(row.get("display_eligible")),
+        engine=str(row.get("engine") or ENGINE_RULE),
+        brand_label=row.get("brand_label"),
         disclaimer=str(row.get("disclaimer") or DISCLAIMER),
         calculated_at=row["calculated_at"],
         expires_at=row.get("expires_at"),
@@ -1414,8 +1463,317 @@ async def compatibility_execute_handler(
 # ----------------------------------------------------------------------
 
 
+# ----------------------------------------------------------------------
+# WP-C1c：compatibility_llm 任务——规则粗排 + LLM 精算（决策 D1）
+# ----------------------------------------------------------------------
+
+
+def _serialize_projection_for_prompt(fields: dict[str, Any]) -> str:
+    """投影字段 → prompt 摘要文本（紧凑 JSON，不含原文/ID/认证信号）。"""
+    if not fields:
+        return ""
+    return json.dumps(fields, ensure_ascii=False, sort_keys=True)
+
+
+async def load_compatibility_prompt_inputs(
+    db: AsyncSession, viewer_id: int, target_id: int
+) -> CompatibilityCompareRequest | None:
+    """双方投影（含 entry_digest）→ 精算请求；任一方缺 personal 投影返回 None。"""
+    rows = await _load_current_projection_rows(db, viewer_id, target_id)
+    by_user_kind: dict[tuple[int, str], dict[str, Any]] = {}
+    for row in rows:
+        by_user_kind[(int(row["subject_user_id"]), str(row["projection_kind"]))] = row
+
+    def _fields(user_id: int, kind: str) -> dict[str, Any]:
+        row = by_user_kind.get((user_id, kind))
+        if row is None:
+            return {}
+        return _maybe_json(row.get("fields_json")) or {}
+
+    def _digest(user_id: int, kind: str) -> str | None:
+        row = by_user_kind.get((user_id, kind))
+        if row is None:
+            return None
+        digest = row.get("entry_digest")
+        return str(digest) if digest else None
+
+    viewer_personal = _fields(viewer_id, ProjectionKind.PERSONAL_COMPATIBILITY.value)
+    target_personal = _fields(target_id, ProjectionKind.PERSONAL_COMPATIBILITY.value)
+    if not viewer_personal or not target_personal:
+        return None
+    return CompatibilityCompareRequest(
+        viewer_personal=_serialize_projection_for_prompt(viewer_personal),
+        target_personal=_serialize_projection_for_prompt(target_personal),
+        viewer_ideal=_serialize_projection_for_prompt(
+            _fields(viewer_id, ProjectionKind.IDEAL_PARTNER_PREFERENCE.value)
+        ),
+        target_ideal=_serialize_projection_for_prompt(
+            _fields(target_id, ProjectionKind.IDEAL_PARTNER_PREFERENCE.value)
+        ),
+        viewer_personal_digest=_digest(
+            viewer_id, ProjectionKind.PERSONAL_COMPATIBILITY.value
+        ),
+        viewer_ideal_digest=_digest(
+            viewer_id, ProjectionKind.IDEAL_PARTNER_PREFERENCE.value
+        ),
+        target_personal_digest=_digest(
+            target_id, ProjectionKind.PERSONAL_COMPATIBILITY.value
+        ),
+        target_ideal_digest=_digest(
+            target_id, ProjectionKind.IDEAL_PARTNER_PREFERENCE.value
+        ),
+    )
+
+
+async def compatibility_llm_execute_handler(
+    db: AsyncSession, task: AiTaskRecord, worker_id: str
+) -> tuple[str, RevisionVector] | None:
+    """``compatibility_llm`` Worker handler：门禁复刻规则 handler → 粗排守门 →
+    LLM 精算 → 写快照；LLM 失败自动降级写规则结果（读取端永远有可用快照）。
+
+    成本守门：粗排 blocked/coverage 不足的 pair **不调用 LLM**，直接写规则
+    快照收尾。完成后由 complete_task 复核版本向量（与规则 handler 同语义）。
+    """
+    payload = task.payload_summary or {}
+    target_user_id = payload.get("target_user_id")
+    if not target_user_id:
+        await fail_task(
+            db, task.task_id, worker_id,
+            error_code="AI_INPUT_INVALID", retryable=False,
+        )
+        return None
+
+    decision = await candidate_visibility_service.decide(
+        db, task.owner_user_id, int(target_user_id), VisibilityScene.PROFILE
+    )
+    if not decision.allowed:
+        await fail_task(
+            db, task.task_id, worker_id,
+            error_code="RESULT_STALE", retryable=False,
+        )
+        return None
+
+    owner_rev = await _load_revision_vector(db, task.owner_user_id)
+    target_rev = await _load_revision_vector(db, int(target_user_id))
+    payload_viewer_revision = payload.get("viewer_source_revision")
+    payload_target_revision = payload.get("target_source_revision")
+    if (
+        not isinstance(payload_viewer_revision, dict)
+        or not isinstance(payload_target_revision, dict)
+        or payload_viewer_revision != owner_rev.as_dict()
+        or payload_target_revision != target_rev.as_dict()
+    ):
+        await fail_task(
+            db, task.task_id, worker_id,
+            error_code="RESULT_STALE", retryable=False,
+        )
+        return None
+    consent = task.consent_snapshot_json or payload.get("consent_snapshot") or {}
+    if not await _pair_consents_current(
+        db, task.owner_user_id, int(target_user_id), consent
+    ):
+        await fail_task(
+            db, task.task_id, worker_id,
+            error_code="RESULT_STALE", retryable=False,
+        )
+        return None
+
+    # 规则粗排：既是兜底结果，也是 LLM 的成本守门（coverage 不足不精算）。
+    viewer_fs, target_fs = await load_compatibility_features(
+        db, task.owner_user_id, int(target_user_id)
+    )
+    rule_result = with_evidence_codes(
+        compute_compatibility(viewer_fs, target_fs, COMPATIBILITY_RULES),
+        viewer_fs,
+        target_fs,
+        COMPATIBILITY_RULES,
+    )
+    if rule_result.status != CompatibilitySnapshotStatus.READY.value:
+        result_ref = await write_shadow_snapshot(
+            db, task.owner_user_id, int(target_user_id), rule_result,
+            (owner_rev, target_rev), consent,
+        )
+        return f"compatibility-snapshot:{result_ref}", owner_rev
+
+    prompt_request = await load_compatibility_prompt_inputs(
+        db, task.owner_user_id, int(target_user_id)
+    )
+    if prompt_request is None:
+        # 投影在任务排队期间失效：按规则结果收尾，不再走 LLM。
+        result_ref = await write_shadow_snapshot(
+            db, task.owner_user_id, int(target_user_id), rule_result,
+            (owner_rev, target_rev), consent,
+        )
+        return f"compatibility-snapshot:{result_ref}", owner_rev
+
+    gateway = AIGateway(timeout_seconds=settings.ai_gateway_timeout_seconds)
+    outcome = await gateway.compare_compatibility(
+        _gateway_context(task), prompt_request
+    )
+    if outcome.error_code is not None or outcome.result is None:
+        # 降级：写规则结果并标注 LLM_FALLBACK_RULE（不外显），读取端永远有可用快照。
+        # 降级必须可观测：warning 日志 + 指标——否则 LLM 故障期间任务层 100%
+        # 成功，全量 pair 静默退化为规则分而无人察觉。
+        logger.warning(
+            "compatibility_llm_degraded task_id=%s viewer=%s target=%s error=%s",
+            task.task_id, task.owner_user_id, target_user_id, outcome.error_code,
+        )
+        emit_ai_metric("llm_degraded", 1, {"task_type": COMPATIBILITY_LLM_TASK_TYPE})
+        degraded = replace(
+            rule_result,
+            reason_codes=rule_result.reason_codes + (REASON_LLM_FALLBACK,),
+        )
+        result_ref = await write_shadow_snapshot(
+            db, task.owner_user_id, int(target_user_id), degraded,
+            (owner_rev, target_rev), consent,
+        )
+        return f"compatibility-snapshot:{result_ref}", owner_rev
+
+    llm = outcome.result
+    v2t = float(llm.viewer_to_target.score)
+    t2v = float(llm.target_to_viewer.score)
+    pair_score = 2 * v2t * t2v / (v2t + t2v) if (v2t + t2v) else 0.0
+    llm_result = CompatibilityResult.ready(
+        pair_score=pair_score,
+        directions=(v2t, t2v),
+        coverage=rule_result.coverage,
+        reason_codes=(),
+    )
+    result_ref = await write_shadow_snapshot(
+        db, task.owner_user_id, int(target_user_id), llm_result,
+        (owner_rev, target_rev), consent,
+        engine=ENGINE_LLM,
+        brand_label=BRAND_LABEL,
+        score_semantics=SCORE_SEMANTICS_LLM,
+        ttl_minutes=settings.ai_compatibility_llm_ttl_minutes,
+        direction_payload={
+            "viewer_to_target": {
+                "score": llm.viewer_to_target.score,
+                "reasons": list(llm.viewer_to_target.reasons),
+            },
+            "target_to_viewer": {
+                "score": llm.target_to_viewer.score,
+                "reasons": list(llm.target_to_viewer.reasons),
+            },
+        },
+    )
+    return f"compatibility-snapshot:{result_ref}", owner_rev
+
+
+def _gateway_context(task: AiTaskRecord):
+    from app.services.ai.base import AITaskContext
+
+    return AITaskContext(
+        task_id=task.task_id,
+        request_id=f"ai-task-{task.task_id}",
+        scene=str(task.scene or COMPATIBILITY_CONSENT_SCOPE),
+    )
+
+
+async def request_compatibility_llm_refresh(
+    db: AsyncSession, viewer_id: int, target_user_id: int
+) -> CompatibilityRecomputeAccepted | None:
+    """读取端触发：无可用快照（缺失/过期）时入队 llm 精算任务（同 pair 同日至多一个）。
+
+    门禁与 recompute 同源：viewer==target / 不可见 → CandidateNotVisible；
+    双方 ``compatibility_shadow`` 授权任一缺失 → 返回 None（不触发，不报错——
+    未授权用户查看匹配度页是正常路径）。已有新鲜 llm 快照 → None。
+    不 commit。
+    """
+    if int(viewer_id) == int(target_user_id):
+        raise CandidateNotVisible()
+    decision = await candidate_visibility_service.decide(
+        db, viewer_id, target_user_id, VisibilityScene.PROFILE
+    )
+    if not decision.allowed:
+        raise CandidateNotVisible()
+    viewer_consent = await _load_active_consent(
+        db, viewer_id, COMPATIBILITY_CONSENT_SCOPE
+    )
+    target_consent = await _load_active_consent(
+        db, target_user_id, COMPATIBILITY_CONSENT_SCOPE
+    )
+    if viewer_consent is None or target_consent is None:
+        return None
+
+    # 新鲜 llm 快照命中 → 无需精算（TTL 内二次查看不触发新任务）。
+    fresh = await db.execute(
+        text(
+            "SELECT id FROM ai_compatibility_snapshot "
+            "WHERE viewer_user_id = :viewer AND target_user_id = :target "
+            "AND engine = :engine AND status = 'ready' "
+            "AND (expires_at IS NULL OR expires_at > UTC_TIMESTAMP()) "
+            "ORDER BY id DESC LIMIT 1"
+        ),
+        {
+            "viewer": int(viewer_id),
+            "target": int(target_user_id),
+            "engine": ENGINE_LLM,
+        },
+    )
+    if fresh.first() is not None:
+        return None
+
+    today = _now_utc().strftime("%Y%m%d")
+    snapshot_id = f"cp_{uuid.uuid4().hex}"
+    viewer_rev = await _load_revision_vector(db, viewer_id)
+    target_rev = await _load_revision_vector(db, target_user_id)
+    consent_snapshot = {
+        "viewer": _consent_snapshot(viewer_consent),
+        "target": _consent_snapshot(target_consent),
+    }
+    task = await enqueue_task(
+        db=db,
+        owner_user_id=viewer_id,
+        task_type=COMPATIBILITY_LLM_TASK_TYPE,
+        idempotency_key=f"compat-llm-{int(viewer_id)}-{int(target_user_id)}-{today}",
+        request_hash=hashlib.sha256(
+            f"compat-llm:{int(viewer_id)}:{int(target_user_id)}:{today}".encode()
+        ).hexdigest(),
+        revisions=viewer_rev,
+        consent=consent_snapshot,
+    )
+    existing_payload = task.payload_summary or {}
+    if not existing_payload.get("snapshot_id"):
+        # 首创建任务：回填受控摘要（与 recompute 同一防死锁写法——重放方不重写）。
+        await db.execute(
+            text(
+                "UPDATE ai_task SET payload_summary = :payload_summary, "
+                "updated_at = UTC_TIMESTAMP() WHERE task_id = :task_id"
+            ),
+            {
+                "payload_summary": json.dumps(
+                    {
+                        "snapshot_id": snapshot_id,
+                        "target_user_id": int(target_user_id),
+                        "viewer_source_revision": viewer_rev.as_dict(),
+                        "target_source_revision": target_rev.as_dict(),
+                    },
+                    ensure_ascii=False,
+                ),
+                "task_id": task.task_id,
+            },
+        )
+    else:
+        snapshot_id = str(existing_payload["snapshot_id"])
+    # 幂等回放可能命中终态任务（昨日失败/已成功但结果已过期）：把它当 202
+    # 会让客户端整天轮询一个永远不产出结果的任务。仅对真正在途的任务返回
+    # 202；终态返回 None，由路由回退 200 原读取结果（诚实），次日新键重试。
+    status_value = str(getattr(task.status, "value", task.status))
+    if status_value not in {"queued", "leased", "running", "retry_wait"}:
+        return None
+    return CompatibilityRecomputeAccepted(
+        snapshot_id=snapshot_id,
+        task_id=task.task_id,
+        status=CompatibilitySnapshotStatus.COVERAGE_INSUFFICIENT.value,
+        poll_after_ms=1000,
+        expires_at=_now_utc()
+        + timedelta(minutes=settings.ai_compatibility_llm_ttl_minutes),
+    )
+
+
 def register_compatibility_handlers() -> None:
-    """把 ``compatibility`` 注册进 AI Worker 的 TASK_HANDLERS。
+    """把 ``compatibility``/``compatibility_llm`` 注册进 AI Worker 的 TASK_HANDLERS。
 
     模块导入（路由导入本模块）即生效；幂等，可在测试中重复调用。
     """
@@ -1423,6 +1781,9 @@ def register_compatibility_handlers() -> None:
 
     worker_module.TASK_HANDLERS.setdefault(
         COMPATIBILITY_TASK_TYPE, compatibility_execute_handler
+    )
+    worker_module.TASK_HANDLERS.setdefault(
+        COMPATIBILITY_LLM_TASK_TYPE, compatibility_llm_execute_handler
     )
 
 

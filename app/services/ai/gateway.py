@@ -25,6 +25,8 @@ from app.services.ai.audit import GenerationAuditEvent, record_generation_audit
 from app.services.ai.base import (
     AIProvider,
     AITaskContext,
+    CompatibilityCompareRequest,
+    CompatibilityCompareResult,
     GatewayCallRecord,
     ModerationResult,
     NarrativeResult,
@@ -401,6 +403,17 @@ class AIGateway:
         return await self.invoke(
             context, "generate_search_suggestions", request,
             response_type=SearchSuggestResult,
+        )
+
+    async def compare_compatibility(
+        self, context: AITaskContext, request: CompatibilityCompareRequest
+    ) -> InvokeOutcome[CompatibilityCompareResult]:
+        """双向匹配度精算（WP-C1b）：主 provider 一次性调用。"""
+        return await self.invoke(
+            context,
+            "compare_compatibility",
+            request,
+            response_type=CompatibilityCompareResult,
         )
 
     async def generate_reply(

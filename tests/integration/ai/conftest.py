@@ -80,6 +80,7 @@ def ai_test_environment() -> Iterator[dict[str, str]]:
         "AI_PROFILE_ENABLED": "true",
         "AI_SEARCH_ENABLED": "true",
         "AI_COMPATIBILITY_SHADOW_ENABLED": "true",
+        "AI_RECOMMEND_ENABLED": "true",
     }
     previous = {name: os.environ.get(name) for name in names}
     os.environ.update(names)
@@ -98,6 +99,7 @@ def ai_test_environment() -> Iterator[dict[str, str]]:
         settings_patch.setattr(settings, "ai_profile_enabled", True)
         settings_patch.setattr(settings, "ai_search_enabled", True)
         settings_patch.setattr(settings, "ai_compatibility_shadow_enabled", True)
+        settings_patch.setattr(settings, "ai_recommend_enabled", True)
         yield names
     finally:
         settings_patch.undo()
@@ -157,6 +159,7 @@ async def sweep_test_users(
                 "DELETE FROM ai_profile_revision_field WHERE revision_id IN (SELECT id FROM ai_profile_revision WHERE user_id BETWEEN 9876543000 AND 9876549999)",
                 "DELETE FROM ai_profile_revision WHERE user_id BETWEEN 9876543000 AND 9876549999",
                 "DELETE FROM ai_compatibility_snapshot WHERE viewer_user_id BETWEEN 9876543000 AND 9876549999 OR target_user_id BETWEEN 9876543000 AND 9876549999",
+                "DELETE FROM ai_recommendation_snapshot WHERE viewer_user_id BETWEEN 9876543000 AND 9876549999 OR target_user_id BETWEEN 9876543000 AND 9876549999",
                 "DELETE FROM ai_feature_projection WHERE subject_user_id BETWEEN 9876543000 AND 9876549999",
                 "DELETE FROM ai_task WHERE owner_user_id BETWEEN 9876543000 AND 9876549999",
                 "DELETE FROM ai_consent_operation WHERE user_id BETWEEN 9876543000 AND 9876549999",

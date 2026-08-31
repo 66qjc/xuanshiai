@@ -751,6 +751,10 @@ class CompatibilityFakeSession:
                 and int(row["subject_user_id"]) in wanted
             ]
             return _MappingResult(rows)
+        if "FROM ai_compatibility_snapshot" in sql and "engine" in values:
+            # WP-C1 llm 新鲜快照查询（绑定名 viewer/target/engine，与规则读取不同）：
+            # 测试 store 无 llm 快照 → 空（fresh miss）。
+            return _MappingResult([])
         if "FROM ai_compatibility_snapshot" in sql:
             row = store.latest_snapshot(
                 int(values["viewer_user_id"]), int(values["target_user_id"])
@@ -992,8 +996,11 @@ def test_get_route_commits_stale_marking_for_stale_snapshot(
         app.dependency_overrides.pop(get_current_user, None)
         app.dependency_overrides.pop(get_db, None)
 
-    assert response.status_code == 200
-    assert response.json()["status"] == CompatibilitySnapshotStatus.STALE.value
+    # WP-C1 起：stale 属"无可用快照"，路由触发 llm 精算并返回 202+任务。
+    assert response.status_code == 202
+    body = response.json()
+    assert body["status"] == CompatibilitySnapshotStatus.COVERAGE_INSUFFICIENT.value
+    assert body["task_id"]
     # 落库标记真实持久化：UPDATE 已执行且路由 commit 被调用。
     assert compatibility_store.snapshots[0]["status"] == "stale"
     assert fake_db.commits >= 1

@@ -588,8 +588,10 @@ def register_business_handlers() -> None:
     ``setdefault`` 使注册幂等（测试中重复调用安全）。
     """
     from app.services.ai.compatibility import (
+        COMPATIBILITY_LLM_TASK_TYPE,
         COMPATIBILITY_TASK_TYPE,
         compatibility_execute_handler,
+        compatibility_llm_execute_handler,
     )
     from app.services.ai.profile import (
         CLEANUP_TASK_TYPE,
@@ -598,6 +600,10 @@ def register_business_handlers() -> None:
         cleanup_handler,
         generate_profile_narrative_handler,
         profile_projection_handler,
+    )
+    from app.services.ai.recommend import (
+        RECOMMEND_TASK_TYPE,
+        recommend_rebuild_handler,
     )
     from app.services.ai.search import (
         SEARCH_EXECUTE_TASK_TYPE,
@@ -616,9 +622,13 @@ def register_business_handlers() -> None:
     TASK_HANDLERS.setdefault(SEARCH_EXECUTE_TASK_TYPE, search_execute_handler)
     TASK_HANDLERS.setdefault(SEARCH_SUGGEST_TASK_TYPE, search_suggest_handler)
     TASK_HANDLERS.setdefault(COMPATIBILITY_TASK_TYPE, compatibility_execute_handler)
+    TASK_HANDLERS.setdefault(
+        COMPATIBILITY_LLM_TASK_TYPE, compatibility_llm_execute_handler
+    )
     TASK_HANDLERS.setdefault(PROJECTION_TASK_TYPE, profile_projection_handler)
     TASK_HANDLERS.setdefault(CLEANUP_TASK_TYPE, cleanup_handler)
     TASK_HANDLERS.setdefault(NARRATIVE_TASK_TYPE, generate_profile_narrative_handler)
+    TASK_HANDLERS.setdefault(RECOMMEND_TASK_TYPE, recommend_rebuild_handler)
     TASK_HANDLERS.setdefault(VOICE_TRANSCRIBE_TASK_TYPE, voice_transcribe_handler)
 
 

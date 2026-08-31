@@ -45,6 +45,18 @@ class CompatibilitySnapshotRead(BaseModel):
     privacy_revision_pair: dict[str, int] = Field(default_factory=dict)
     experiment_bucket: str = "shadow"
     display_eligible: bool = False
+    engine: str = Field(
+        default="rule-v1",
+        description="WP-C1：最近一次计算来源 rule-v1/llm-v1",
+    )
+    brand_label: str | None = Field(
+        default=None,
+        description="WP-C4：AI 算法标注（默认「来自良配Ai算法」，随读取端点下发）",
+    )
+    reason_texts: dict[str, list[str]] = Field(
+        default_factory=dict,
+        description="WP-C1：llm 精算的可解释中文理由（按方向分组，rule 引擎为空）",
+    )
     disclaimer: str = "仅根据双方当前可见且已确认资料整理，供了解和破冰参考"
     calculated_at: datetime
     expires_at: datetime
