@@ -48,7 +48,11 @@ from app.services.ai.base import (
     StructuredExtractRequest,
     StructuredExtractResult,
 )
-from app.services.ai.prompts.profile_extract import build_profile_extract_prompt, build_profile_update_clarify_prompt
+from app.services.ai.prompts.profile_extract import (
+    build_profile_extract_prompt,
+    build_profile_master_extract_prompt,
+    build_profile_update_clarify_prompt,
+)
 from app.services.ai.prompts.compatibility_compare import build_compatibility_compare_prompt
 from app.services.ai.prompts.profile_narrative import build_profile_narrative_prompt
 from app.services.ai.prompts.search_parse import build_search_parse_prompt
@@ -954,6 +958,8 @@ class _OpenAICompatProvider:
     ) -> StructuredExtractResult:
         if request.session_kind == "update":
             return await self._structured_extract_update(request)
+        if request.session_kind == "master":
+            return await self._structured_extract_master(request)
         prompt = build_profile_extract_prompt(
             request.subject,
             request.turn_texts,
@@ -1018,6 +1024,58 @@ class _OpenAICompatProvider:
     ) -> StructuredExtractResult:
         """update 会话澄清式抽取：产出 clarifying_question 或 entry patch。"""
         prompt = build_profile_update_clarify_prompt(
+            request.subject,
+            request.turn_texts,
+            entry_digest=request.entry_digest,
+        )
+        data = await self._chat_json(prompt)
+        subject = ProfileSubject(request.subject)
+        patches_data = data.get("patches", []) if isinstance(data, dict) else []
+        patches: list[ExtractedPatch] = []
+        for item in patches_data:
+            if not isinstance(item, dict):
+                continue
+            try:
+                patches.append(
+                    ExtractedPatch(
+                        action=item.get("action", ""),
+                        category=item.get("category", ""),
+                        content=item.get("content", ""),
+                        replaces_field_key=item.get("replaces_field_key"),
+                        subject=subject,
+                        source_quote=item.get("source_quote"),
+                        confidence=_safe_confidence(item.get("confidence")),
+                        needs_confirmation=True,
+                        confirmation_status="suggested",
+                        schema_version=_PROFILE_SCHEMA_VERSION,
+                        prompt_version=_PROFILE_PROMPT_VERSION,
+                        policy_revision=request.policy_revision,
+                    )
+                )
+            except ValidationError:
+                continue
+        question = data.get("clarifying_question") if isinstance(data, dict) else None
+        if not isinstance(question, str) or not question.strip():
+            question = None
+        return StructuredExtractResult(
+            schema_version=_PROFILE_SCHEMA_VERSION,
+            fields=(),
+            entries=(),
+            clarifying_question=question,
+            patches=tuple(patches),
+        )
+
+    async def _structured_extract_master(
+        self, request: StructuredExtractRequest
+    ) -> StructuredExtractResult:
+        """master 会话对话抽取（设计 Task 6）：只产 entry patch，禁止澄清问题。
+
+        解析与 update 同构（patches + clarifying_question 透传）：master prompt
+        契约禁止澄清问题、允许 0 条 patch；若模型违反契约仍返回非空
+        clarifying_question，原样透传给 handler——handler 侧对契约违规终态
+        失败（fail-closed），provider 不静默吞掉。
+        """
+        prompt = build_profile_master_extract_prompt(
             request.subject,
             request.turn_texts,
             entry_digest=request.entry_digest,

@@ -33,6 +33,11 @@ _SYSTEM_HEADER = (
     "7. 不得编造用户未提供的信息。\n"
     "8. 回复口语化，通常 2-4 句话，不要长篇大论。"
     "如果是语音输入的回复，要适合 TTS 播放——自然停顿，不书面。\n"
+    "9. 话题白名单：只围绕用户的自我认知、三观与感情观、生活方式与作息饮食、"
+    "物理位置（城市/居住地）、基本情况（年龄/婚姻状态/学历/职业/身高/收入）提问"
+    "与展开。用户把话题带到白名单之外时，不接话、不说教，温和地拉回："
+    "先用一句话承认对方说的内容，再自然地把话题引回白名单。"
+    "若用户明确拒绝回答某项，轻轻放下换角度，不再追问同一项。\n"
 )
 
 # 会话开场白——用户进入墨相师页面时，由后端直接推送，不经过 LLM。
@@ -73,21 +78,65 @@ def _format_narrative_context(narrative_data: dict[str, Any] | None) -> str:
     )
 
 
+# 缺失基础信息的 field_key → 中文提示（与 voice_reply 的 fieldLabel 语义对齐）。
+# 未知 key 原样透传：调用方也可在传入前自行格式化成中文名。
+_MISSING_FIELD_LABELS = {
+    "age": "年龄",
+    "city_code": "所在城市",
+    "marriage_status": "婚姻状况",
+    "education_level": "学历",
+    "height_cm": "身高",
+    "income_band": "收入范围",
+    "occupation_group": "职业",
+}
+
+
+def _missing_label(field_key: str) -> str:
+    return _MISSING_FIELD_LABELS.get(field_key, field_key)
+
+
+def build_build_context(
+    missing_hard: list[str], confirmed_summary: str, percent: float
+) -> str:
+    """构建模式上下文（独立 system 段）：缺什么、已知什么、当前进度。
+
+    ``missing_hard`` 项若为 field_key（如 ``city_code``）按内置中文标签渲染，
+    未知名原样透传（调用方也可直接传中文名）。
+    """
+    parts = [
+        "当前处于画像建构模式（对话目标：自然收集齐用户画像），进度约 "
+        f"{percent:.0f}%。",
+    ]
+    if missing_hard:
+        parts.append("还缺少的基础信息：" + "、".join(
+            _missing_label(key) for key in missing_hard
+        ) + "。在对话自然处把它们问出来，一次只问一个，不要像审表。")
+    else:
+        parts.append("基础信息已齐，继续丰富生活方式与三观类内容。")
+    if confirmed_summary:
+        parts.append("已确认的画像内容（呼应即可，不要复述）：\n" + confirmed_summary)
+    return "\n".join(parts)
+
+
 def build_master_prompt(
     user_message: str,
     history: list[dict[str, str]],
     narrative_context: str = "",
+    build_context: str = "",
 ) -> list[dict[str, str]]:
-    """组装多轮消息列表：system + 画像上下文 + 历史 + 当前用户消息。
+    """组装多轮消息列表：system + 画像上下文 + 构建上下文 + 历史 + 当前用户消息。
 
     ``history`` 为 ``[{role, content}, ...]`` 格式，只保留最近若干轮。
     ``narrative_context`` 来自 :func:`_format_narrative_context`。
+    ``build_context`` 来自 :func:`build_build_context`，空串表示纯聊模式（不注入）。
     """
     messages: list[dict[str, str]] = [
         {"role": "system", "content": _SYSTEM_HEADER}
     ]
     if narrative_context:
         messages.append({"role": "system", "content": narrative_context})
+    if build_context:
+        messages.append({"role": "system", "content": build_context})
     messages.extend(history)
     messages.append({"role": "user", "content": user_message})
     return messages

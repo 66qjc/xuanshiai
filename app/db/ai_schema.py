@@ -17,6 +17,14 @@ from __future__ import annotations
 
 from typing import Any
 
+# session_kind：build=建构问答 / update=对话式追加 / master=墨相师对话建构。
+# 枚举追加只增不改，存量行零影响；默认 'build' 保证旧会话行为不变。
+# 建表 DDL 与旧库补列（AI_PROFILE_SESSION_REQUIRED_COLUMNS）统一引用本常量，同源防漂移。
+AI_PROFILE_SESSION_KIND_DDL = (
+    "`session_kind` enum('build','update','master') NOT NULL DEFAULT 'build' "
+    "COMMENT 'build=建构问答/update=对话式追加/master=墨相师对话建构'"
+)
+
 AI_TABLES = {
     # ============ AI-CORE（§10.1）============
     "ai_consent_grant": """
@@ -96,14 +104,14 @@ AI_TABLES = {
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='AI Provider 调用最小审计，不存原始 prompt/response'
     """,
     # ============ M04 AI 画像（§10.2）============
-    "ai_profile_session": """
+    "ai_profile_session": f"""
         CREATE TABLE IF NOT EXISTS `ai_profile_session` (
             `id` bigint unsigned NOT NULL AUTO_INCREMENT,
             `session_id` varchar(64) NOT NULL,
             `user_id` bigint unsigned NOT NULL,
             `subject` varchar(24) NOT NULL COMMENT 'personal/ideal_partner',
             `input_mode` varchar(16) NOT NULL DEFAULT 'text',
-            `session_kind` enum('build','update') NOT NULL DEFAULT 'build' COMMENT 'build=建构问答/update=对话式追加（WP-P4，澄清式追问+entry patch）',
+            {AI_PROFILE_SESSION_KIND_DDL},
             `status` varchar(24) NOT NULL DEFAULT 'draft' COMMENT 'draft/extracting/awaiting_confirmation/paused/published/failed/cancelled/stale',
             `active_status` tinyint NOT NULL DEFAULT '1' COMMENT '1活动 0已关闭',
             `consent_version` varchar(32) NOT NULL,
@@ -627,25 +635,43 @@ def ensure_ai_profile_entry_columns(cursor: Any) -> None:
 # WP-P4 / F5：画像会话 update 语义补列（旧库幂等补列）
 # ----------------------------------------------------------------------
 #
-# session_kind 默认 'build' 保证存量会话行为零变化；update 会话是加法通道。
+# session_kind：build=建构问答 / update=对话式追加 / master=墨相师对话建构。
+# 枚举追加只增不改，存量行零影响；默认 'build' 保证旧会话行为不变。
+# 补列值统一引用 AI_PROFILE_SESSION_KIND_DDL，与建表 DDL 同源防漂移。
 AI_PROFILE_SESSION_REQUIRED_COLUMNS: dict[str, str] = {
-    "session_kind": (
-        "`session_kind` enum('build','update') NOT NULL DEFAULT 'build' "
-        "COMMENT 'build=建构问答/update=对话式追加（WP-P4）'"
-    ),
+    "session_kind": AI_PROFILE_SESSION_KIND_DDL,
 }
 
 
+def session_kind_needs_upgrade(current_column_type: str) -> bool:
+    """判断存量 session_kind 列定义是否缺 'master'（append enum 值是元数据级
+    变更，无需重建表；'build'/'update' 存量值保持有效）。"""
+    return "'master'" not in (current_column_type or "")
+
+
 def ensure_ai_profile_session_columns(cursor: Any) -> None:
-    """Idempotently add update-session columns to ``ai_profile_session``。"""
+    """Idempotently add update-session columns to ``ai_profile_session``。
+
+    存量 session_kind 列若仍为 enum('build','update')（缺 'master'），执行
+    元数据级 MODIFY 追加枚举值（append 不重建表，'build'/'update' 存量值保持
+    有效）；upgrade 后 Type 已含 'master'，再跑不重复 ALTER（幂等）。
+    """
     try:
         cursor.execute("SHOW COLUMNS FROM `ai_profile_session`")
-        existing = {row["Field"] for row in cursor.fetchall()}
+        existing = {row["Field"]: row for row in cursor.fetchall()}
     except Exception:  # noqa: BLE001 - legacy bootstrap is best effort
         return
     for column_name, column_def in AI_PROFILE_SESSION_REQUIRED_COLUMNS.items():
         if column_name not in existing:
             cursor.execute(f"ALTER TABLE `ai_profile_session` ADD COLUMN {column_def}")
+    session_kind_column = existing.get("session_kind")
+    if session_kind_column is not None and session_kind_needs_upgrade(
+        str(session_kind_column.get("Type") or "")
+    ):
+        cursor.execute(
+            f"ALTER TABLE `ai_profile_session` MODIFY COLUMN "
+            f"{AI_PROFILE_SESSION_KIND_DDL}"
+        )
 
 
 # ----------------------------------------------------------------------

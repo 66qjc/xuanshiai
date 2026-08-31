@@ -182,6 +182,82 @@ _UPDATE_JSON_FORMAT_INSTRUCTION = (
 )
 
 
+# 设计 Task 6：墨相师对话建构（master 会话）的对话抽取 prompt。与 update 的
+# 澄清式契约不同：澄清追问由对话中的墨相师承担，抽取器**禁止**输出
+# clarifying_question；对话里没有可固化内容时允许 0 条 patch（空数组是合法
+# 结果，不硬凑）。faithfulness 硬约束与 update 相同。
+_MASTER_SYSTEM_HEADER = (
+    "你是一个画像建构助手，正在陪用户自然对话，并从中沉淀画像条目候选。"
+    "你的任务只有一个：把用户已经表达清晰的内容固化为条目。规则：\n"
+    "  - 只能基于用户陈述内容归纳，禁止编造、引申用户没有表达过的偏好或细节；\n"
+    "  - 对话里没有可固化内容时，patches 输出空数组——这是正常结果，"
+    "不要硬凑、不要输出用户没有表达过的内容；\n"
+    "  - 禁止输出 clarifying_question（澄清追问由对话中的墨相师承担，"
+    "你不负责提问），该字段必须为 null；\n"
+    "  - 每条 patch 含 action（add=新增/modify=改写既有条目）、category、"
+    "content（1 到 200 字）、replaces_field_key（仅 modify 需要，指向被改写"
+    "条目的 field_key）；\n"
+    "  - category 只能取：basics（基本情况）/ occupation（工作状态）/ "
+    "appearance（外形特征）/ personality（性格特征）/ values（价值观）/ "
+    "interests（兴趣爱好）/ routine（作息习惯）/ diet（饮食习惯）/ "
+    "life_plan（生活规划）。\n"
+)
+
+_MASTER_JSON_FORMAT_INSTRUCTION = (
+    "请以 JSON 格式输出，根对象形如：\n"
+    "{\n"
+    "  \"clarifying_question\": null,\n"
+    "  \"patches\": []\n"
+    "}\n"
+    "或\n"
+    "{\n"
+    "  \"clarifying_question\": null,\n"
+    "  \"patches\": [\n"
+    "    {\n"
+    "      \"action\": \"add\",\n"
+    "      \"category\": \"interests\",\n"
+    "      \"content\": \"喜欢看展，周末常去美术馆\",\n"
+    "      \"source_quote\": \"我喜欢看展，周末常去美术馆\",\n"
+    "      \"confidence\": 0.9\n"
+    "    }\n"
+    "  ]\n"
+    "}"
+)
+
+
+def build_profile_master_extract_prompt(
+    subject: str,
+    turn_texts: tuple[str, ...],
+    entry_digest: str | None = None,
+) -> str:
+    """构造 master 会话对话抽取 prompt（设计 Task 6）。
+
+    ``turn_texts`` 是本会话按时间顺序的用户陈述；``entry_digest`` 是该维度
+    已发布条目摘要，供 modify patch 定位被改写条目，可为 None。契约：允许
+    返回 0 条 patch，禁止返回澄清问题——澄清由墨相师对话承担。
+    """
+    is_personal = subject == ProfileSubject.PERSONAL.value
+    subject_label = "个人画像" if is_personal else "理想型画像"
+    dialogue_block = "\n\n".join(
+        f"【第 {idx + 1} 句】\n{text}" for idx, text in enumerate(turn_texts) if text
+    )
+    if not dialogue_block:
+        dialogue_block = "（用户尚未陈述）"
+    digest_block = ""
+    if entry_digest:
+        digest_block = (
+            f"\n该维度当前已发布的条目（modify 时 replaces_field_key 从中选取）：\n"
+            f"{entry_digest}\n"
+        )
+    return (
+        f"{_MASTER_SYSTEM_HEADER}\n\n"
+        f"建构目标：{subject_label}。\n"
+        f"{digest_block}\n"
+        f"{_MASTER_JSON_FORMAT_INSTRUCTION}\n\n"
+        f"以下是用户在本会话中的陈述：\n{dialogue_block}"
+    )
+
+
 def build_profile_update_clarify_prompt(
     subject: str,
     turn_texts: tuple[str, ...],

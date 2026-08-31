@@ -67,6 +67,7 @@ class MoxiangMasterOrchestrator:
     state: MasterState = field(default=MasterState.IDLE)
     _history: list[dict[str, str]] = field(default_factory=list)
     _narrative_context: str = ""
+    _build_context: str = ""
     _last_reply_text: str = ""
     _generation_id: int = 0
     _last_request_id: str = ""
@@ -74,6 +75,10 @@ class MoxiangMasterOrchestrator:
     def set_narrative_context(self, context: str) -> None:
         """设置用户画像上下文（session_start 时调用）。"""
         self._narrative_context = context
+
+    def set_build_context(self, context: str) -> None:
+        """设置建构模式上下文（缺失硬字段/已确认摘要/进度），空串=纯聊模式。"""
+        self._build_context = context
 
     async def stream_reply(
         self,
@@ -93,7 +98,8 @@ class MoxiangMasterOrchestrator:
         self._last_request_id = request_id
         gen = self._generation_id
         messages = build_master_prompt(
-            user_text, self._history, self._narrative_context
+            user_text, self._history, self._narrative_context,
+            build_context=self._build_context,
         )
         try:
             provider = get_provider(settings.ai_provider)

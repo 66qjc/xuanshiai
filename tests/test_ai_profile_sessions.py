@@ -368,9 +368,21 @@ class FakeProfileSession:
             return _WriteResult(rowcount=1 if applied else 0)
         # ---- profile tables ----
         if "INSERT INTO ai_profile_session" in sql:
+            # build/master 创建把 session_kind 写成 SQL 字面量（绑定参数中无
+            # session_kind），假库按真实 DB 语义从语句补齐；update 走 :session_kind
+            # 绑定参数，无需补齐。
+            if "'master'" in sql:
+                values = {**values, "session_kind": "master"}
+            elif "'build'" in sql:
+                values = {**values, "session_kind": "build"}
             self._store.insert_session(values)
             return _WriteResult(rowcount=1)
         if "INSERT INTO ai_profile_turn" in sql:
+            if "'assistant'" in sql:
+                # ``_insert_assistant_turn`` 以 SQL 字面量写 role='assistant'
+                # （绑定参数中无 role），假库按真实 DB 语义记录 assistant 行，
+                # 而非落回 role 缺省的 'user'。
+                values = {**values, "role": "assistant"}
             self._store.insert_turn(values)
             return _WriteResult(rowcount=1)
         if "INSERT INTO ai_profile_draft_field" in sql:

@@ -125,6 +125,10 @@ class Settings(BaseSettings):
     # 良配对齐：默认 7/10 ≈ 67%，"无需完成全部题目，进度 67% 左右可提前
     # 建构画像"。进度提示与发布硬门槛共用此值，避免两套数字漂移。
     ai_profile_min_fields: int = Field(default=7, ge=1, le=20)
+    # 墨相师对话建构门槛（设计 D2/D6）：硬字段全齐 + 折算总分百分比阈值。
+    ai_master_build_gate: float = 0.60
+    # 墨相师硬字段白名单（逗号分隔，空串=内置默认 城市/年龄/婚姻状态）。
+    ai_master_hard_fields: str = ""
     # 匹配度外显灰度（方案 WP-C2 / 决策 D6）：off=影子运行不外显（现状）；
     # bucket=按 viewer 稳定哈希放量 ai_compatibility_display_bucket_pct%；
     # on=全量外显。仅改变 ai_compatibility_snapshot.display_eligible 的写入值，

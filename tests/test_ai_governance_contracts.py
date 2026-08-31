@@ -1,11 +1,20 @@
 from pathlib import Path
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
-WORKSPACE_ROOT = BACKEND_ROOT.parent
+
+
+def find_workspace_root() -> Path:
+    """向上查找包含 PRODUCT.md 的工作区根（兼容 worktree 目录深度）。"""
+    current = BACKEND_ROOT
+    for _ in range(5):
+        if (current / "PRODUCT.md").exists():
+            return current
+        current = current.parent
+    raise FileNotFoundError("PRODUCT.md not found above backend root")
 
 
 def test_ai_product_and_security_decisions_are_frozen() -> None:
-    product = (WORKSPACE_ROOT / "PRODUCT.md").read_text(encoding="utf-8")
+    product = (find_workspace_root() / "PRODUCT.md").read_text(encoding="utf-8")
     decisions = (BACKEND_ROOT / "docs/ai/AI_PRODUCT_SECURITY_DECISIONS.md").read_text(
         encoding="utf-8"
     )
