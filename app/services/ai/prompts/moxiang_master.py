@@ -38,10 +38,28 @@ _SYSTEM_HEADER = (
     "与展开。用户把话题带到白名单之外时，不接话、不说教，温和地拉回："
     "先用一句话承认对方说的内容，再自然地把话题引回白名单。"
     "若用户明确拒绝回答某项，轻轻放下换角度，不再追问同一项。\n"
+    "10. 双画像阶段边界：当前阶段由系统明确指定为「我的墨相」或「愿遇之相」。"
+    "在「我的墨相」阶段，只讨论并沉淀用户自己的性格、恋爱观、关系边界和生活方式；"
+    "在「愿遇之相」阶段，只讨论并沉淀用户明确表达的伴侣偏好和期待的相处方式。"
+    "不要在一句话里自行猜测并同时写入两个主体。\n"
+    "11. 用户提到现实中的具体对象时，可以陪用户理解自己的感受，但不要把对方的"
+    "人格判断当成事实，也不要默认写入「愿遇之相」。先追问这是否代表用户自己的偏好；"
+    "只有用户明确确认「这是我希望未来伴侣具备的特质」后，才把话题转为偏好表达。\n"
 )
 
 # 会话开场白——用户进入墨相师页面时，由后端直接推送，不经过 LLM。
 OPENING_MESSAGE = "你好，我是墨相师。我会陪你说说话，帮你慢慢看见自己的样子。不用紧张，想到什么说什么就好。你想从哪里开始聊？"
+IDEAL_PARTNER_OPENING_MESSAGE = (
+    "接下来我们聊聊你期待遇见怎样的人。可以从让你心动的性格、相处时的感受，"
+    "或者你看重的关系方式说起。"
+)
+
+
+def opening_message_for_subject(subject: str) -> str:
+    """返回当前画像阶段的安全开场白。"""
+    if subject == "ideal_partner":
+        return IDEAL_PARTNER_OPENING_MESSAGE
+    return OPENING_MESSAGE
 
 
 def _format_narrative_context(narrative_data: dict[str, Any] | None) -> str:
@@ -96,14 +114,25 @@ def _missing_label(field_key: str) -> str:
 
 
 def build_build_context(
-    missing_hard: list[str], confirmed_summary: str, percent: float
+    missing_hard: list[str],
+    confirmed_summary: str,
+    percent: float,
+    *,
+    subject: str = "personal",
 ) -> str:
     """构建模式上下文（独立 system 段）：缺什么、已知什么、当前进度。
 
     ``missing_hard`` 项若为 field_key（如 ``city_code``）按内置中文标签渲染，
     未知名原样透传（调用方也可直接传中文名）。
     """
+    subject_label = "愿遇之相" if subject == "ideal_partner" else "我的墨相"
+    subject_rule = (
+        "本阶段只沉淀用户明确表达的伴侣偏好；具体对象的未经确认观察不写入画像。"
+        if subject == "ideal_partner"
+        else "本阶段只沉淀用户自己的事实、恋爱观和关系边界；伴侣偏好留到愿遇之相阶段。"
+    )
     parts = [
+        f"当前建构主体：{subject_label}。{subject_rule}",
         "当前处于画像建构模式（对话目标：自然收集齐用户画像），进度约 "
         f"{percent:.0f}%。",
     ]

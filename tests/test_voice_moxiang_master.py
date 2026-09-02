@@ -261,3 +261,21 @@ def test_reset_clears_last_reply():
     orchestrator._last_reply_text = "旧回复"
     orchestrator.reset()
     assert orchestrator._last_reply_text == ""
+
+
+def test_hydrate_history_restores_existing_turns_for_next_reply() -> None:
+    """重连后的编排器应可恢复持久化 user/assistant turns。"""
+    orchestrator = MoxiangMasterOrchestrator(
+        ai_gateway=_make_mock_ai_gateway(),
+        voice_gateway=_make_mock_voice_gateway(),
+    )
+
+    orchestrator.hydrate_history([
+        {"role": "user", "content": "我最近在杭州工作"},
+        {"role": "assistant", "content": "记下了，你最近在杭州工作。"},
+    ])
+
+    assert orchestrator._history == [
+        {"role": "user", "content": "我最近在杭州工作"},
+        {"role": "assistant", "content": "记下了，你最近在杭州工作。"},
+    ]

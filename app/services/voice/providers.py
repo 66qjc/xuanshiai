@@ -351,7 +351,7 @@ class _AliyunVoiceClient:
                 "enable_inverse_text_normalization": "true",
             }
             asr_url = (
-                f"https://nls-gateway.{self._region}.aliyuncs.com"
+                f"https://nls-gateway-{self._region}.aliyuncs.com"
                 "/stream/v1/asr"
             )
             headers = {
@@ -441,7 +441,7 @@ class _AliyunVoiceClient:
             # 阿里云 NLS 语音合成 HTTP 提交（/stream/v1/tts，与 ASR 对称）：
             # 参数走 query string，成功返回音频二进制，失败返回 JSON。
             tts_url = (
-                f"https://nls-gateway.{self._region}.aliyuncs.com"
+                f"https://nls-gateway-{self._region}.aliyuncs.com"
                 "/stream/v1/tts"
             )
             params = {

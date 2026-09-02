@@ -295,8 +295,8 @@ class ProfileSessionRead(BaseModel):
     subject: ProfileSubject
     status: ProfileSessionStatus
     input_mode: str = "text"
-    # WP-P4 加法字段：build=建构问答；update=对话式追加。旧前端零感知。
-    session_kind: str = Field(default="build", pattern="^(build|update)$")
+    # build=建构问答；update=对话式追加；master=墨相师对话建构。
+    session_kind: str = Field(default="build", pattern="^(build|update|master)$")
     progress: ProfileProgress
     current_question: dict[str, str] | None = None
     # 加法字段（Task6 Step2）：当前会话的活动草稿 ID，供前端直接跳转草稿编辑器；

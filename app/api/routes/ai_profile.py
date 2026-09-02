@@ -608,6 +608,7 @@ async def patch_profile_draft_route(
 )
 async def publish_profile_draft_route(
     draft_id: str = Path(..., min_length=1, max_length=64, pattern=r"^[a-z0-9_]+$"),
+    payload: dict | None = Body(default=None),
     current: CurrentUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
@@ -618,6 +619,9 @@ async def publish_profile_draft_route(
     Task6 Step3：``expected_revision`` 作为 **query 参数** 传递（非 body），
     与 draft PATCH body 内的 ``expected_revision``（逐项乐观锁）语义分离、互不冲突。
     缺失 query 参数返回 ``400 AI_INPUT_INVALID``。
+
+    Phase 3 P3-01 —— ``preview_id``(body 字段,可空)若存在,必须与 draft revision
+    匹配且 status=active,否则 409 ``DRAFT_VERSION_CONFLICT``。不传则走旧流程(向后兼容)。
     """
     _require_profile_feature()
     _check_idempotency_key(idempotency_key)
@@ -627,6 +631,42 @@ async def publish_profile_draft_route(
             "publish 必须携带 expected_revision 查询参数",
             status.HTTP_400_BAD_REQUEST,
         )
+    preview_id = None
+    if isinstance(payload, dict):
+        preview_id = payload.get("preview_id")
+        if preview_id is not None and (not isinstance(preview_id, str) or not preview_id):
+            raise _error_response(
+                "AI_INPUT_INVALID",
+                "preview_id 必须为非空字符串或省略",
+                status.HTTP_400_BAD_REQUEST,
+            )
+    if preview_id:
+        try:
+            from app.services.ai.preview import (
+                PreviewConflict,
+                SqlPreviewRepository,
+                confirm_publish_with_preview,
+            )
+
+            preview_repo = SqlPreviewRepository(db)
+            await confirm_publish_with_preview(
+                user_id=current.id,
+                draft_id=draft_id,
+                expected_revision=int(expected_revision),
+                preview_id=str(preview_id),
+                repo=preview_repo,
+            )
+        except PreviewConflict as exc:
+            raise _error_response(
+                exc.code, exc.message, status.HTTP_409_CONFLICT
+            ) from exc
+        except Exception as exc:  # noqa: BLE001
+            raise _error_response(
+                "AI_TEMPORARILY_UNAVAILABLE",
+                "预览校验失败,请稍后",
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                retryable=True,
+            ) from exc
     try:
         submission = await publish_profile_draft(
             db, draft_id, current.id, expected_revision, idempotency_key
@@ -658,6 +698,123 @@ async def publish_profile_draft_route(
         field_count=len(revision.changed_field_keys) if revision else None,
         narrative_task_id=submission.narrative_task_id,
     )
+
+
+# ===== Phase 3 P3-01: 成稿预览 =====
+@router.post(
+    "/profile-drafts/{draft_id}/preview",
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="生成/复用草稿预览(Phase 3 P3-01)",
+)
+async def create_profile_preview_route(
+    draft_id: str = Path(..., min_length=1, max_length=64, pattern=r"^[a-z0-9_]+$"),
+    payload: dict | None = Body(default=None),
+    current: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """为当前草稿 revision 生成/复用预览。
+
+    请求 body: ``{"expected_revision": <int>}`` —— 必须等于 draft.expected_revision。
+    响应: ``{preview_id, draft_id, expected_revision, status, content}``。
+    旧客户端不传 preview_id 仍可走 publish(向后兼容)。
+    """
+    _require_profile_feature()
+    if not isinstance(payload, dict):
+        raise _error_response(
+            "AI_INPUT_INVALID",
+            "body 必须为 JSON 对象,包含 expected_revision",
+            status.HTTP_400_BAD_REQUEST,
+        )
+    expected_revision = payload.get("expected_revision")
+    if not isinstance(expected_revision, int) or expected_revision < 0:
+        raise _error_response(
+            "AI_INPUT_INVALID",
+            "expected_revision 必须为非负整数",
+            status.HTTP_400_BAD_REQUEST,
+        )
+    try:
+        from app.services.ai.preview import (
+            PreviewConflict,
+            SqlPreviewRepository,
+            generate_preview,
+        )
+
+        preview_repo = SqlPreviewRepository(db)
+        rec = await generate_preview(
+            user_id=current.id,
+            draft_id=draft_id,
+            expected_revision=expected_revision,
+            repo=preview_repo,
+        )
+    except PreviewConflict as exc:
+        # DRAFT_NOT_FOUND → 404;DRAFT_VERSION_CONFLICT → 409
+        status_code = (
+            status.HTTP_404_NOT_FOUND
+            if exc.code == "DRAFT_NOT_FOUND"
+            else status.HTTP_409_CONFLICT
+        )
+        raise _error_response(exc.code, exc.message, status_code) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise _error_response(
+            "AI_TEMPORARILY_UNAVAILABLE",
+            "生成预览失败,请稍后重试",
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            retryable=True,
+        ) from exc
+    await db.commit()
+    return {
+        "preview_id": rec.preview_id,
+        "draft_id": rec.draft_id,
+        "expected_revision": rec.expected_revision,
+        "subject": rec.subject,
+        "status": rec.status,
+        "content": rec.content,
+        "task_id": rec.task_id,
+    }
+
+
+@router.get(
+    "/profile-previews/{preview_id}",
+    status_code=status.HTTP_200_OK,
+    summary="读取草稿预览(Phase 3 P3-01)",
+)
+async def get_profile_preview_route(
+    preview_id: str = Path(..., min_length=1, max_length=96),
+    current: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """读取本人预览;越权/不存在 → 404。"""
+    _require_profile_feature()
+    try:
+        from app.services.ai.preview import SqlPreviewRepository, get_preview
+
+        preview_repo = SqlPreviewRepository(db)
+        rec = await get_preview(
+            user_id=current.id, preview_id=preview_id, repo=preview_repo
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise _error_response(
+            "AI_TEMPORARILY_UNAVAILABLE",
+            "读取预览失败",
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            retryable=True,
+        ) from exc
+    if rec is None:
+        raise _error_response(
+            "PREVIEW_NOT_FOUND", "预览不存在或不属于当前用户", status.HTTP_404_NOT_FOUND
+        )
+    return {
+        "preview_id": rec.preview_id,
+        "draft_id": rec.draft_id,
+        "expected_revision": rec.expected_revision,
+        "subject": rec.subject,
+        "status": rec.status,
+        "content": rec.content,
+        "task_id": rec.task_id,
+        "last_error": rec.last_error,
+        "created_at": rec.created_at,
+        "updated_at": rec.updated_at,
+    }
 
 
 @router.get(

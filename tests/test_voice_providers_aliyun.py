@@ -116,6 +116,9 @@ async def test_recognize_audio_success(
     assert result["confidence"] == 1.0
     assert result["duration_ms"] > 0
     assert result["language"] == "zh-CN"
+    assert fake_http.post.await_args.args[0] == (
+        "https://nls-gateway-cn-shanghai.aliyuncs.com/stream/v1/asr"
+    )
 
 
 @pytest.mark.asyncio
@@ -253,6 +256,9 @@ async def test_synthesize_speech_success(
     assert result["audio_url"].startswith("/storage/uploads/tts/")
     assert result["duration_ms"] > 0
     assert written_files[0][1] == b"FAKE_AUDIO_BYTES"
+    assert fake_http.post.await_args.args[0] == (
+        "https://nls-gateway-cn-shanghai.aliyuncs.com/stream/v1/tts"
+    )
 
 
 @pytest.mark.asyncio

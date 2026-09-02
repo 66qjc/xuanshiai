@@ -214,6 +214,13 @@ def _now_utc() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
 
 
+def _naive_utc(value: datetime) -> datetime:
+    """Normalize driver/test datetimes before comparing MySQL-style timestamps."""
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(UTC).replace(tzinfo=None)
+
+
 def _maybe_json(value: Any) -> Any:
     if value is None or isinstance(value, (dict, list)):
         return value
@@ -589,13 +596,21 @@ async def start_task(
             message="任务租约不属于当前 Worker",
             status_code=404,
         )
-    assert_transition(task.status, AiTaskStatus.RUNNING)
     now = _now_utc()
+    if task.lease_until is None or _naive_utc(task.lease_until) <= now:
+        raise TaskError(
+            code="TASK_NOT_FOUND",
+            message="任务租约已过期",
+            status_code=404,
+        )
+    assert_transition(task.status, AiTaskStatus.RUNNING)
     result = await db.execute(
         text(
             "UPDATE ai_task SET status = 'running', "
             "started_at = COALESCE(started_at, :now), updated_at = UTC_TIMESTAMP() "
-            "WHERE task_id = :task_id AND status = 'leased' AND lease_owner = :worker_id"
+            "WHERE task_id = :task_id AND status = 'leased' "
+            "AND lease_owner = :worker_id "
+            "AND lease_until IS NOT NULL AND lease_until > :now"
         ),
         {"now": now, "task_id": task_id, "worker_id": worker_id},
     )

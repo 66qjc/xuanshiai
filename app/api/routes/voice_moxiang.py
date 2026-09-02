@@ -4,7 +4,7 @@
 
 与 ``/voice/conversation`` 的区别：
 - 使用墨相师人设提示词（非 voice_reply 的 ≤30 字资料采集）
-- 维护多轮对话历史（内存级，WS 连接生命周期内有效）
+- 维护多轮对话历史（持久化轮次在 WS 建立时恢复，连接内继续累积）
 - 不做画像字段抽取
 - 新增 ``text_message`` 文字通道（文字模式不经 ASR）
 - 流式推送 ``ai_content`` 增量
@@ -13,8 +13,10 @@
 
 前端 → 后端::
 
-    {"type": "session_start", "mode": "profile_build"?, "subject": "personal"?,
+    {"type": "session_start", "mode": "profile_build"?,
+     "subject": "personal"?,
      "consentVersion": "profile-text-v1"?}
+    {"type": "subject_switch", "subject": "ideal_partner"}
     {"type": "audio_start"}
     {"type": "audio_chunk", "data": "<base64 PCM>", "seq": 1}
     {"type": "audio_end"}
@@ -25,25 +27,33 @@
 
 后端 → 前端::
 
-    {"type": "session_ready"}
-    {"type": "progress", "percent": 40.0, "hard_done": 1, "hard_total": 3,
+    {"type": "session_ready", "session_id": "...", "subject": "personal",
+     "resumed": true, "new_session": false}
+    {"type": "subject_changed", "subject": "ideal_partner", "session_id": "...",
+     "resumed": true, "new_session": false}
+    {"type": "progress", "subject": "personal", "percent": 40.0,
+     "hard_done": 1, "hard_total": 3,
      "entry_score": 1.5, "gate_met": false}      # 仅建构模式（mode=profile_build）
-    {"type": "confirm_card", "card_id": "c-...", "draft_id": "d-...",
+    {"type": "confirm_card", "subject": "personal", "card_id": "c-...",
+     "draft_id": "d-...",
      "expected_revision": 3, "items": [{"field_key": "...", "kind": "entry",
      "category": "价值观", "content": "...", ...}]}   # 仅建构模式
-    {"type": "publish_ready", "summary": "基础信息已齐，可以去成稿了"}  # 门槛达标
+    {"type": "publish_ready", "subject": "personal",
+     "summary": "你的个人画像已经可以成稿了"}  # 门槛达标
     {"type": "partial_transcript", "text": "..."}
     {"type": "final_transcript", "text": "..."}
     {"type": "ai_thinking"}
     {"type": "ai_content", "text": "..."}        # 流式增量
-    {"type": "ai_reply", "text": "..."}           # 完整回复
+    {"type": "ai_reply", "text": "...", "opening": false}  # 完整回复；开场时 opening=true
     {"type": "tts_audio", "audio_url": "...", "duration_ms": 3000}
     {"type": "error", "code": "...", "message": "..."}
 
 建构模式：``session_start`` 带 ``mode=profile_build`` 时绑定（或复用）master
-会话，用户轮次经 ``submit_profile_turn`` 落库并入队 ``profile_extract`` 任务，
-任务终态后推送 progress / confirm_card。不带 ``mode`` 为纯聊，行为与既有
-协议一致（不建会话、不推进度）。
+会话；``subject_switch`` 在同一聊天时间线内切换 personal / ideal_partner，
+两个主体分别维护 master 会话、进度、卡片与抽取轮询。用户轮次经
+``submit_profile_turn`` 落库并入队 ``profile_extract`` 任务，任务终态后推送
+带主体的 progress / confirm_card。不带 ``mode`` 为纯聊，行为与既有协议一致
+（不建会话、不推进度）。
 
 门禁：语音模式需 ``ai_voice_conversation_enabled`` + ``ai_voice_enabled``；
 文字模式仅需 AI provider 非 mock。fail closed。
@@ -83,6 +93,7 @@ from app.services.ai.prompts.moxiang_master import (
     _format_narrative_context,
     _missing_label,
     build_build_context,
+    opening_message_for_subject,
 )
 from app.services.voice.base import (
     STREAM_CHUNK_MAX_BYTES,
@@ -106,6 +117,8 @@ WS_MESSAGE_MAX_BYTES = STREAM_CHUNK_MAX_BYTES * 2
 
 # 用户消息文本长度上限。
 _MAX_TEXT_LENGTH = 2000
+
+_PROFILE_BUILD_MODE = "profile_build"
 
 
 def _check_voice_feature() -> str | None:
@@ -210,7 +223,9 @@ async def _push_streamed_reply(
         )
         return
     if full_reply:
-        await _send_json(ws, {"type": "ai_reply", "text": full_reply})
+        await _send_json(
+            ws, {"type": "ai_reply", "text": full_reply, "opening": False}
+        )
 
 
 async def _drain_partials(ws: WebSocket, asr_client: Any) -> None:
@@ -232,7 +247,9 @@ _EXTRACT_TERMINAL_STATUSES = frozenset(
 )
 
 
-async def _build_context_snapshot(db: Any, user_id: int, session_id: str) -> str:
+async def _build_context_snapshot(
+    db: Any, user_id: int, session_id: str, subject: str
+) -> str:
     """建构模式上下文快照（Task 4）：缺失硬字段 + 已确认摘要 + 进度。
 
     缺失字段在路由侧先经 ``_missing_label`` 渲染成中文标签再交给
@@ -241,11 +258,41 @@ async def _build_context_snapshot(db: Any, user_id: int, session_id: str) -> str
     """
     snap = await load_master_progress_snapshot(db, session_id, user_id)
     missing = [_missing_label(key) for key in snap.missing_hard]
-    return build_build_context(missing, snap.confirmed_summary, snap.progress.percent)
+    return build_build_context(
+        missing,
+        snap.confirmed_summary,
+        snap.progress.percent,
+        subject=subject,
+    )
+
+
+async def _load_master_history(
+    db: Any, session_id: str, *, limit: int = 24
+) -> list[dict[str, str]]:
+    """Load the recent persisted master dialogue in chronological order."""
+    result = await db.execute(
+        sql_text(
+            "SELECT role, answer_text FROM ai_profile_turn "
+            "WHERE session_id = :session_id AND status = 'saved' "
+            "ORDER BY turn_no DESC LIMIT :limit"
+        ),
+        {"session_id": session_id, "limit": limit},
+    )
+    rows = list(result.mappings().all())
+    rows.reverse()
+    return [
+        {
+            "role": str(row.get("role") or ""),
+            "content": str(row.get("answer_text") or ""),
+        }
+        for row in rows
+        if str(row.get("role") or "") in {"user", "assistant"}
+        and str(row.get("answer_text") or "").strip()
+    ]
 
 
 async def _push_progress_snapshot(
-    ws: WebSocket, user_id: int, session_id: str
+    ws: WebSocket, user_id: int, session_id: str, subject: str
 ) -> None:
     """读会话已确认字段/条目并推 progress；读不到就静默跳过（不阻塞对话）。"""
     if _db_session_factory is None:
@@ -257,6 +304,7 @@ async def _push_progress_snapshot(
             ws,
             {
                 "type": "progress",
+                "subject": subject,
                 "percent": snap.progress.percent,
                 "hard_done": snap.progress.hard_done,
                 "hard_total": snap.progress.hard_total,
@@ -273,7 +321,7 @@ async def _push_progress_snapshot(
 
 
 async def _push_confirm_card(
-    ws: WebSocket, user_id: int, session_id: str
+    ws: WebSocket, user_id: int, session_id: str, subject: str
 ) -> None:
     """把活动草稿的 suggested 行推成 confirm_card（items 含 field_key/kind/
     category/content + draft_id + expected_revision，前端可直接拿去调 REST
@@ -318,6 +366,7 @@ async def _push_confirm_card(
                 ws,
                 {
                     "type": "confirm_card",
+                    "subject": subject,
                     "card_id": f"c-{uuid.uuid4().hex}",
                     "draft_id": str(draft_id),
                     "expected_revision": int(
@@ -331,7 +380,12 @@ async def _push_confirm_card(
                 ws,
                 {
                     "type": "publish_ready",
-                    "summary": "基础信息已齐，可以去成稿了",
+                    "subject": subject,
+                    "summary": (
+                        "你的个人画像已经可以成稿了"
+                        if subject == "personal"
+                        else "你的愿遇之相已经可以成稿了"
+                    ),
                 },
             )
     except Exception as exc:  # noqa: BLE001
@@ -343,7 +397,11 @@ async def _push_confirm_card(
 
 
 async def _wait_extract_and_push(
-    ws: WebSocket, user_id: int, session_id: str, task_id: str
+    ws: WebSocket,
+    user_id: int,
+    session_id: str,
+    subject: str,
+    task_id: str,
 ) -> None:
     """轮询 profile_extract 任务终态（≤30s），终态后推 progress/confirm_card。
 
@@ -378,8 +436,8 @@ async def _wait_extract_and_push(
             break
     else:
         return
-    await _push_progress_snapshot(ws, user_id, session_id)
-    await _push_confirm_card(ws, user_id, session_id)
+    await _push_progress_snapshot(ws, user_id, session_id, subject)
+    await _push_confirm_card(ws, user_id, session_id, subject)
 
 
 async def _submit_build_turn(
@@ -410,17 +468,18 @@ async def _finish_build_turn(
     orchestrator: MoxiangMasterOrchestrator,
     user_id: int,
     session_id: str,
+    subject: str,
     task_id: str,
-    poll_task: asyncio.Task[None] | None,
-) -> asyncio.Task[None] | None:
+    poll_tasks: dict[str, asyncio.Task[None]],
+) -> None:
     """墨相师回复落库（assistant turn）+ 抽取轮询接管；text_message 与
-    audio_end 共用。返回新的轮询任务（或传入的原任务）。
+    audio_end 共用。每个主体会话单独持有轮询任务，互不取消。
 
     ``persist_master_assistant_reply`` 经 ``load_owned_active_session`` 护栏：
     stale/paused 会话抛异常沿既有错误路径上抛，不静默吞掉导致状态漂移。
     """
     if not session_id:
-        return poll_task
+        return
     reply_text = orchestrator._last_reply_text  # noqa: SLF001 — listen 分支同款私有读取
     if reply_text and _db_session_factory is not None:
         async with _db_session_factory() as db:
@@ -429,11 +488,12 @@ async def _finish_build_turn(
             )
             await db.commit()
     if not task_id:
-        return poll_task
-    if poll_task is not None:
-        poll_task.cancel()
-    return asyncio.create_task(
-        _wait_extract_and_push(ws, user_id, session_id, task_id)
+        return
+    old_task = poll_tasks.get(session_id)
+    if old_task is not None:
+        old_task.cancel()
+    poll_tasks[session_id] = asyncio.create_task(
+        _wait_extract_and_push(ws, user_id, session_id, subject, task_id)
     )
 
 
@@ -482,11 +542,13 @@ async def moxiang_master_conversation(
     )
     asr_client: Any = None
     partial_task: asyncio.Task[None] | None = None
-    # 建构模式连接级状态（设计 Task 7）：build_session_id 绑定 master 会话，
-    # 空串=纯聊；poll_task 轮询当前轮抽取任务，新轮次/断线时取消。
-    build_session_id = ""
-    build_subject = "personal"
-    poll_task: asyncio.Task[None] | None = None
+    # 双画像建构状态：每个主体绑定独立 master 会话与抽取轮询任务；
+    # orchestrator 仍保留同一条连接级聊天时间线。
+    sessions_by_subject: dict[str, str] = {}
+    active_subject = ProfileSubject.PERSONAL.value
+    poll_tasks: dict[str, asyncio.Task[None]] = {}
+    build_mode_active = False
+    build_consent_version = "profile-text-v1"
 
     try:
         while True:
@@ -508,41 +570,80 @@ async def moxiang_master_conversation(
                 # 读取用户画像上下文
                 narrative_ctx = await _load_narrative_context(user_id)
                 orchestrator.set_narrative_context(narrative_ctx)
-                build_mode = str(message.get("mode", "")) == "profile_build"
-                build_subject = str(message.get("subject") or "personal")
-                build_session_id = ""
+                requested_mode = str(message.get("mode", ""))
+                build_mode = requested_mode == _PROFILE_BUILD_MODE
+                requested_subject = str(message.get("subject") or "personal")
+                bound_session_id = ""
+                bound_session_new = False
                 if not build_mode:
                     # 纯聊：不建会话、不推进度（行为与既有协议一致）。
+                    build_mode_active = False
+                    # A mode switch to pure chat must also detach every
+                    # portrait binding and stop replay workers from the prior
+                    # build session; otherwise a late card/progress push could
+                    # leak into the pure-chat timeline.
+                    sessions_by_subject.clear()
+                    active_subject = ProfileSubject.PERSONAL.value
+                    for poll_task in poll_tasks.values():
+                        poll_task.cancel()
+                    poll_tasks.clear()
                     orchestrator.set_build_context("")
                 elif _db_session_factory is not None:
                     # 建构模式：绑定（或复用）master 会话；fail-closed——
                     # 授权缺失 AI_CONSENT_REQUIRED，DB/其他异常
                     # AI_TEMPORARILY_UNAVAILABLE，且不得留下可用会话绑定。
                     try:
+                        if requested_subject not in {
+                            ProfileSubject.PERSONAL.value,
+                            ProfileSubject.IDEAL_PARTNER.value,
+                        }:
+                            raise ValueError("subject 非法")
+                        requested_consent_version = str(
+                            message.get("consentVersion", "profile-text-v1")
+                        )
                         async with _db_session_factory() as db:
                             session = await create_master_session(
                                 db,
                                 user_id,
-                                ProfileSubject(build_subject),
-                                str(
-                                    message.get(
-                                        "consentVersion", "profile-text-v1"
-                                    )
-                                ),
+                                ProfileSubject(requested_subject),
+                                requested_consent_version,
                             )
                             await db.commit()
-                            build_session_id = session.session_id
+                            bound_session_id = session.session_id
+                            bound_session_new = session.created
                             build_ctx = await _build_context_snapshot(
-                                db, user_id, session.session_id
+                                db,
+                                user_id,
+                                session.session_id,
+                                requested_subject,
                             )
+                            history = await _load_master_history(
+                                db, session.session_id
+                            )
+                        sessions_by_subject[requested_subject] = bound_session_id
+                        active_subject = requested_subject
+                        build_consent_version = requested_consent_version
+                        build_mode_active = True
                         orchestrator.set_build_context(build_ctx)
+                        orchestrator.hydrate_history(history)
                     except Exception as exc:  # noqa: BLE001
-                        build_session_id = ""
+                        # 建构绑定失败后 fail-closed：不能继续沿用本连接此前
+                        # 成功绑定的画像会话；连接仍可作为纯聊继续使用。
+                        build_mode_active = False
+                        sessions_by_subject.clear()
+                        active_subject = ProfileSubject.PERSONAL.value
                         orchestrator.set_build_context("")
+                        for poll_task in poll_tasks.values():
+                            poll_task.cancel()
+                        poll_tasks.clear()
                         code = (
                             "AI_CONSENT_REQUIRED"
                             if isinstance(exc, AIConsentRequired)
-                            else "AI_TEMPORARILY_UNAVAILABLE"
+                            else (
+                                "AI_INPUT_INVALID"
+                                if isinstance(exc, ValueError)
+                                else "AI_TEMPORARILY_UNAVAILABLE"
+                            )
                         )
                         logger.warning(
                             "moxiang_build_session_failed user_id=%s "
@@ -554,13 +655,38 @@ async def moxiang_master_conversation(
                         await _send_error(
                             ws, code, "画像建构通道暂不可用，可稍后重试"
                         )
-                await _send_json(ws, {"type": "session_ready"})
-                if build_session_id:
-                    await _push_progress_snapshot(ws, user_id, build_session_id)
-                # 推送开场白
                 await _send_json(
-                    ws, {"type": "ai_reply", "text": OPENING_MESSAGE}
+                    ws,
+                    {
+                        "type": "session_ready",
+                        "session_id": bound_session_id,
+                        "subject": requested_subject,
+                        "resumed": bool(bound_session_id) and not bound_session_new,
+                        "new_session": bool(bound_session_id) and bound_session_new,
+                    },
                 )
+                if bound_session_id:
+                    await _push_progress_snapshot(
+                        ws, user_id, bound_session_id, requested_subject
+                    )
+                    await _push_confirm_card(
+                        ws, user_id, bound_session_id, requested_subject
+                    )
+                # 仅真正新建的画像会话发送一次自然开场；重连/重复
+                # session_start 依靠持久化 turns 恢复上下文，不重复插入开场。
+                if not build_mode or not bound_session_id or bound_session_new:
+                    await _send_json(
+                        ws,
+                        {
+                            "type": "ai_reply",
+                            "opening": True,
+                            "text": (
+                                opening_message_for_subject(requested_subject)
+                                if bound_session_id
+                                else OPENING_MESSAGE
+                            ),
+                        },
+                    )
                 logger.info(
                     "moxiang_session_start user_id=%s request_id=%s "
                     "has_narrative=%s",
@@ -568,13 +694,86 @@ async def moxiang_master_conversation(
                     request_id,
                     bool(narrative_ctx),
                 )
-                if build_session_id:
+                if bound_session_id:
                     logger.info(
                         "moxiang_build_session_bound user_id=%s "
                         "request_id=%s session_id=%s",
                         user_id,
                         request_id,
-                        build_session_id,
+                        bound_session_id,
+                    )
+
+            elif msg_type == "subject_switch":
+                requested_subject = str(message.get("subject") or "")
+                if requested_subject not in {
+                    ProfileSubject.PERSONAL.value,
+                    ProfileSubject.IDEAL_PARTNER.value,
+                }:
+                    await _send_error(ws, "AI_INPUT_INVALID", "画像主体非法")
+                    continue
+                if not build_mode_active or _db_session_factory is None:
+                    await _send_error(
+                        ws, "AI_INPUT_INVALID", "当前不是画像建构会话"
+                    )
+                    continue
+                try:
+                    async with _db_session_factory() as db:
+                        session = await create_master_session(
+                            db,
+                            user_id,
+                            ProfileSubject(requested_subject),
+                            build_consent_version,
+                        )
+                        await db.commit()
+                        session_new = session.created
+                        build_ctx = await _build_context_snapshot(
+                            db,
+                            user_id,
+                            session.session_id,
+                            requested_subject,
+                        )
+                        history = await _load_master_history(
+                            db, session.session_id
+                        )
+                    # 只有目标会话和上下文均加载成功后才切换，失败时保持原主体。
+                    sessions_by_subject[requested_subject] = session.session_id
+                    active_subject = requested_subject
+                    orchestrator.set_build_context(build_ctx)
+                    orchestrator.hydrate_history(history)
+                except Exception as exc:  # noqa: BLE001
+                    code = (
+                        "AI_CONSENT_REQUIRED"
+                        if isinstance(exc, AIConsentRequired)
+                        else "AI_TEMPORARILY_UNAVAILABLE"
+                    )
+                    await _send_error(
+                        ws, code, "画像阶段切换失败，当前阶段保持不变"
+                    )
+                    continue
+                await _send_json(
+                    ws,
+                    {
+                        "type": "subject_changed",
+                        "subject": requested_subject,
+                        "session_id": session.session_id,
+                        "resumed": not session_new,
+                        "new_session": session_new,
+                    },
+                )
+                await _push_progress_snapshot(
+                    ws, user_id, session.session_id, requested_subject
+                )
+                await _push_confirm_card(
+                    ws, user_id, session.session_id, requested_subject
+                )
+                if session_new:
+                    await _send_json(
+                        ws,
+                        {
+                            "type": "ai_reply",
+                            "opening": True,
+                            "text": opening_message_for_subject(requested_subject),
+                        },
                     )
 
             elif msg_type == "text_message":
@@ -593,11 +792,17 @@ async def moxiang_master_conversation(
                     continue
                 # 建构模式：先落库原文并入队抽取（回复失败也不丢用户输入），
                 # 再流式回复；异常沿既有 turn 错误路径上抛，不吞。
+                turn_subject = active_subject
+                turn_session_id = (
+                    sessions_by_subject.get(turn_subject, "")
+                    if build_mode_active
+                    else ""
+                )
                 task_id = ""
-                if build_session_id and _db_session_factory is not None:
+                if turn_session_id and _db_session_factory is not None:
                     task_id = await _submit_build_turn(
                         user_id,
-                        build_session_id,
+                        turn_session_id,
                         str(message.get("clientTurnId") or uuid.uuid4().hex),
                         text_content,
                     )
@@ -607,13 +812,14 @@ async def moxiang_master_conversation(
                     text_content,
                     request_id=request_id,
                 )
-                poll_task = await _finish_build_turn(
+                await _finish_build_turn(
                     ws,
                     orchestrator,
                     user_id,
-                    build_session_id,
+                    turn_session_id,
+                    turn_subject,
                     task_id,
-                    poll_task,
+                    poll_tasks,
                 )
 
             elif msg_type == "audio_start":
@@ -702,15 +908,21 @@ async def moxiang_master_conversation(
                     )
                 # 建构模式：语音轮次与文字轮次同一链路（clientTurnId 由服务端
                 # 生成；source 语义由 submit 内部落库承担）。
+                turn_subject = active_subject
+                turn_session_id = (
+                    sessions_by_subject.get(turn_subject, "")
+                    if build_mode_active
+                    else ""
+                )
                 task_id = ""
                 if (
-                    build_session_id
+                    turn_session_id
                     and _db_session_factory is not None
                     and final_transcript.strip()
                 ):
                     task_id = await _submit_build_turn(
                         user_id,
-                        build_session_id,
+                        turn_session_id,
                         uuid.uuid4().hex,
                         final_transcript,
                     )
@@ -720,13 +932,14 @@ async def moxiang_master_conversation(
                     final_transcript,
                     request_id=request_id,
                 )
-                poll_task = await _finish_build_turn(
+                await _finish_build_turn(
                     ws,
                     orchestrator,
                     user_id,
-                    build_session_id,
+                    turn_session_id,
+                    turn_subject,
                     task_id,
-                    poll_task,
+                    poll_tasks,
                 )
                 asr_client = None
 
@@ -804,7 +1017,7 @@ async def moxiang_master_conversation(
     finally:
         if partial_task is not None:
             partial_task.cancel()
-        if poll_task is not None:
+        for poll_task in poll_tasks.values():
             poll_task.cancel()
         if asr_client is not None:
             try:

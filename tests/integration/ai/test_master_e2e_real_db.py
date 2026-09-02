@@ -42,6 +42,7 @@ from app.services.ai.profile import (
     MASTER_HARD_FIELD_KEYS,
     PROFILE_POLICY_REVISION,
     PROFILE_SCHEMA_VERSION,
+    ProfileTurn,
     create_master_session,
     confirm_profile_draft,
     enqueue_task,
@@ -234,8 +235,8 @@ async def test_master_e2e_full_chain_progress_gate(
         user_input,
         "e2e-master-key-001",
     )
-    assert turn_submission.task is not None
-    turn_id = turn_submission.turn.turn_id
+    assert turn_submission.task_id is not None
+    turn_id = turn_submission.turn_id
     await real_db_session.commit()
 
     # 4) 注入 fake provider + 跑 _handle_master_extract
@@ -330,10 +331,31 @@ async def test_master_e2e_full_chain_progress_gate(
     session_loaded = await load_owned_session(
         real_db_session, session.session_id, USER_ID
     )
+    turn_row = (
+        await real_db_session.execute(
+            text(
+                "SELECT turn_id, session_id, client_turn_id, user_id, turn_no, "
+                "answer_text, status, created_at FROM ai_profile_turn "
+                "WHERE turn_id = :tid"
+            ),
+            {"tid": turn_id},
+        )
+    ).mappings().first()
+    assert turn_row is not None
+    turn_obj = ProfileTurn(
+        turn_id=str(turn_row["turn_id"]),
+        session_id=str(turn_row["session_id"]),
+        client_turn_id=str(turn_row["client_turn_id"]),
+        user_id=int(turn_row["user_id"]),
+        turn_no=int(turn_row["turn_no"] or 0),
+        answer_text=str(turn_row["answer_text"] or ""),
+        status=str(turn_row.get("status") or "saved"),
+        created_at=turn_row.get("created_at"),
+    )
     outcome = await _handle_master_extract(
         real_db_session,
         session_loaded,
-        turn_submission.turn,
+        turn_obj,
         AITaskContext(
             task_id=extract_task.task_id,
             request_id="e2e-req-001",

@@ -1,9 +1,9 @@
 """master 会话：创建/复用/助手回复落库（fake store）。
 
 形态与 tests/test_ai_profile_sessions.py 一致（ProfileStore 内存假库，不依赖
-真实数据库）。覆盖简报三断言：新会话 kind='master' 且 status=draft；已有活动
-会话（含 build）时复用同一 session_id（墨相师重连语义，与 update 的拒绝语义
-不同）；助手回复以 role='assistant' turn 落库后可读回。
+真实数据库）。覆盖简报三断言：新会话 kind='master' 且 status=draft；旧 build
+会话保留并标记 stale，重复进入只复用新 master；助手回复以 role='assistant'
+turn 落库后可读回。
 """
 
 from __future__ import annotations
@@ -32,10 +32,10 @@ async def test_create_master_session_inserts_kind_master() -> None:
 
 
 @pytest.mark.asyncio
-async def test_create_master_session_reuses_active_session() -> None:
+async def test_create_master_session_replaces_legacy_then_reuses_master() -> None:
     store = ProfileStore()
     # 已有活动 build 会话（seed 行缺 session_kind，读取时默认 build）：
-    # master 创建必须复用同一活动槽位，不新建第二行。
+    # master 不得静默复用；旧行保留为 stale，后续重连复用新 master。
     await store.seed_session(
         owner_user_id=10, subject="personal", session_id="sess1"
     )
@@ -45,8 +45,12 @@ async def test_create_master_session_reuses_active_session() -> None:
     second = await create_master_session(
         store.db, 10, ProfileSubject.PERSONAL, "profile-text-v1"
     )
-    assert first.session_id == second.session_id == "sess1"
-    assert len(store.sessions) == 1
+    assert first.session_id == second.session_id
+    assert first.session_id != "sess1"
+    assert first.session_kind == "master"
+    assert store.sessions["sess1"]["status"] == "stale"
+    assert store.sessions["sess1"]["active_status"] == 0
+    assert len(store.sessions) == 2
 
 
 @pytest.mark.asyncio

@@ -29,6 +29,7 @@ async def _clean(db: AsyncSession) -> None:
         "DELETE FROM ai_compatibility_snapshot WHERE viewer_user_id = :viewer OR target_user_id = :target",
         "DELETE FROM ai_task WHERE owner_user_id IN (:viewer, :target)",
         "DELETE FROM ai_feature_projection WHERE subject_user_id IN (:viewer, :target)",
+        "DELETE FROM ai_profile_projection_status WHERE user_id IN (:viewer, :target)",
         "DELETE FROM ai_consent_grant WHERE user_id IN (:viewer, :target)",
         "DELETE FROM user_revision_state WHERE user_id IN (:viewer, :target)",
         "DELETE FROM user_profile_completion WHERE user_id IN (:viewer, :target)",
@@ -188,6 +189,22 @@ async def test_real_compatibility_persists_pair_provenance_and_blocks_revocation
                     "visibility": visibility,
                     "expires_at": now + timedelta(days=1),
                 },
+            )
+            # Phase 4 P4-01: 投影准入位(测试 fixture 显式触发,默认 active)
+            await real_db_session.execute(
+                text(
+                    "DELETE FROM ai_profile_projection_status "
+                    "WHERE user_id = :user_id AND kind = :kind"
+                ),
+                {"user_id": user_id, "kind": kind},
+            )
+            await real_db_session.execute(
+                text(
+                    "INSERT INTO ai_profile_projection_status "
+                    "(user_id, kind, status, source_revision) "
+                    "VALUES (:user_id, :kind, 'active', 0)"
+                ),
+                {"user_id": user_id, "kind": kind},
             )
     await real_db_session.commit()
 

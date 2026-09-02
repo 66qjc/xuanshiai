@@ -26,6 +26,7 @@ NARRATIVE_USER = 9_988_700_001
 
 async def _clean_user(db: AsyncSession) -> None:
     statements = (
+        "DELETE FROM ai_profile_projection_status WHERE user_id = :user_id",
         "DELETE FROM ai_feature_projection WHERE subject_user_id = :user_id",
         "DELETE FROM ai_profile_draft_field WHERE draft_id IN "
         "(SELECT draft_id FROM ai_profile_draft WHERE user_id = :user_id)",
@@ -191,6 +192,19 @@ async def test_real_publish_pins_revision_consent_and_projection(
     assert json.loads(projection["source_revision_json"]) == task.source_revision_json
     assert json.loads(projection["consent_snapshot_json"])["version"] == "profile-text-v1"
     assert projection["visibility_class"] == "searchable"
+    projection_gate = (
+        await real_db_session.execute(
+            text(
+                "SELECT status, source_revision, projection_id "
+                "FROM ai_profile_projection_status "
+                "WHERE user_id = :user_id AND kind = 'personal_searchable'"
+            ),
+            {"user_id": USER_ID},
+        )
+    ).mappings().one()
+    assert projection_gate["status"] == "active"
+    assert projection_gate["source_revision"] == submission.revision.revision_id
+    assert projection_gate["projection_id"] is not None
 
     await _clean_user(real_db_session)
 

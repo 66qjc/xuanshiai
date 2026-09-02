@@ -14,6 +14,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -24,6 +26,7 @@ from scripts.manage_ai_migration import (
     MIGRATION_ROOT,
     MigrationError,
     _checksum,
+    _database_config_for_target,
     _manifest,
 )
 
@@ -111,6 +114,52 @@ def test_runner_normalises_line_endings_before_checksum() -> None:
     manifest = _manifest()
     assert "versions" in manifest
     assert len(manifest["versions"]) >= 2
+
+
+def test_documented_direct_runner_invocation_needs_no_pythonpath() -> None:
+    """The documented ``python scripts/...`` form must work in a clean shell."""
+    repo_root = Path(__file__).resolve().parents[1]
+    env = os.environ.copy()
+    env.pop("PYTHONPATH", None)
+    result = subprocess.run(
+        [sys.executable, "scripts/manage_ai_migration.py", "--help"],
+        cwd=repo_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "Manage reviewed AI schema migrations" in result.stdout
+
+
+def test_test_target_uses_only_explicit_test_database_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scripts.manage_ai_migration as migration
+
+    development_url = "mysql+pymysql://dev:secret@dev-db:3306/development_db"
+    test_url = "mysql+pymysql://test:secret@test-db:3307/integration_db"
+    monkeypatch.setenv("DATABASE_URL", development_url)
+    monkeypatch.setenv("AI_TEST_DATABASE_URL", test_url)
+    seen_urls: list[str | None] = []
+
+    def fake_get_db_config() -> dict[str, object]:
+        seen_urls.append(os.getenv("DATABASE_URL"))
+        return {"database": "integration_db"}
+
+    monkeypatch.setattr(migration, "get_db_config", fake_get_db_config)
+    assert _database_config_for_target("test")["database"] == "integration_db"
+    assert seen_urls == [test_url]
+    assert os.environ["DATABASE_URL"] == development_url
+
+
+def test_test_target_refuses_development_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("AI_TEST_DATABASE_URL", raising=False)
+    with pytest.raises(MigrationError, match="refusing to fall back"):
+        _database_config_for_target("test")
 
 
 # ---------------------------------------------------------------------------

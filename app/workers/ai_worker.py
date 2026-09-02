@@ -372,7 +372,7 @@ async def _process(
 
 
 async def _run_round(worker_id: str, batch_size: int) -> tuple[int, int, int]:
-    """One real round: reap stale leases, claim, start and dispatch tasks."""
+    """One real round: reap stale leases, then claim/process tasks one by one."""
     if session_factory is None:
         raise RuntimeError("数据库驱动未安装，无法运行 AI Worker")
     if not TASK_HANDLERS:
@@ -393,18 +393,24 @@ async def _run_round(worker_id: str, batch_size: int) -> tuple[int, int, int]:
         logger.info("ai_worker_reaped count=%d", len(reaped))
         emit_ai_metric("lease_reclaimed", len(reaped), {"worker_id": worker_id})
 
-    async with session_factory() as claim_db:
-        try:
-            claimed = await claim_tasks(claim_db, worker_id, now, limit=batch_size)
-            await claim_db.commit()
-        except Exception:
-            await claim_db.rollback()
-            logger.exception("ai_worker_claim_failed")
-            claimed = []
-
+    claimed_count = 0
     completed = 0
     failed = 0
-    for task in claimed:
+    for _ in range(batch_size):
+        async with session_factory() as claim_db:
+            try:
+                claimed = await claim_tasks(
+                    claim_db, worker_id, _now(), limit=1
+                )
+                await claim_db.commit()
+            except Exception:
+                await claim_db.rollback()
+                logger.exception("ai_worker_claim_failed")
+                break
+        if not claimed:
+            break
+        task = claimed[0]
+        claimed_count += 1
         if task.created_at is not None:
             # 遍历 claimed 时重新取 _now() 计算 queue_age：reap 阶段的 now
             # 已经过时（claim 期间发生了 IO/等待），用陈旧 now 会让 age 偏小。
@@ -420,7 +426,7 @@ async def _run_round(worker_id: str, batch_size: int) -> tuple[int, int, int]:
             failed += 1
     if failed:
         emit_ai_metric("retry_rate", failed, {"worker_id": worker_id})
-    return len(claimed), completed, failed
+    return claimed_count, completed, failed
 
 
 async def _run_cleanup_round(worker_id: str, batch_size: int) -> dict[str, int]:

@@ -70,7 +70,6 @@ from app.schemas.ai_profile import (
 )
 from app.services.ai.base import (
     AITaskContext,
-    ExtractedEntry,
     ExtractedField,
     NarrativeRequest,
     StructuredExtractRequest,
@@ -438,6 +437,11 @@ class ProfileSession:
     draft_id: str | None = None
     # 用户点「不想答」跳过的字段。不计入 confirmed，也不再作为下一问。
     skipped_keys: frozenset[str] = frozenset()
+    # True only for the request that inserted this session row.  Reused active
+    # sessions stay False so WebSocket callers can make one-time UX decisions
+    # (for example, whether to send the opening message) without guessing from
+    # the presence of a session id.
+    created: bool = False
 
 
 @dataclass(frozen=True)
@@ -890,6 +894,7 @@ def _session_from_row(
     field_keys: frozenset[str],
     confirmed_keys: frozenset[str],
     draft_id: str | None = None,
+    created: bool = False,
 ) -> ProfileSession:
     session = ProfileSession(
         session_id=str(row["session_id"]),
@@ -912,6 +917,7 @@ def _session_from_row(
         updated_at=row.get("updated_at"),
         draft_id=draft_id,
         skipped_keys=_parse_skipped_keys(row.get("skipped_field_keys")),
+        created=created,
     )
     object.__setattr__(session, "current_question", next_profile_question(session))
     return session
@@ -1243,10 +1249,10 @@ async def create_master_session(
 ) -> ProfileSession:
     """墨相师对话建构会话（设计 Task 5）。
 
-    与 build/update 共用唯一活动槽位：已有活动会话时**复用**（WS 重连/重复
-    session_start 不丢上下文），这与 update 的"拒绝新建"语义不同。无活动会话
-    时新建 kind='master'、status=draft 行（复用 build 的 INSERT，仅 kind 不同）。
-    校验授权；不 commit。
+    与 build/update 共用唯一活动槽位：仅复用同主体的 master 会话（WS 重连/
+    重复 session_start 不丢上下文）。若活动槽是旧 build/update，会保留其数据并
+    标记 stale、释放活动槽，再新建 kind='master'、status=draft 行。校验授权；
+    不 commit。
     """
     subject_value = subject.value if isinstance(subject, ProfileSubject) else str(subject)
     if subject_value not in {ProfileSubject.PERSONAL.value, ProfileSubject.IDEAL_PARTNER.value}:
@@ -1260,8 +1266,20 @@ async def create_master_session(
     consent_snapshot = _consent_snapshot(consent)
     existing = await _find_active_session(db, owner_user_id, subject_value)
     if existing is not None:
-        return await _reuse_active_session(
-            db, existing, revision=revision, consent_snapshot=consent_snapshot
+        if str(existing.get("session_kind") or "build") == "master":
+            return await _reuse_active_session(
+                db, existing, revision=revision, consent_snapshot=consent_snapshot
+            )
+        # 旧 build/update 会话不能静默复用为 master：抽取 handler 会按
+        # session_kind 分流，误复用会把墨相师轮次送进题库/更新路径。保留旧数据，
+        # 仅关闭活动槽并标记 stale，再创建新的 master 会话。
+        await db.execute(
+            text(
+                "UPDATE ai_profile_session SET status = 'stale', active_status = 0, "
+                "ended_at = UTC_TIMESTAMP(), updated_at = UTC_TIMESTAMP() "
+                "WHERE session_id = :session_id AND active_status = 1"
+            ),
+            {"session_id": str(existing["session_id"])},
         )
     session_id = uuid.uuid4().hex
     expires_at = _now_utc() + timedelta(days=settings.ai_profile_session_expire_days)
@@ -1325,6 +1343,7 @@ async def create_master_session(
         consent_snapshot=consent_snapshot,
         field_keys=frozenset(),
         confirmed_keys=frozenset(),
+        created=True,
     )
 
 
@@ -4498,6 +4517,20 @@ async def delete_ai_profile(
             **{f"k{i}": kind for i, kind in enumerate(projection_kinds)},
         },
     )
+    # Phase 4 P4-01: 投影准入位也置 deleted(数据保留但下游永远不读)
+    from app.services.ai.projection_status import (
+        KIND_FOR_SUBJECT as _PS_KIND_FOR_SUBJECT,
+        SqlProjectionStatusRepository,
+        mark_deleted as _ps_mark_deleted,
+    )
+    ps_repo = SqlProjectionStatusRepository(db)
+    for _kind in _PS_KIND_FOR_SUBJECT.get(subject_value, ()):
+        await _ps_mark_deleted(
+            user_id=owner_user_id,
+            kind=_kind,
+            repo=ps_repo,
+            reason="ai_profile_deleted",
+        )
     await db.execute(
         text(
             # M-4 carry-over：不仅失效 target 方向结果，还要失效该用户作为
@@ -4807,6 +4840,7 @@ async def profile_projection_handler(
         return None
     user_id_int = int(user_id)
     built: list[str] = []
+    built_pairs: list[tuple[str, int | None]] = []
     try:
         for kind in (
             ProjectionKind.PERSONAL_SEARCHABLE,
@@ -4832,6 +4866,30 @@ async def profile_projection_handler(
             built.append(
                 f"{kind.value}:{projection.id if projection.id is not None else 'ok'}"
             )
+            built_pairs.append((kind.value, projection.id))
+            # Phase 4 P4-01: 投影准入位置 active(同 kind 旧 active 行被覆盖)
+            from app.services.ai.projection_status import (
+                SqlProjectionStatusRepository,
+                mark_active as _ps_mark_active,
+                mark_invalidated as _ps_mark_invalidated,
+            )
+            ps_repo = SqlProjectionStatusRepository(db)
+            if projection.id is not None and pinned_revision_id is not None:
+                await _ps_mark_active(
+                    user_id=user_id_int,
+                    kind=kind.value,
+                    source_revision=int(pinned_revision_id),
+                    projection_id=int(projection.id),
+                    repo=ps_repo,
+                )
+            else:
+                # 同主体的其他 kind 旧 active 行踢到 invalidated
+                await _ps_mark_invalidated(
+                    user_id=user_id_int,
+                    kind=kind.value,
+                    repo=ps_repo,
+                    reason="rebuild",
+                )
     except ProjectionBuildError:
         # 投影不可构建（无该主体已确认字段/授权撤回等）：不可重试终态。
         await fail_task(

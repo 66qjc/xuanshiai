@@ -225,6 +225,12 @@ class Settings(BaseSettings):
     ai_recommendation_pool_limit: int = Field(default=200, gt=0)
     ai_recommendation_top_n: int = Field(default=20, gt=0)
 
+    # ==================== 墨相师四阶段融合 Journey 开关（Contract v1.1 §10）====================
+    # 墨相师新旅程（候选理解池 + 自动整理邀请）默认关闭。生产启用需经过
+    # _validate_ai_feature_gates 的三道审批门禁。关闭时不产生新候选、不推
+    # 新邀请，新前端显示暂不可用并保留旧备用入口；旧 profile_build 不受影响。
+    ai_moxiang_journey_enabled: bool = False
+
     # Task 12 审计/指标开关（非敏感，不影响 production fail-closed）。
     ai_audit_enabled: bool = True
     # outbox/purge 积压指标触发本地告警的阈值。
@@ -355,6 +361,7 @@ class Settings(BaseSettings):
                 self.ai_compatibility_shadow_enabled,
                 self.ai_recommend_enabled,
                 self.ai_voice_enabled,
+                self.ai_moxiang_journey_enabled,
             )
         )
         if not any_ai_enabled:

@@ -64,6 +64,33 @@
         "up": "fef0f6996f85f8856e8e52657e7442801e4e04922af2081be6973c1d9687250d",
         "down": "ecad3acbaef28ab537011bbaebb594a920b00ba82e534a693f82f045bf405aaf"
       }
+    },
+    {
+      "version": "20260901_01_moxiang_journey",
+      "up": "20260901_01_moxiang_journey_up.sql",
+      "down": "20260901_01_moxiang_journey_down.sql",
+      "sha256": {
+        "up": "487214879cccc3a98ff8d981e9d9171bbf5d34f3dccce476cc5af1a80aa666af",
+        "down": "cff1bf45d1e4316b8ea9f299f2bc24305901b471cc24efb77e61421a89a4d521"
+      }
+    },
+    {
+      "version": "20260901_02_moxiang_preview",
+      "up": "20260901_02_moxiang_preview_up.sql",
+      "down": "20260901_02_moxiang_preview_down.sql",
+      "sha256": {
+        "up": "5a6ff2c50da44ea8f44da0a56366dcbf8fb94f954aa05c339c7dc910e5556ad1",
+        "down": "2d9363dcc35b5cfaa2db0ef833a979e9921d4683408d8619324faf4a429c9c07"
+      }
+    },
+    {
+      "version": "20260901_03_projection_status",
+      "up": "20260901_03_projection_status_up.sql",
+      "down": "20260901_03_projection_status_down.sql",
+      "sha256": {
+        "up": "778ea61d21927db2895a1d5b94d950c7d2c9906c77bee20dae15814aa0ad7e68",
+        "down": "c8e699dc7ac4282a30ab8b7f7e8a1fd0d81819e5fdd90b8837c7ba62f2e5b00e"
+      }
     }
   ]
 }

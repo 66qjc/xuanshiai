@@ -562,7 +562,9 @@ async def test_claim_uses_for_update_skip_locked(task_store) -> None:
 async def test_start_task_moves_leased_to_running_with_lease_ownership(task_store) -> None:
     db = task_store.session
     task = await task_store.seed(
-        status="leased", lease_owner="worker-1", lease_until="2026-08-07T08:10:00Z"
+        status="leased",
+        lease_owner="worker-1",
+        lease_until=datetime.now(UTC) + timedelta(minutes=10),
     )
 
     running = await start_task(db, task.task_id, "worker-1")
@@ -700,7 +702,7 @@ async def test_worker_fails_task_terminal_when_no_handler_registered(
     task = await task_store.seed(
         status="leased",
         lease_owner="worker-1",
-        lease_until=_utc(2026, 8, 7, 8, 1),
+        lease_until=datetime.now(UTC) + timedelta(minutes=1),
         task_type="type_without_handler",
     )
 

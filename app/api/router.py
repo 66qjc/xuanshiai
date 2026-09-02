@@ -12,6 +12,7 @@ from app.api.routes import (
     ai_profile,
     ai_search,
     ai_tasks,
+    ai_moxiang,
     matchmaker_admin,
     matchmaker_admin_account,
     matchmaker_member_admin,
@@ -29,8 +30,6 @@ from app.api.routes import (
     ai_advisor,
     certifications,
     community,
-    community_admin,
-    message_admin,
     discovery,
     finance,
     health,
@@ -106,6 +105,7 @@ api_router.include_router(ai_profile.router, prefix="/ai", tags=["AI"])
 api_router.include_router(ai_search.router, prefix="/ai", tags=["AI"])
 api_router.include_router(ai_compatibility.router, prefix="/ai", tags=["AI"])
 api_router.include_router(ai_recommend.router, prefix="/ai", tags=["AI"])
+api_router.include_router(ai_moxiang.router, prefix="/ai", tags=["AI"])
 api_router.include_router(voice.router, prefix="/voice", tags=["语音"])
 api_router.include_router(voice_ws.router, prefix="/voice", tags=["语音"])
 api_router.include_router(

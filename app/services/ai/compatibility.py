@@ -761,15 +761,18 @@ async def _load_projection_rows(
 ) -> list[dict[str, Any]]:
     result = await db.execute(
         text(
-            "SELECT id, subject_user_id, projection_kind, fields_json, source_hash, "
-            "source_revision_json, profile_revision, preference_revision, "
-            "privacy_revision, relationship_revision, policy_revision, "
-            "consent_snapshot_json, entry_digest, status, expires_at "
-            "FROM ai_feature_projection "
-            "WHERE subject_user_id IN (:uid_viewer, :uid_target) "
-            "AND projection_kind IN ('personal_compatibility', "
+            "SELECT p.id, p.subject_user_id, p.projection_kind, p.fields_json, p.source_hash, "
+            "p.source_revision_json, p.profile_revision, p.preference_revision, "
+            "p.privacy_revision, p.relationship_revision, p.policy_revision, "
+            "p.consent_snapshot_json, p.entry_digest, p.status, p.expires_at "
+            "FROM ai_feature_projection p "
+            "INNER JOIN ai_profile_projection_status ps "
+            "  ON ps.user_id = p.subject_user_id AND ps.kind = p.projection_kind "
+            "WHERE p.subject_user_id IN (:uid_viewer, :uid_target) "
+            "AND p.projection_kind IN ('personal_compatibility', "
             " 'ideal_partner_preference') "
-            "AND status = 'active'"
+            "AND p.status = 'active' "
+            "AND ps.status = 'active'"
         ),
         {"uid_viewer": viewer_id, "uid_target": target_id},
     )

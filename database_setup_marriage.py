@@ -2616,6 +2616,7 @@ class DatabaseManager:
             ensure_ai_compatibility_engine_columns,
             ensure_ai_legacy_columns,
             ensure_ai_profile_entry_columns,
+            ensure_ai_profile_journey_columns,
             ensure_ai_profile_session_columns,
             ensure_ai_projection_columns,
             ensure_ai_search_snapshot_columns,
@@ -2686,6 +2687,10 @@ class DatabaseManager:
         # WP-C1 / F11：旧库兼容度快照幂等补 engine/brand_label（engine 默认
         # 'rule-v1'，存量快照语义零变化）。
         ensure_ai_compatibility_engine_columns(cursor)
+        # Contract v1.1 / Phase 1 P1-A：旧库画像会话 + 字段表幂等补 journey_stage
+        # 与 profile_dimension；候选表 / 邀请表由 AI_TABLES 中的 CREATE TABLE IF
+        # NOT EXISTS 直接创建（与 reviewed migration 同源）。
+        ensure_ai_profile_journey_columns(cursor)
         # Task 2 additive AI fields are safe to backfill during bootstrap;
         # constraint/index changes remain in the reviewed migration runner.
         ensure_ai_legacy_columns(cursor)

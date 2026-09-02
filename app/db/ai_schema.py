@@ -11,11 +11,39 @@ bootstrap pattern used by ``derivation_schema.py`` and ``business_schema.py``.
 JSON columns carry controlled structures only; they never bypass field
 constraints and are always expanded through Pydantic schemas before leaving the
 service.  No table stores raw provider prompts, provider responses or secrets.
+
+Phase 1 (Contract v1.1) extends this schema with the candidate understanding
+pool ``ai_profile_candidate`` and the build-invite ledger ``ai_profile_build_invite``,
+plus a ``journey_stage`` column on ``ai_profile_session`` and a nullable
+``profile_dimension`` column on both ``ai_profile_draft_field`` and
+``ai_profile_revision_field``.  The migration files live in
+``migrations/ai/20260901_01_moxiang_journey_*.sql``; ``database_setup_marriage.py``
+only registers the helper that performs the additive columns.
 """
 
 from __future__ import annotations
 
 from typing import Any
+
+# Contract v1.1 — fixed portrait dimension vocabulary.  Stored as VARCHAR(64) on
+# candidate/draft_field/revision_field but centralised here so the schema helper,
+# the prompt validator and the progress calculator stay aligned.  Append-only.
+PROFILE_DIMENSIONS: tuple[str, ...] = (
+    "personality_social",
+    "intimacy_pattern",
+    "lifestyle",
+    "emotional_expression",
+    "relationship_boundaries",
+    "future_expectations",
+)
+
+PROFILE_DIMENSION_SET: frozenset[str] = frozenset(PROFILE_DIMENSIONS)
+
+PROFILE_DIMENSIONS_DDL_COMMENT = (
+    "COMMENT 'six-dimension anchor: "
+    + ", ".join(PROFILE_DIMENSIONS)
+    + "'"
+)
 
 # session_kind：build=建构问答 / update=对话式追加 / master=墨相师对话建构。
 # 枚举追加只增不改，存量行零影响；默认 'build' 保证旧会话行为不变。
@@ -23,6 +51,15 @@ from typing import Any
 AI_PROFILE_SESSION_KIND_DDL = (
     "`session_kind` enum('build','update','master') NOT NULL DEFAULT 'build' "
     "COMMENT 'build=建构问答/update=对话式追加/master=墨相师对话建构'"
+)
+
+# journey_stage：chatting=自然聊天 / building=受邀整理 / ready=待查看 / published=已发布。
+# Contract v1.1 §1.2. 默认 'chatting' 与既有新建会话行为一致；新增会话若未经历 chatting，
+# 由 P1-C 的会话工厂显式写入更后的 stage。
+AI_PROFILE_SESSION_JOURNEY_STAGE_DDL = (
+    "`journey_stage` enum('chatting','building','ready','published') "
+    "NOT NULL DEFAULT 'chatting' "
+    "COMMENT 'chatting/building/ready/published（Contract v1.1）'"
 )
 
 AI_TABLES = {
@@ -112,6 +149,7 @@ AI_TABLES = {
             `subject` varchar(24) NOT NULL COMMENT 'personal/ideal_partner',
             `input_mode` varchar(16) NOT NULL DEFAULT 'text',
             {AI_PROFILE_SESSION_KIND_DDL},
+            {AI_PROFILE_SESSION_JOURNEY_STAGE_DDL},
             `status` varchar(24) NOT NULL DEFAULT 'draft' COMMENT 'draft/extracting/awaiting_confirmation/paused/published/failed/cancelled/stale',
             `active_status` tinyint NOT NULL DEFAULT '1' COMMENT '1活动 0已关闭',
             `consent_version` varchar(32) NOT NULL,
@@ -185,6 +223,7 @@ AI_TABLES = {
             `field_key` varchar(64) NOT NULL,
             `subject` varchar(24) NOT NULL COMMENT 'personal/ideal_partner',
             `field_kind` enum('structured','entry') NOT NULL DEFAULT 'structured' COMMENT 'structured=受控字段/entry=条目（WP-P1，决策D2并存扩展）',
+            `profile_dimension` varchar(64) DEFAULT NULL COMMENT 'Contract v1.1 §1.3 六维之一；旧字段保持 NULL 不参与完整度',
             `category` varchar(32) DEFAULT NULL COMMENT 'entry 分类，服务层校验 9 枚举',
             `content` varchar(200) DEFAULT NULL COMMENT 'entry 正文，≤200 字由服务层双保险',
             `replaces_field_key` varchar(64) DEFAULT NULL COMMENT 'entry 改写指向的被替换条目 field_key',
@@ -204,6 +243,7 @@ AI_TABLES = {
             `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
             PRIMARY KEY (`id`),
             UNIQUE KEY `uk_ai_profile_draft_field` (`draft_id`, `field_key`),
+            KEY `idx_draft_field_dimension` (`draft_id`, `profile_dimension`),
             KEY `idx_ai_profile_draft_field_status` (`draft_id`, `confirmation_status`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='AI 画像字段候选与来源证据'
     """,
@@ -231,6 +271,7 @@ AI_TABLES = {
             `field_key` varchar(64) NOT NULL,
             `subject` varchar(24) NOT NULL COMMENT 'personal/ideal_partner',
             `field_kind` enum('structured','entry') NOT NULL DEFAULT 'structured' COMMENT 'structured=受控字段/entry=条目（WP-P1，决策D2并存扩展）',
+            `profile_dimension` varchar(64) DEFAULT NULL COMMENT 'Contract v1.1 §1.3 六维之一；旧字段保持 NULL 不参与完整度',
             `category` varchar(32) DEFAULT NULL COMMENT 'entry 分类，服务层校验 9 枚举',
             `content` varchar(200) DEFAULT NULL COMMENT 'entry 正文，≤200 字由服务层双保险',
             `replaces_field_key` varchar(64) DEFAULT NULL COMMENT 'entry 改写指向的被替换条目 field_key',
@@ -246,6 +287,7 @@ AI_TABLES = {
             `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (`id`),
             UNIQUE KEY `uk_ai_profile_revision_field` (`revision_id`, `field_key`),
+            KEY `idx_revision_field_dimension` (`revision_id`, `profile_dimension`),
             KEY `idx_ai_profile_revision_field_rev` (`revision_id`, `field_key`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='AI 画像发布版本逐字段快照'
     """,
@@ -484,6 +526,127 @@ AI_TABLES = {
             KEY `idx_voice_transcript_owner` (`owner_user_id`, `created_at`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='语音转写结果'
     """,
+    # ============ Phase 4 P4-01：投影准入位（search/compat/recommend 硬过滤）============
+    # 与 ai_feature_projection 的 status='active' 区分:本表是"准入位"——只有
+    # (user_id, kind) 对应的 status='active' 时,下游消费者(搜索/匹配/推荐)才
+    # 允许读 ai_feature_projection 中相应 kind 的行。这样保证:
+    #   - 撤回授权 → mark_deleted,下游立即不可见
+    #   - 删除画像 → mark_deleted,下游立即不可见
+    #   - 恢复旧版本 → 旧 mark_invalidated,新 mark_pending → active
+    #   - 同一 revision 多次发布 → UNIQUE(user_id, kind) 保证只一份 active
+    "ai_profile_projection_status": """
+        CREATE TABLE IF NOT EXISTS `ai_profile_projection_status` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `user_id` bigint unsigned NOT NULL,
+            `kind` varchar(32) NOT NULL COMMENT 'personal_searchable/personal_compatibility/ideal_partner_preference',
+            `status` varchar(24) NOT NULL DEFAULT 'pending' COMMENT 'pending/active/invalidated/deleted/failed',
+            `source_revision` int unsigned DEFAULT NULL COMMENT '关联的 ai_profile_revision.id(同主体),非该 kind 主体时为 NULL',
+            `projection_id` bigint unsigned DEFAULT NULL COMMENT '关联的 ai_feature_projection.id',
+            `last_error` varchar(255) DEFAULT NULL,
+            `activated_at` datetime DEFAULT NULL,
+            `invalidated_at` datetime DEFAULT NULL,
+            `deleted_at` datetime DEFAULT NULL,
+            `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`),
+            UNIQUE KEY `uk_ai_profile_projection_status_user_kind` (`user_id`, `kind`),
+            KEY `idx_ai_profile_projection_status_status` (`status`, `updated_at`),
+            KEY `idx_ai_profile_projection_status_user_status` (`user_id`, `status`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='AI 投影准入位:每个 (user, kind) 只能有一行 active 投影'
+    """,
+    # ============ Contract v1.1：候选理解池与构建邀请（Phase 1 P1-A）============
+    # 候选理解池：自然聊天抽取结果先落这里，由 build_invite 接受后晋升为 suggested
+    # 草稿字段；正式画像成稿前不暴露给搜索/匹配/推荐。content_hash 包含 subject +
+    # field_kind + field_key/category + canonical(value/content)，不含
+    # source_turn_ids，确保重连重复表达合并证据而非新增候选。
+    "ai_profile_candidate": """
+        CREATE TABLE IF NOT EXISTS `ai_profile_candidate` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `candidate_id` varchar(64) NOT NULL,
+            `session_id` varchar(64) NOT NULL,
+            `user_id` bigint unsigned NOT NULL,
+            `subject` varchar(32) NOT NULL COMMENT 'personal/ideal_partner',
+            `profile_dimension` varchar(64) NOT NULL COMMENT 'Contract v1.1 §1.3 六维之一',
+            `field_kind` varchar(16) NOT NULL COMMENT 'structured/entry',
+            `field_key` varchar(64) DEFAULT NULL,
+            `category` varchar(64) DEFAULT NULL,
+            `content` text DEFAULT NULL,
+            `value_json` json DEFAULT NULL,
+            `confidence` decimal(5,4) NOT NULL,
+            `source_turn_ids` json NOT NULL COMMENT '产生该候选的 turn_id 列表，用于证据回溯',
+            `source_span` varchar(512) DEFAULT NULL,
+            `consent_version` varchar(32) NOT NULL,
+            `policy_revision` varchar(64) NOT NULL,
+            `status` varchar(16) NOT NULL DEFAULT 'active' COMMENT 'active/promoted/dismissed/expired',
+            `content_hash` char(64) NOT NULL,
+            `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`),
+            UNIQUE KEY `uk_ai_profile_candidate_id` (`candidate_id`),
+            UNIQUE KEY `uk_candidate_session_hash` (`session_id`, `content_hash`),
+            KEY `idx_candidate_session_status` (`session_id`, `status`),
+            KEY `idx_candidate_session_dimension` (`session_id`, `profile_dimension`, `confidence`),
+            KEY `idx_candidate_user_subject` (`user_id`, `subject`, `status`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='墨相师候选理解池'
+    """,
+    # 构建邀请：每个会话同一时间只允许一条 pending；invite_no 控制自动邀请计数；
+    # active_slot 是 STORED 生成列，依赖 status='pending'，与
+    # uk_ai_profile_build_invite_pending(session_id, active_slot) 共同保证互斥。
+    "ai_profile_build_invite": """
+        CREATE TABLE IF NOT EXISTS `ai_profile_build_invite` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `invite_id` varchar(96) NOT NULL,
+            `session_id` varchar(64) NOT NULL,
+            `user_id` bigint unsigned NOT NULL,
+            `subject` varchar(32) NOT NULL COMMENT 'personal/ideal_partner',
+            `status` varchar(16) NOT NULL DEFAULT 'pending' COMMENT 'pending/accepted/snoozed/expired',
+            `trigger_kind` varchar(16) NOT NULL DEFAULT 'auto' COMMENT 'auto/manual',
+            `invite_no` int unsigned NOT NULL,
+            `summary_json` json NOT NULL,
+            `effective_turn_count_at_create` int unsigned NOT NULL,
+            `dimension_count` int unsigned NOT NULL,
+            `candidate_count` int unsigned NOT NULL,
+            `snoozed_at_effective_turn_count` int unsigned DEFAULT NULL,
+            `accepted_at` datetime DEFAULT NULL,
+            `snoozed_at` datetime DEFAULT NULL,
+            `expired_at` datetime DEFAULT NULL,
+            `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            `active_slot` tinyint GENERATED ALWAYS AS (
+                CASE WHEN `status` = 'pending' THEN 1 ELSE NULL END
+            ) STORED,
+            PRIMARY KEY (`id`),
+            UNIQUE KEY `uk_ai_profile_build_invite_id` (`invite_id`),
+            UNIQUE KEY `uk_ai_profile_build_invite_no` (`session_id`, `invite_no`),
+            UNIQUE KEY `uk_ai_profile_build_invite_pending` (`session_id`, `active_slot`),
+            KEY `idx_ai_profile_build_invite_owner` (`user_id`, `subject`, `status`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='墨相师构建邀请'
+    """,
+    # Phase 3 P3-01 —— 成稿预览。
+    # 与 ``ai_profile_draft`` 通过 ``(draft_id, expected_revision)`` 唯一绑定;
+    # ``status`` 状态机: active / confirmed / stale / failed。
+    # 不修改既有 draft / revision 表。
+    "ai_profile_preview": """
+        CREATE TABLE IF NOT EXISTS `ai_profile_preview` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `preview_id` varchar(96) NOT NULL COMMENT '服务端稳定 ID,前端轮询 GET 用',
+            `draft_id` varchar(64) NOT NULL,
+            `expected_revision` int unsigned NOT NULL COMMENT '乐观锁,绑定 draft.expected_revision',
+            `user_id` bigint unsigned NOT NULL,
+            `subject` varchar(24) NOT NULL COMMENT 'personal/ideal_partner',
+            `content` mediumtext NOT NULL COMMENT '预览正文(narrative + 维度摘要)',
+            `status` enum('active','confirmed','stale','failed') NOT NULL DEFAULT 'active',
+            `task_id` varchar(96) DEFAULT NULL COMMENT 'profile_preview worker task_id',
+            `last_error` varchar(512) DEFAULT NULL,
+            `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`),
+            UNIQUE KEY `uk_ai_profile_preview_id` (`preview_id`),
+            UNIQUE KEY `uk_ai_profile_preview_draft_revision` (`draft_id`, `expected_revision`),
+            KEY `idx_ai_profile_preview_user_subject` (`user_id`, `subject`, `status`),
+            KEY `idx_ai_profile_preview_draft_status` (`draft_id`, `status`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='墨相师独立画像预览(Phase 3 P3-01)'
+    """,
 }
 
 AI_CONSENT_OPERATION_TABLE = """
@@ -716,7 +879,7 @@ COMPATIBILITY_ENGINE_REQUIRED_COLUMNS: dict[str, str] = {
 
 
 def ensure_ai_compatibility_engine_columns(cursor: Any) -> None:
-    """Idempotently add engine/brand_label columns to ``ai_compatibility_snapshot``。"""
+    """Idempotently add engine/brand_label columns to ``ai_compatibility_snapshot``."""
     try:
         cursor.execute("SHOW COLUMNS FROM `ai_compatibility_snapshot`")
         existing = {row["Field"] for row in cursor.fetchall()}
@@ -727,6 +890,72 @@ def ensure_ai_compatibility_engine_columns(cursor: Any) -> None:
             cursor.execute(
                 f"ALTER TABLE `ai_compatibility_snapshot` ADD COLUMN {column_def}"
             )
+
+
+# ----------------------------------------------------------------------
+# Contract v1.1 / Phase 1 P1-A：墨相师旅程 + 六维字段（旧库幂等补列）
+# ----------------------------------------------------------------------
+#
+# 三处加列：
+#   * ai_profile_session.journey_stage          (Contract §1.2 enum)
+#   * ai_profile_draft_field.profile_dimension  (Contract §1.3, nullable)
+#   * ai_profile_revision_field.profile_dimension (Contract §1.3, nullable)
+# 两张新表（ai_profile_candidate / ai_profile_build_invite）通过
+# CREATE TABLE IF NOT EXISTS 在 AI_TABLES 中定义，旧库缺表时 bootstrap 同样可补；
+# reviewed migration 中也包含 CREATE TABLE IF NOT EXISTS（IGNORABLE_MYSQL_ERRORS
+# 中 1050 让其再次执行不报错）。两张表无需额外 SHOW COLUMNS 检查。
+#
+# 旧草稿/版本行保持 profile_dimension=NULL（P1-A 不进行猜测式 AI 回填）。
+AI_PROFILE_JOURNEY_REQUIRED_COLUMNS: dict[str, str] = {
+    "ai_profile_session": AI_PROFILE_SESSION_JOURNEY_STAGE_DDL,
+}
+
+
+def _add_column_if_missing(
+    cursor: Any,
+    table_name: str,
+    column_name: str,
+    column_def: str,
+) -> None:
+    try:
+        cursor.execute(f"SHOW COLUMNS FROM `{table_name}`")
+    except Exception:  # noqa: BLE001 - legacy bootstrap is best effort
+        return
+    existing = {row["Field"] for row in cursor.fetchall()}
+    if column_name in existing:
+        return
+    cursor.execute(f"ALTER TABLE `{table_name}` ADD COLUMN {column_def}")
+
+
+def ensure_ai_profile_journey_columns(cursor: Any) -> None:
+    """Idempotently add Phase 1 contract v1.1 columns to legacy AI tables.
+
+    fresh bootstrap 通过 ``AI_TABLES`` 直接获得完整列；本 helper 只补旧库缺列，
+    与 ``ensure_ai_legacy_columns`` 同模式（SHOW COLUMNS→ALTER TABLE ADD COLUMN）。
+    """
+    for table_name, column_def in AI_PROFILE_JOURNEY_REQUIRED_COLUMNS.items():
+        _add_column_if_missing(cursor, table_name, "journey_stage", column_def)
+    # draft_field / revision_field.profile_dimension 必须在 ai_profile_draft_field
+    # 与 ai_profile_revision_field 之间保持 schema 一致（Contract §1.3）。
+    for table_name in AI_PROFILE_ENTRY_FIELD_TABLES:
+        _add_column_if_missing(
+            cursor,
+            table_name,
+            "profile_dimension",
+            f"`profile_dimension` varchar(64) DEFAULT NULL "
+            f"{PROFILE_DIMENSIONS_DDL_COMMENT}",
+        )
+    # 两张新增表走 CREATE TABLE IF NOT EXISTS；bootstrap 也走 CREATE TABLE，
+    # 若运行顺序先于 reviewed migration，仍能保证存在。helper 内的最佳努力
+    # 只检查 journey/dimension 列，因此新表缺表时不抛错（旧库升级路径）。
+    try:
+        cursor.execute("SHOW COLUMNS FROM `ai_profile_candidate`")
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        cursor.execute("SHOW COLUMNS FROM `ai_profile_build_invite`")
+    except Exception:  # noqa: BLE001
+        pass
 
 
 # These additive columns keep an older bootstrap-created database readable until

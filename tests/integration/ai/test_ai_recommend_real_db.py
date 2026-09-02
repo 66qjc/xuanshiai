@@ -97,6 +97,13 @@ async def _seed_user(
         ),
         {"user_id": user_id, "granted_at": now},
     )
+    # Phase 4 P4-01: 测试隔离 — 先清后写，UNIQUE(user_id, kind) 跨用例幂等。
+    await db.execute(
+        text(
+            "DELETE FROM ai_profile_projection_status WHERE user_id = :user_id"
+        ),
+        {"user_id": user_id},
+    )
     consent_snapshot = {
         "scope": "profile_text_extract",
         "version": "profile-text-v1",
@@ -152,6 +159,15 @@ async def _seed_user(
                 "consent": json.dumps(consent_snapshot, ensure_ascii=False),
                 "expires_at": now + timedelta(days=1),
             },
+        )
+        # Phase 4 P4-01: 投影准入位(测试 fixture 默认 active)
+        await db.execute(
+            text(
+                "INSERT INTO ai_profile_projection_status "
+                "(user_id, kind, status, source_revision, projection_id) "
+                "VALUES (:user_id, :kind, 'active', 0, NULL)"
+            ),
+            {"user_id": user_id, "kind": kind},
         )
 
 
@@ -419,7 +435,6 @@ async def test_real_daily_batch_enqueues_idempotently(
 # WP-P6e 读取服务：read_recommendations + miss 触发重建
 # ----------------------------------------------------------------------
 
-from datetime import timedelta  # noqa: E402
 
 from app.services.ai.recommend import (  # noqa: E402
     enqueue_recommendation_rebuild,

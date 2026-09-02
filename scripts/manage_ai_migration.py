@@ -15,9 +15,15 @@ import pymysql
 from pymysql.connections import Connection
 from pymysql.cursors import DictCursor
 
-from database_setup_marriage import get_db_config
-
+# ``python scripts/manage_ai_migration.py ...`` makes ``scripts/`` the first
+# import root instead of the repository root.  Keep the documented direct
+# invocation working even when PYTHONPATH has not been preconfigured.
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from database_setup_marriage import get_db_config  # noqa: E402
+
 MIGRATION_ROOT = ROOT / "migrations" / "ai"
 MANIFEST_PATH = MIGRATION_ROOT / "manifest.json"
 MIGRATION_LOCK = "xuanshiai_ai_schema_migration_v1"
@@ -111,8 +117,28 @@ def _statements(path: Path) -> list[str]:
     return chunks
 
 
-def _connect() -> tuple[Connection, str]:
-    config = get_db_config()
+def _database_config_for_target(target: str) -> dict[str, Any]:
+    if target == "development":
+        return get_db_config()
+    test_database_url = os.getenv("AI_TEST_DATABASE_URL", "").strip()
+    if not test_database_url:
+        raise MigrationError(
+            "AI_TEST_DATABASE_URL is required for --target test; "
+            "refusing to fall back to the development database"
+        )
+    previous_database_url = os.environ.get("DATABASE_URL")
+    os.environ["DATABASE_URL"] = test_database_url
+    try:
+        return get_db_config()
+    finally:
+        if previous_database_url is None:
+            os.environ.pop("DATABASE_URL", None)
+        else:
+            os.environ["DATABASE_URL"] = previous_database_url
+
+
+def _connect(target: str) -> tuple[Connection, str]:
+    config = _database_config_for_target(target)
     database = str(config["database"])
     if not SAFE_IDENTIFIER.fullmatch(database):
         raise MigrationError("invalid database identifier")
@@ -220,7 +246,12 @@ def _column_nullable(cursor: Any, table: str, column: str) -> str:
     return str(row["is_nullable"]) if row else ""
 
 
-def _verify(cursor: Any, manifest: dict[str, Any], expect: str) -> None:
+def _verify(
+    cursor: Any,
+    manifest: dict[str, Any],
+    expect: str,
+    database_name: str,
+) -> None:
     if expect not in {"current", "previous"}:
         raise MigrationError("verify expect must be current or previous")
     versions = manifest["versions"]
@@ -337,11 +368,7 @@ def _verify(cursor: Any, manifest: dict[str, Any], expect: str) -> None:
                 raise MigrationError("previous schema still contains hardened turn columns")
             if "updated_at" in result_columns or "uk_ai_search_result_rank" not in result_indexes:
                 raise MigrationError("previous AI schema was not restored")
-    print(f"verified={expect} database={database_name_for_output()}")
-
-
-def database_name_for_output() -> str:
-    return str(get_db_config()["database"])
+    print(f"verified={expect} database={database_name}")
 
 
 def _active_task_count(cursor: Any) -> int:
@@ -367,7 +394,7 @@ def _run(command: str, target: str, expect: str = "current") -> int:
         )
     manifest = _manifest()
     versions = manifest["versions"]
-    connection, _ = _connect()
+    connection, database_name = _connect(target)
     try:
         with connection.cursor() as cursor:
             _ensure_history(cursor)
@@ -382,7 +409,7 @@ def _run(command: str, target: str, expect: str = "current") -> int:
                     connection.commit()
                     return 0
                 if command == "verify":
-                    _verify(cursor, manifest, expect)
+                    _verify(cursor, manifest, expect, database_name)
                     connection.commit()
                     return 0
                 if command == "up":
@@ -399,7 +426,7 @@ def _run(command: str, target: str, expect: str = "current") -> int:
                             _record_finish(cursor, version, "failed", type(exc).__name__)
                             connection.commit()
                             raise
-                    _verify(cursor, manifest, "current")
+                    _verify(cursor, manifest, "current", database_name)
                     connection.commit()
                     print(f"migration={' -> '.join(str(v['version']) for v in versions)} status=succeeded")
                     return 0
@@ -419,7 +446,7 @@ def _run(command: str, target: str, expect: str = "current") -> int:
                             _record_finish(cursor, version, "rollback_failed", type(exc).__name__)
                             connection.commit()
                             raise
-                    _verify(cursor, manifest, "previous")
+                    _verify(cursor, manifest, "previous", database_name)
                     connection.commit()
                     print(f"migration={' -> '.join(str(v['version']) for v in reversed(versions))} status=rolled_back")
                     return 0

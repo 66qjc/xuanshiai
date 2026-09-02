@@ -47,6 +47,7 @@ async def _cleanup(db: AsyncSession) -> None:
         "DELETE FROM ai_search_draft WHERE user_id = :a",
         "DELETE FROM ai_compatibility_snapshot WHERE viewer_user_id IN (:a, :b) OR target_user_id IN (:a, :b)",
         "DELETE FROM ai_feature_projection WHERE subject_user_id IN (:a, :b)",
+        "DELETE FROM ai_profile_projection_status WHERE user_id IN (:a, :b)",
         "DELETE FROM ai_task WHERE owner_user_id IN (:a, :b)",
         "DELETE FROM ai_consent_operation WHERE user_id IN (:a, :b)",
         "DELETE FROM ai_consent_grant WHERE user_id IN (:a, :b)",
@@ -242,6 +243,27 @@ async def _seed_ready_reads(db: AsyncSession) -> tuple[str, str]:
                 "expires_at": now + timedelta(days=1),
             },
         )
+        # Phase 4 P4-01: 投影准入位
+        for _kind in (
+            "personal_searchable",
+            "personal_compatibility",
+            "ideal_partner_preference",
+        ):
+            await db.execute(
+                text(
+                    "DELETE FROM ai_profile_projection_status "
+                    "WHERE user_id = :user_id AND kind = :kind"
+                ),
+                {"user_id": user_id, "kind": _kind},
+            )
+            await db.execute(
+                text(
+                    "INSERT INTO ai_profile_projection_status "
+                    "(user_id, kind, status, source_revision) "
+                    "VALUES (:user_id, :kind, 'active', 0)"
+                ),
+                {"user_id": user_id, "kind": _kind},
+            )
 
     draft_id = f"privacy-search-{uuid.uuid4().hex[:10]}"
     await db.execute(

@@ -1,7 +1,7 @@
 """墨相师·AI 引路人的对话编排器。
 
 与 :class:`VoiceConversationOrchestrator` 的区别：
-- 维护多轮对话历史（内存级，WS 连接生命周期内有效）
+- 维护多轮对话历史（由路由从持久化轮次恢复后，连接内继续累积）
 - 使用墨相师人设提示词（非 voice_reply 的 ≤30 字资料采集助手）
 - 不做画像字段抽取（不调 structured_extract / extract_all）
 - 回复无硬性字数上限，适合人设化对话
@@ -79,6 +79,24 @@ class MoxiangMasterOrchestrator:
     def set_build_context(self, context: str) -> None:
         """设置建构模式上下文（缺失硬字段/已确认摘要/进度），空串=纯聊模式。"""
         self._build_context = context
+
+    def hydrate_history(self, turns: list[dict[str, str]]) -> None:
+        """Restore the recent persisted dialogue for a resumed WS session.
+
+        The orchestrator is connection-scoped, while ``ai_profile_turn`` is
+        session-scoped.  Rehydrating before the next reply keeps reconnects and
+        subject switches on the same conversational context without retaining
+        unbounded or malformed rows.
+        """
+        restored: list[dict[str, str]] = []
+        for turn in turns:
+            role = str(turn.get("role") or "")
+            content = str(turn.get("content") or "").strip()
+            if role not in {"user", "assistant"} or not content:
+                continue
+            restored.append({"role": role, "content": content})
+        self._history = restored[-(_MAX_HISTORY_TURNS * 2):]
+        self._last_reply_text = ""
 
     async def stream_reply(
         self,

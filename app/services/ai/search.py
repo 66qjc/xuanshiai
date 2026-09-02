@@ -1650,15 +1650,18 @@ async def _load_projections(
     placeholders = ", ".join(f":uid{i}" for i in range(len(user_ids)))
     result = await db.execute(
         text(
-            "SELECT id, subject_user_id, source_hash, fields_json, "
-            "profile_revision, preference_revision, privacy_revision, "
-            "relationship_revision, policy_revision, source_revision_json, "
-            "consent_snapshot_json, status, expires_at "
-            "FROM ai_feature_projection "
-            f"WHERE subject_user_id IN ({placeholders}) "
-            "AND projection_kind = 'personal_searchable' AND status = 'active' "
-            "AND (expires_at IS NULL OR expires_at > UTC_TIMESTAMP()) "
-            "ORDER BY id DESC"
+            "SELECT p.id, p.subject_user_id, p.source_hash, p.fields_json, "
+            "p.profile_revision, p.preference_revision, p.privacy_revision, "
+            "p.relationship_revision, p.policy_revision, p.source_revision_json, "
+            "p.consent_snapshot_json, p.status, p.expires_at "
+            "FROM ai_feature_projection p "
+            "INNER JOIN ai_profile_projection_status ps "
+            "  ON ps.user_id = p.subject_user_id AND ps.kind = p.projection_kind "
+            f"WHERE p.subject_user_id IN ({placeholders}) "
+            "AND p.projection_kind = 'personal_searchable' AND p.status = 'active' "
+            "AND (p.expires_at IS NULL OR p.expires_at > UTC_TIMESTAMP()) "
+            "AND ps.status = 'active' "
+            "ORDER BY p.id DESC"
         ),
         {f"uid{i}": uid for i, uid in enumerate(user_ids)},
     )
@@ -2553,12 +2556,15 @@ async def get_search_suggestions(
         )
     result = await db.execute(
         text(
-            "SELECT subject_user_id, fields_json, status, expires_at "
-            "FROM ai_feature_projection "
-            "WHERE subject_user_id = :user_id "
-            "AND projection_kind = 'personal_searchable' AND status = 'active' "
-            "AND (expires_at IS NULL OR expires_at > UTC_TIMESTAMP()) "
-            "ORDER BY id DESC LIMIT 1"
+            "SELECT p.subject_user_id, p.fields_json, p.status, p.expires_at "
+            "FROM ai_feature_projection p "
+            "INNER JOIN ai_profile_projection_status ps "
+            "  ON ps.user_id = p.subject_user_id AND ps.kind = p.projection_kind "
+            "WHERE p.subject_user_id = :user_id "
+            "AND p.projection_kind = 'personal_searchable' AND p.status = 'active' "
+            "AND (p.expires_at IS NULL OR p.expires_at > UTC_TIMESTAMP()) "
+            "AND ps.status = 'active' "
+            "ORDER BY p.id DESC LIMIT 1"
         ),
         {"user_id": owner_user_id},
     )

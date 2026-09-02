@@ -60,6 +60,7 @@ async def _cleanup_pair(db: AsyncSession) -> None:
         "DELETE FROM ai_profile_revision WHERE user_id IN (:a, :b)",
         "DELETE FROM ai_compatibility_snapshot WHERE viewer_user_id IN (:a, :b) OR target_user_id IN (:a, :b)",
         "DELETE FROM ai_feature_projection WHERE subject_user_id IN (:a, :b)",
+        "DELETE FROM ai_profile_projection_status WHERE user_id IN (:a, :b)",
         "DELETE FROM ai_task WHERE owner_user_id IN (:a, :b)",
         "DELETE FROM ai_consent_operation WHERE user_id IN (:a, :b)",
         "DELETE FROM ai_consent_grant WHERE user_id IN (:a, :b)",
@@ -74,6 +75,38 @@ async def _cleanup_pair(db: AsyncSession) -> None:
         "DELETE FROM users WHERE id IN (:a, :b)",
     ):
         await db.execute(text(statement), {"a": USER_A, "b": USER_B})
+    await db.commit()
+
+
+async def _seed_projection_status_active(db: AsyncSession, *user_ids: int) -> None:
+    """Phase 4 P4-01: 为指定 user 在三种 kind 上置 projection_status.active。
+
+    publish→projection 链路在 supersede 触发的 savepoint 回滚时,可能让
+    handler 的 mark_active 写入被丢弃,下游 search 走 INNER JOIN 因此空。
+    显式 seed 让该集成测试回到准入位 active。
+    """
+    kinds = (
+        "personal_searchable",
+        "personal_compatibility",
+        "ideal_partner_preference",
+    )
+    for user_id in user_ids:
+        for kind in kinds:
+            await db.execute(
+                text(
+                    "DELETE FROM ai_profile_projection_status "
+                    "WHERE user_id = :user_id AND kind = :kind"
+                ),
+                {"user_id": user_id, "kind": kind},
+            )
+            await db.execute(
+                text(
+                    "INSERT INTO ai_profile_projection_status "
+                    "(user_id, kind, status, source_revision) "
+                    "VALUES (:user_id, :kind, 'active', 0)"
+                ),
+                {"user_id": user_id, "kind": kind},
+            )
     await db.commit()
 
 
@@ -305,6 +338,11 @@ async def _prepare_ready_pair(
     for user_id in (USER_A, USER_B):
         await _publish_subject_via_real_session(factory, user_id, ProfileSubject.PERSONAL)
         await _publish_subject_via_real_session(factory, user_id, ProfileSubject.IDEAL_PARTNER)
+    # Phase 4 P4-01: publish→projection 链路可能因版本向量 supersede 触发
+    # savepoint 回滚,导致 mark_active 写入被吞;此处显式 seed
+    # projection_status,让下游 search/compat 走准入位。日常生产路径由
+    # profile_projection_handler 在 succeeded 提交时 mark_active 接管。
+    await _seed_projection_status_active(real_db_session, USER_A, USER_B)
     return factory, consent_a, consent_b
 
 

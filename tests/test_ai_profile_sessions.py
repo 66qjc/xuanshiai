@@ -46,6 +46,7 @@ from app.services.ai.profile import (
     ProfileSessionNotFound,
     ProfileSessionStale,
     ProfileSessionStatus,
+    create_master_session,
     create_profile_session,
     extract_profile_turn,
     load_owned_session,
@@ -465,6 +466,18 @@ class FakeProfileSession:
         # app.services.ai.profile.moderate_text。
         if "FROM config_sensitive_word" in sql:
             return _MappingResult([])
+        # ---- Phase 4 P4-01: ai_profile_projection_status ----
+        # 假库只关心删除路径(走 mark_deleted):记录 status=deleted 即视为
+        # 准入位已不可读;active/invalidated/pending 假库不模拟,默认视为"可读"。
+        if "INSERT INTO ai_profile_projection_status" in sql:
+            kind = str(values.get("kind") or "")
+            status = str(values.get("status") or "")
+            if status == "deleted":
+                self._store.projection_status[(int(values["user_id"]), kind)] = {
+                    "status": status, "reason": values.get("last_error")
+                }
+            # 其余状态假库不模拟(测试目标只关心删除)
+            return _MappingResult([])
         raise AssertionError(f"unhandled sql: {sql}")
 
     async def commit(self) -> None:
@@ -491,6 +504,8 @@ class ProfileStore:
         self.draft_fields: list[dict[str, Any]] = []
         self.consents: list[dict[str, Any]] = []
         self.revision_rows: dict[int, dict[str, Any]] = {}
+        # Phase 4 P4-01: ai_profile_projection_status 假存储
+        self.projection_status: dict[tuple[int, str], dict[str, Any]] = {}
         self.task_store = TaskStore()
         self.session = FakeProfileSession(self)
         self.db = self.session
@@ -2001,6 +2016,33 @@ async def test_create_session_service_rejects_unknown_subject(profile_store) -> 
         )
     assert excinfo.value.code == "AI_INPUT_INVALID"
     assert excinfo.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_master_session_replaces_legacy_active_session_without_deleting_it(
+    profile_store,
+) -> None:
+    """master 入口不得静默复用旧 build/update 会话。"""
+    legacy = await profile_store.seed_session(
+        owner_user_id=10,
+        subject="personal",
+        status="draft",
+        session_id="legacy_build_personal",
+    )
+    legacy["session_kind"] = "build"
+
+    session = await create_master_session(
+        profile_store.db,
+        10,
+        ProfileSubject.PERSONAL,
+        "profile-text-v1",
+    )
+
+    assert session.session_id != legacy["session_id"]
+    assert session.session_kind == "master"
+    assert legacy["status"] == "stale"
+    assert legacy["active_status"] == 0
+    assert legacy["session_id"] in profile_store.sessions
 
 
 @pytest.mark.asyncio

@@ -25,6 +25,7 @@ _DEFAULT_FEATURE_FLAGS = {
     "ai_profile_enabled": False,
     "ai_search_enabled": False,
     "ai_compatibility_shadow_enabled": False,
+    "ai_moxiang_journey_enabled": False,
     "ai_provider": "mock",
 }
 

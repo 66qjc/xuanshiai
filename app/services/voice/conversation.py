@@ -154,24 +154,36 @@ class VoiceConversationOrchestrator:
         request_id: str = "",
         synthesize: bool = False,
     ) -> ConversationTurnResult:
-        """处理最终转写文本：画像抽取 → 流式拼回复；默认不合成 TTS。
+        """兼容入口：单轮画像抽取 → 完整回复；默认不合成 TTS。
 
         状态流转：LISTENING → PROCESSING → IDLE。
         仅当 ``synthesize=True`` 时再进入 SPEAKING。
-        抽取失败不打断口语回复。
+        实时 WebSocket 使用 :meth:`stream_reply_events` 的批量抽取路径；本入口
+        保留旧调用方依赖的单轮抽取和 ``reply_builder`` 契约。
         """
+        if self.state != ConversationState.LISTENING:
+            raise RuntimeError(
+                f"对话状态非 listening，无法处理转写: {self.state}"
+            )
+        self.state = ConversationState.PROCESSING
         result = ConversationTurnResult(final_transcript=final_transcript)
-        async for _kind, _text in self.stream_reply_events(
-            final_transcript,
-            user_id=user_id,
-            request_id=request_id,
-            consent_version=consent_version,
-            policy_revision=policy_revision,
-        ):
-            pass
+        self._last_request_id = request_id
+        self._all_transcripts.append(final_transcript)
+        try:
+            extracted = await self._extract_in_memory(
+                final_transcript,
+                consent_version=consent_version,
+                policy_revision=policy_revision,
+                request_id=request_id,
+            )
+            self._last_extract_result = extracted
+            self._last_reply_text = await self._build_reply(
+                final_transcript, extracted, request_id
+            )
+        finally:
+            self.state = ConversationState.IDLE
 
-        extracted = self._last_extract_result
-        if extracted is not None and extracted.fields:
+        if extracted.fields:
             field = extracted.fields[0]
             result.extracted_field_key = field.field_key
             result.extracted_value = field.value
@@ -459,6 +471,54 @@ class VoiceConversationOrchestrator:
                 request_id,
             )
         # 降级模板
+        return "好的，我了解了，请继续。"
+
+    async def _build_reply(
+        self,
+        transcript: str,
+        extracted: StructuredExtractResult,
+        request_id: str,
+    ) -> str:
+        """Build the compatibility-path reply with extracted-field context."""
+        if callable(self.reply_builder):
+            value = self.reply_builder(transcript, extracted, request_id)
+            if hasattr(value, "__await__"):
+                return await value
+            return value
+
+        known_fields = tuple(
+            {"field_key": field.field_key, "value": field.value}
+            for field in extracted.fields
+        )
+        reply_context = AITaskContext(
+            task_id=uuid.uuid4().hex,
+            request_id=request_id or uuid.uuid4().hex,
+            scene="voice_conversation_reply",
+            provider=settings.ai_provider,
+            model=settings.ai_model_name,
+            schema_version="voice-reply-v1",
+        )
+        reply_request = ReplyRequest(
+            transcript=transcript,
+            field_key=self._field_key,
+            known_fields=known_fields,
+        )
+        try:
+            outcome = await self.ai_gateway.generate_reply(
+                reply_context, reply_request
+            )
+            if outcome.result is not None and outcome.result.reply_text:
+                return outcome.result.reply_text
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "conversation_reply_failed session=%s request_id=%s, "
+                "降级模板回复",
+                self._session_id,
+                request_id,
+            )
+        if extracted.fields:
+            field = extracted.fields[0]
+            return f"好的，已记录你的信息。请继续告诉我你的{field.field_key}。"
         return "好的，我了解了，请继续。"
 
     async def extract_all(

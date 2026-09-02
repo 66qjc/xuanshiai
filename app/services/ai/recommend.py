@@ -263,12 +263,16 @@ async def load_candidate_pool(
     """
     result = await db.execute(
         text(
-            "SELECT id, subject_user_id, projection_kind, fields_json, source_hash, "
-            "source_revision_json, consent_snapshot_json FROM ai_feature_projection "
-            "WHERE projection_kind IN ('personal_compatibility', 'ideal_partner_preference') "
-            "AND status = 'active' AND subject_user_id <> :viewer "
-            "AND (expires_at IS NULL OR expires_at > UTC_TIMESTAMP()) "
-            "ORDER BY id DESC LIMIT :limit"
+            "SELECT p.id, p.subject_user_id, p.projection_kind, p.fields_json, p.source_hash, "
+            "p.source_revision_json, p.consent_snapshot_json "
+            "FROM ai_feature_projection p "
+            "INNER JOIN ai_profile_projection_status ps "
+            "  ON ps.user_id = p.subject_user_id AND ps.kind = p.projection_kind "
+            "WHERE p.projection_kind IN ('personal_compatibility', 'ideal_partner_preference') "
+            "AND p.status = 'active' AND p.subject_user_id <> :viewer "
+            "AND (p.expires_at IS NULL OR p.expires_at > UTC_TIMESTAMP()) "
+            "AND ps.status = 'active' "
+            "ORDER BY p.id DESC LIMIT :limit"
         ),
         {"viewer": int(viewer_id), "limit": int(limit) * 2},
     )
@@ -312,13 +316,16 @@ async def load_recommendation_inputs(
     """
     result = await db.execute(
         text(
-            "SELECT projection_kind, fields_json, source_hash "
-            "FROM ai_feature_projection "
-            "WHERE subject_user_id = :viewer "
-            "AND projection_kind IN ('personal_compatibility', 'ideal_partner_preference') "
-            "AND status = 'active' "
-            "AND (expires_at IS NULL OR expires_at > UTC_TIMESTAMP()) "
-            "ORDER BY id DESC"
+            "SELECT p.projection_kind, p.fields_json, p.source_hash "
+            "FROM ai_feature_projection p "
+            "INNER JOIN ai_profile_projection_status ps "
+            "  ON ps.user_id = p.subject_user_id AND ps.kind = p.projection_kind "
+            "WHERE p.subject_user_id = :viewer "
+            "AND p.projection_kind IN ('personal_compatibility', 'ideal_partner_preference') "
+            "AND p.status = 'active' "
+            "AND (p.expires_at IS NULL OR p.expires_at > UTC_TIMESTAMP()) "
+            "AND ps.status = 'active' "
+            "ORDER BY p.id DESC"
         ),
         {"viewer": int(viewer_id)},
     )
@@ -347,11 +354,14 @@ async def viewer_projection_is_current(db: AsyncSession, viewer_id: int) -> bool
     """
     result = await db.execute(
         text(
-            "SELECT source_revision_json, profile_revision, preference_revision "
-            "FROM ai_feature_projection "
-            "WHERE subject_user_id = :viewer "
-            "AND projection_kind = 'personal_compatibility' AND status = 'active' "
-            "ORDER BY id DESC LIMIT 1"
+            "SELECT p.source_revision_json, p.profile_revision, p.preference_revision "
+            "FROM ai_feature_projection p "
+            "INNER JOIN ai_profile_projection_status ps "
+            "  ON ps.user_id = p.subject_user_id AND ps.kind = p.projection_kind "
+            "WHERE p.subject_user_id = :viewer "
+            "AND p.projection_kind = 'personal_compatibility' AND p.status = 'active' "
+            "AND ps.status = 'active' "
+            "ORDER BY p.id DESC LIMIT 1"
         ),
         {"viewer": int(viewer_id)},
     )

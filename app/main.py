@@ -20,6 +20,7 @@ from app.api.router import OPENAPI_TAGS, api_router
 from app.api.routes.admin_home import legacy_router as admin_home_legacy_router
 from app.core.config import settings
 from app.core.logging import configure_logging, request_id_context
+from app.db.session import engine
 
 configure_logging(settings)
 logger = logging.getLogger(__name__)
@@ -51,6 +52,8 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     )
     await initialize_database_on_startup()
     yield
+    if engine is not None:
+        await engine.dispose()
     logger.info("application_stopping")
 
 

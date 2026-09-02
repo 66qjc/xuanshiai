@@ -27,6 +27,7 @@ async def _clean(db: AsyncSession) -> None:
         "DELETE FROM ai_search_condition WHERE draft_id IN (SELECT draft_id FROM ai_search_draft WHERE user_id = :owner)",
         "DELETE FROM ai_search_snapshot WHERE user_id = :owner",
         "DELETE FROM ai_search_draft WHERE user_id = :owner",
+        "DELETE FROM ai_profile_projection_status WHERE user_id IN (:owner, :candidate)",
         "DELETE FROM ai_task WHERE owner_user_id = :owner",
         "DELETE FROM ai_feature_projection WHERE subject_user_id = :candidate",
         "DELETE FROM ai_consent_grant WHERE user_id IN (:owner, :candidate)",
@@ -41,6 +42,26 @@ async def _clean(db: AsyncSession) -> None:
             text(statement), {"owner": OWNER_ID, "candidate": CANDIDATE_ID}
         )
     await db.commit()
+
+
+async def _seed_projection_status_active(
+    db: AsyncSession, user_id: int, kind: str = "personal_searchable"
+) -> None:
+    """Phase 4 P4-01: 投影准入位置 active(测试 fixture 显式触发,默认 active)。"""
+    await db.execute(
+        text(
+            "DELETE FROM ai_profile_projection_status "
+            "WHERE user_id = :user_id AND kind = :kind"
+        ),
+        {"user_id": user_id, "kind": kind},
+    )
+    await db.execute(
+        text(
+            "INSERT INTO ai_profile_projection_status (user_id, kind, status) "
+            "VALUES (:user_id, :kind, 'active')"
+        ),
+        {"user_id": user_id, "kind": kind},
+    )
 
 
 @pytest.mark.asyncio
@@ -158,6 +179,8 @@ async def test_real_search_materializes_provenance_and_reads_without_recompute(
             "expires_at": now + timedelta(days=1),
         },
     )
+    # Phase 4 P4-01: 投影准入位
+    await _seed_projection_status_active(real_db_session, CANDIDATE_ID)
     draft_id = "real-search-draft-phase2"
     await real_db_session.execute(
         text(
@@ -326,6 +349,7 @@ async def test_real_generation_increments_and_old_candidates_cleared(
             "expires_at": now + timedelta(days=1),
         },
     )
+    await _seed_projection_status_active(real_db_session, CANDIDATE_ID)
     draft_id = "real-gen-draft-1"
     await real_db_session.execute(
         text(
@@ -485,6 +509,7 @@ async def test_real_v2_cursor_paging_no_duplicates_with_target_user_id_tiebreak(
             "expires_at": now + timedelta(days=1),
         },
     )
+    await _seed_projection_status_active(real_db_session, CANDIDATE_ID)
     draft_id = "real-page-draft-1"
     await real_db_session.execute(
         text(
@@ -637,6 +662,7 @@ async def test_real_old_cursor_invalid_after_generation_switch(
             "expires_at": now + timedelta(days=1),
         },
     )
+    await _seed_projection_status_active(real_db_session, CANDIDATE_ID)
     draft_id = "real-switch-draft-1"
     await real_db_session.execute(
         text(

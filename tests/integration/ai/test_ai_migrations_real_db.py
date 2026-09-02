@@ -16,6 +16,10 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 def _run_migration(*arguments: str) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env["PYTHONPATH"] = str(REPO_ROOT)
+    env["AI_TEST_DATABASE_URL"] = os.getenv(
+        "AI_TEST_DATABASE_URL",
+        "mysql+aiomysql://root:@127.0.0.1:3307/xuanshiai_ai_test",
+    )
     return subprocess.run(
         [sys.executable, "scripts/manage_ai_migration.py", *arguments, "--target", "test"],
         cwd=REPO_ROOT,

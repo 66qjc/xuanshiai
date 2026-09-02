@@ -1,8 +1,11 @@
+from types import SimpleNamespace
+
 import pytest
 from pydantic import ValidationError
 
 from app.core.config import Settings, settings
 from app.db.derivation_schema import DERIVATION_TABLES
+import app.main as main_module
 from app.main import initialize_database_on_startup
 from database_setup_marriage import DatabaseManager
 
@@ -16,6 +19,25 @@ def test_production_rejects_database_auto_init() -> None:
 async def test_database_bootstrap_can_be_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "auto_init_db", False)
     await initialize_database_on_startup()
+
+
+@pytest.mark.asyncio
+async def test_lifespan_disposes_database_engine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    disposed = False
+
+    async def dispose() -> None:
+        nonlocal disposed
+        disposed = True
+
+    monkeypatch.setattr(main_module.settings, "auto_init_db", False)
+    monkeypatch.setattr(main_module, "engine", SimpleNamespace(dispose=dispose))
+
+    async with main_module.lifespan(None):
+        pass
+
+    assert disposed is True
 
 
 def test_derivation_tables_are_registered_with_database_bootstrap(

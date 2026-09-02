@@ -12,6 +12,8 @@ fake 库形态仿 ``tests/test_master_extract_handler.py``（内存假库 + work
 - text_message → ai_reply 正常；DB 出现 user+assistant turn；ai_task 出现
   profile_extract 行并由 fake gateway 同步完成后收到 confirm_card
 - 不带 mode 的 session_start：无会话创建、无 progress 推送（回归兼容）
+- subject_switch 的非法主体、双主体会话/进度/确认卡隔离
+- 断线重连恢复当前主体的进度/确认卡，并按主体推送 publish_ready
 - 软删除建议硬字段行（占 (draft_id, field_key) 唯一键）后下一轮抽取重定位
   成功：UPDATE 复活而非 INSERT（无 IntegrityError）
 """
@@ -143,6 +145,25 @@ class _WSFakeSession(MasterFakeSession):
         sql = str(statement)
         values = dict(params or {})
         store = self._store
+        if "FROM ai_profile_turn" in sql and "ORDER BY turn_no DESC" in sql:
+            rows = sorted(
+                (
+                    r
+                    for r in store.turns
+                    if r["session_id"] == values["session_id"]
+                ),
+                key=lambda r: r["turn_no"],
+                reverse=True,
+            )
+            return _MappingResult(
+                [
+                    {
+                        "role": r["role"],
+                        "answer_text": r["answer_text"],
+                    }
+                    for r in rows
+                ]
+            )
         if "FROM ai_profile_summary" in sql:
             return _MappingResult([])
         if (
@@ -339,6 +360,571 @@ def test_session_start_with_build_mode_creates_master_session(
     assert next(iter(store.sessions.values()))["session_kind"] == "master"
 
 
+def test_subject_switch_creates_second_master_session_and_tags_progress(
+    build_env: _WSProfileStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """一个 WS 连接可以从 personal 阶段切到 ideal_partner 阶段。"""
+    _install_gateway(
+        monkeypatch,
+        lambda request: InvokeOutcome(
+            result=StructuredExtractResult(schema_version=PROFILE_SCHEMA_VERSION)
+        ),
+    )
+    store = build_env
+    token = _make_access_token(user_id=10)
+    with client.websocket_connect(
+        f"/api/v1/voice/moxiang-master?token={token}"
+    ) as ws:
+        ws.send_text(
+            json.dumps(
+                {"type": "session_start", "mode": "profile_build",
+                 "subject": "personal"}
+            )
+        )
+        _drain_until(ws, "ai_reply")
+        ws.send_text(
+            json.dumps(
+                {"type": "subject_switch", "subject": "ideal_partner"}
+            )
+        )
+        msgs = _drain_until(ws, "ai_reply")
+
+    assert [m["type"] for m in msgs] == [
+        "subject_changed",
+        "progress",
+        "ai_reply",
+    ]
+    assert msgs[0]["subject"] == "ideal_partner"
+    assert msgs[1]["subject"] == "ideal_partner"
+    assert len(store.sessions) == 2
+    assert {row["subject"] for row in store.sessions.values()} == {
+        "personal", "ideal_partner"
+    }
+
+
+def test_switching_back_reuses_both_master_sessions(
+    build_env: _WSProfileStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """来回切换和断线重连都复用两个主体原有的 master 会话。"""
+    _install_gateway(
+        monkeypatch,
+        lambda request: InvokeOutcome(
+            result=StructuredExtractResult(schema_version=PROFILE_SCHEMA_VERSION)
+        ),
+    )
+    store = build_env
+    token = _make_access_token(user_id=10)
+    with client.websocket_connect(
+        f"/api/v1/voice/moxiang-master?token={token}"
+    ) as ws:
+        ws.send_text(json.dumps({"type": "session_start", "mode": "profile_build"}))
+        first = _drain_until(ws, "ai_reply")
+        assert first[0]["new_session"] is True
+        assert first[0]["resumed"] is False
+        ws.send_text(json.dumps({"type": "subject_switch", "subject": "ideal_partner"}))
+        _drain_until(ws, "ai_reply")
+        ws.send_text(json.dumps({"type": "subject_switch", "subject": "personal"}))
+        back = _drain_until(ws, "progress")
+
+    assert back[0]["type"] == "subject_changed"
+    assert back[0]["subject"] == "personal"
+    original_ids = {
+        row["subject"]: row["session_id"] for row in store.sessions.values()
+    }
+    assert len(original_ids) == 2
+
+    with client.websocket_connect(
+        f"/api/v1/voice/moxiang-master?token={token}"
+    ) as ws:
+        ws.send_text(
+            json.dumps(
+                {
+                    "type": "session_start",
+                    "mode": "profile_build",
+                    "subject": "ideal_partner",
+                }
+            )
+        )
+        _drain_until(ws, "progress")
+        ws.send_text(json.dumps({"type": "subject_switch", "subject": "personal"}))
+        _drain_until(ws, "progress")
+
+    assert len(store.sessions) == 2
+    assert {
+        row["subject"]: row["session_id"] for row in store.sessions.values()
+    } == original_ids
+
+
+def test_reconnect_replays_subject_progress_and_confirm_card(
+    build_env: _WSProfileStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """断线重连后，当前主体应恢复进度和待确认卡，而不是只恢复会话 ID。"""
+    _install_gateway(
+        monkeypatch,
+        lambda request: InvokeOutcome(
+            result=StructuredExtractResult(schema_version=PROFILE_SCHEMA_VERSION)
+        ),
+    )
+    store = build_env
+    token = _make_access_token(user_id=10)
+
+    with client.websocket_connect(
+        f"/api/v1/voice/moxiang-master?token={token}"
+    ) as ws:
+        ws.send_text(
+            json.dumps(
+                {
+                    "type": "session_start",
+                    "mode": "profile_build",
+                    "subject": "personal",
+                }
+            )
+        )
+        _drain_until(ws, "ai_reply")
+
+    session = next(iter(store.sessions.values()))
+    draft = store._make_draft_row(
+        draft_id="draft-reconnect-personal",
+        user_id=10,
+        subject="personal",
+        revision=2,
+        session_id=session["session_id"],
+    )
+    draft["status"] = "awaiting_confirmation"
+    store.drafts.append(draft)
+    store.drafts_by_id[draft["draft_id"]] = draft
+    field = store._make_draft_field_row(
+        draft_id=draft["draft_id"],
+        field_key="interest_tags",
+        subject="personal",
+        value=["看展"],
+        status="suggested",
+    )
+    field.update(
+        {
+            "field_kind": "structured",
+            "category": "interests",
+            "content": None,
+        }
+    )
+    store.draft_fields.append(field)
+
+    with client.websocket_connect(
+        f"/api/v1/voice/moxiang-master?token={token}"
+    ) as ws:
+        ws.send_text(
+            json.dumps(
+                {
+                    "type": "session_start",
+                    "mode": "profile_build",
+                    "subject": "personal",
+                }
+            )
+        )
+        replay = _drain_until(ws, "confirm_card", timeout=1.0)
+
+    assert [message["type"] for message in replay] == [
+        "session_ready",
+        "progress",
+        "confirm_card",
+    ]
+    assert replay[1]["subject"] == "personal"
+    assert replay[1]["percent"] == 0.0
+    assert replay[2]["subject"] == "personal"
+    assert replay[2]["draft_id"] == draft["draft_id"]
+    assert replay[2]["expected_revision"] == 2
+    assert replay[2]["items"][0]["field_key"] == "interest_tags"
+
+
+def test_reconnect_reuses_history_without_repeating_opening(
+    build_env: _WSProfileStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """已有 master 会话重连只恢复历史，不再推送一次性开场白。"""
+    _install_gateway(
+        monkeypatch,
+        lambda request: InvokeOutcome(
+            result=StructuredExtractResult(schema_version=PROFILE_SCHEMA_VERSION)
+        ),
+    )
+    store = build_env
+    token = _make_access_token(user_id=10)
+
+    with client.websocket_connect(
+        f"/api/v1/voice/moxiang-master?token={token}"
+    ) as ws:
+        ws.send_text(json.dumps({"type": "session_start", "mode": "profile_build"}))
+        first = _drain_until(ws, "ai_reply")
+        assert first[0]["new_session"] is True
+        assert first[0]["resumed"] is False
+
+    session = next(iter(store.sessions.values()))
+    awaitable = store.seed_turn(session["session_id"], "old-user", "我最近在杭州工作")
+    import asyncio
+
+    asyncio.run(awaitable)
+    store.turns.append(
+        {
+            "turn_id": "old-assistant",
+            "session_id": session["session_id"],
+            "client_turn_id": "old-assistant",
+            "user_id": 10,
+            "turn_no": 2,
+            "role": "assistant",
+            "answer_text": "记下了，你最近在杭州工作。",
+            "status": "saved",
+            "source_type": "assistant_reply",
+            "created_at": _now(),
+        }
+    )
+
+    with client.websocket_connect(
+        f"/api/v1/voice/moxiang-master?token={token}"
+    ) as ws:
+        ws.send_text(json.dumps({"type": "session_start", "mode": "profile_build"}))
+        first = _drain_until(ws, "progress")
+        assert [m["type"] for m in first] == ["session_ready", "progress"]
+        assert first[0]["new_session"] is False
+        assert first[0]["resumed"] is True
+        with pytest.raises(AssertionError):
+            _recv_json(ws, timeout=0.2)
+
+
+def test_reconnect_hydrates_persisted_history_into_next_provider_prompt(
+    build_env: _WSProfileStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """重连后下一轮 provider prompt 必须包含已有 user/assistant turns。"""
+    _install_gateway(
+        monkeypatch,
+        lambda request: InvokeOutcome(
+            result=StructuredExtractResult(schema_version=PROFILE_SCHEMA_VERSION)
+        ),
+    )
+    captured: list[list[dict[str, str]]] = []
+
+    class _CapturingProvider:
+        async def stream_chat(self, messages, *, json_mode=False):
+            captured.append(messages)
+            yield ("content", "继续说说")
+            yield ("finish", "stop")
+
+    monkeypatch.setattr(
+        "app.services.voice.master_orchestrator.get_provider",
+        lambda name: _CapturingProvider(),
+    )
+    store = build_env
+    token = _make_access_token(user_id=10)
+
+    with client.websocket_connect(
+        f"/api/v1/voice/moxiang-master?token={token}"
+    ) as ws:
+        ws.send_text(json.dumps({"type": "session_start", "mode": "profile_build"}))
+        _drain_until(ws, "ai_reply")
+
+    session = next(iter(store.sessions.values()))
+    import asyncio
+
+    asyncio.run(store.seed_turn(session["session_id"], "history-user", "我最近在杭州工作"))
+    store.turns.append(
+        {
+            "turn_id": "history-assistant",
+            "session_id": session["session_id"],
+            "client_turn_id": "history-assistant",
+            "user_id": 10,
+            "turn_no": 2,
+            "role": "assistant",
+            "answer_text": "记下了，你最近在杭州工作。",
+            "status": "saved",
+            "source_type": "assistant_reply",
+            "created_at": _now(),
+        }
+    )
+
+    with client.websocket_connect(
+        f"/api/v1/voice/moxiang-master?token={token}"
+    ) as ws:
+        ws.send_text(json.dumps({"type": "session_start", "mode": "profile_build"}))
+        _drain_until(ws, "progress")
+        ws.send_text(
+            json.dumps(
+                {
+                    "type": "text_message",
+                    "text": "我还想聊聊最近的生活",
+                    "clientTurnId": "history-next",
+                }
+            )
+        )
+        _drain_until(ws, "ai_reply")
+
+    prompt = captured[-1]
+    assert {m["role"] for m in prompt} >= {"user", "assistant"}
+    assert any("我最近在杭州工作" in m["content"] for m in prompt)
+    assert any("记下了，你最近在杭州工作。" in m["content"] for m in prompt)
+
+
+def test_both_subjects_replay_scoped_progress_card_and_publish_ready(
+    build_env: _WSProfileStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """两个主体各自重连/切换时，progress、confirm_card、publish_ready 不串线。"""
+    _install_gateway(
+        monkeypatch,
+        lambda request: InvokeOutcome(
+            result=StructuredExtractResult(schema_version=PROFILE_SCHEMA_VERSION)
+        ),
+    )
+    store = build_env
+    token = _make_access_token(user_id=10)
+
+    # 建立同一用户的两个 master 会话，模拟用户先后访问两个主体。
+    with client.websocket_connect(
+        f"/api/v1/voice/moxiang-master?token={token}"
+    ) as ws:
+        ws.send_text(
+            json.dumps(
+                {"type": "session_start", "mode": "profile_build", "subject": "personal"}
+            )
+        )
+        _drain_until(ws, "ai_reply")
+        ws.send_text(json.dumps({"type": "subject_switch", "subject": "ideal_partner"}))
+        _drain_until(ws, "ai_reply")
+
+    for subject in ("personal", "ideal_partner"):
+        session = next(row for row in store.sessions.values() if row["subject"] == subject)
+        draft = store._make_draft_row(
+            draft_id=f"draft-ready-{subject}",
+            user_id=10,
+            subject=subject,
+            revision=2,
+            session_id=session["session_id"],
+        )
+        draft["status"] = "awaiting_confirmation"
+        store.drafts.append(draft)
+        store.drafts_by_id[draft["draft_id"]] = draft
+        for field_key in (*sorted(MASTER_HARD_FIELD_KEYS), "interest_tags", "occupation_group", "education_level"):
+            field = store._make_draft_field_row(
+                draft_id=draft["draft_id"],
+                field_key=field_key,
+                subject=subject,
+                value="confirmed-value",
+                status="confirmed",
+            )
+            field["field_kind"] = "structured"
+            store.draft_fields.append(field)
+        entry = store._make_draft_field_row(
+            draft_id=draft["draft_id"],
+            field_key=f"entry_{subject}",
+            subject=subject,
+            value=None,
+            status="suggested",
+        )
+        entry.update(
+            {
+                "field_kind": "entry",
+                "category": "values",
+                "content": f"{subject} candidate",
+                "value_json": None,
+            }
+        )
+        store.draft_fields.append(entry)
+
+    with client.websocket_connect(
+        f"/api/v1/voice/moxiang-master?token={token}"
+    ) as ws:
+        ws.send_text(
+            json.dumps(
+                {"type": "session_start", "mode": "profile_build", "subject": "personal"}
+            )
+        )
+        personal = _drain_until(ws, "publish_ready")
+        ws.send_text(json.dumps({"type": "subject_switch", "subject": "ideal_partner"}))
+        ideal = _drain_until(ws, "publish_ready")
+
+    assert [message["type"] for message in personal] == [
+        "session_ready",
+        "progress",
+        "confirm_card",
+        "publish_ready",
+    ]
+    assert personal[1]["subject"] == "personal"
+    assert personal[1]["gate_met"] is True
+    assert personal[2]["subject"] == "personal"
+    assert personal[2]["items"][0]["content"] == "personal candidate"
+    assert personal[3]["subject"] == "personal"
+    assert personal[3]["summary"] == "你的个人画像已经可以成稿了"
+
+    assert [message["type"] for message in ideal] == [
+        "subject_changed",
+        "progress",
+        "confirm_card",
+        "publish_ready",
+    ]
+    assert ideal[0]["subject"] == "ideal_partner"
+    assert ideal[1]["subject"] == "ideal_partner"
+    assert ideal[1]["gate_met"] is True
+    assert ideal[2]["subject"] == "ideal_partner"
+    assert ideal[2]["items"][0]["content"] == "ideal_partner candidate"
+    assert ideal[3]["subject"] == "ideal_partner"
+    assert ideal[3]["summary"] == "你的愿遇之相已经可以成稿了"
+
+
+def test_invalid_subject_switch_keeps_current_subject(
+    build_env: _WSProfileStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_gateway(
+        monkeypatch,
+        lambda request: InvokeOutcome(
+            result=StructuredExtractResult(schema_version=PROFILE_SCHEMA_VERSION)
+        ),
+    )
+    token = _make_access_token(user_id=10)
+    with client.websocket_connect(
+        f"/api/v1/voice/moxiang-master?token={token}"
+    ) as ws:
+        ws.send_text(json.dumps({"type": "session_start", "mode": "profile_build"}))
+        _drain_until(ws, "ai_reply")
+        ws.send_text(json.dumps({"type": "subject_switch", "subject": "someone_else"}))
+        error = _recv_json(ws)
+        ws.send_text(json.dumps({"type": "subject_switch", "subject": "personal"}))
+        back = _drain_until(ws, "progress")
+
+    assert error["type"] == "error"
+    assert error["code"] == "AI_INPUT_INVALID"
+    assert back[0]["subject"] == "personal"
+
+
+def test_text_after_subject_switch_isolated_to_ideal_partner_draft(
+    build_env: _WSProfileStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """切换后用户表达只写入当前 ideal_partner 会话和草稿。"""
+    def respond(request: Any) -> InvokeOutcome:
+        if request.subject == "ideal_partner":
+            return InvokeOutcome(
+                result=StructuredExtractResult(
+                    schema_version=PROFILE_SCHEMA_VERSION,
+                    patches=(
+                        ExtractedPatch(
+                            action="add",
+                            category="personality",
+                            content="希望对方温柔而稳定",
+                            subject=ProfileSubject.IDEAL_PARTNER,
+                            source_quote="我希望未来伴侣温柔而稳定",
+                            confidence=0.9,
+                        ),
+                    ),
+                )
+            )
+        return InvokeOutcome(
+            result=StructuredExtractResult(schema_version=PROFILE_SCHEMA_VERSION)
+        )
+
+    _install_gateway(monkeypatch, respond)
+    store = build_env
+    token = _make_access_token(user_id=10)
+    with client.websocket_connect(
+        f"/api/v1/voice/moxiang-master?token={token}"
+    ) as ws:
+        ws.send_text(
+            json.dumps(
+                {"type": "session_start", "mode": "profile_build",
+                 "subject": "personal"}
+            )
+        )
+        _drain_until(ws, "ai_reply")
+        ws.send_text(
+            json.dumps(
+                {"type": "subject_switch", "subject": "ideal_partner"}
+            )
+        )
+        _drain_until(ws, "ai_reply")
+        ws.send_text(
+            json.dumps(
+                {
+                    "type": "text_message",
+                    "text": "我希望未来伴侣温柔而稳定",
+                    "clientTurnId": "ct-ideal-001",
+                }
+            )
+        )
+        _drain_until(ws, "ai_reply")
+        push_msgs = _drain_until(ws, "confirm_card", limit=10)
+
+    session_rows = [
+        row for row in store.sessions.values() if row["subject"] == "ideal_partner"
+    ]
+    assert len(session_rows) == 1
+    ideal_session_id = session_rows[0]["session_id"]
+    assert all(
+        turn["session_id"] == ideal_session_id
+        for turn in store.turns
+        if turn["role"] == "user"
+    )
+    assert len(store.draft_fields) == 1
+    assert store.draft_fields[0]["subject"] == "ideal_partner"
+    assert push_msgs[0]["subject"] == "ideal_partner"
+    assert push_msgs[-1]["subject"] == "ideal_partner"
+
+
+def test_background_extract_keeps_original_subject_after_switch(
+    build_env: _WSProfileStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """旧主体抽取在切换后完成时，进度和卡片仍标记旧主体。"""
+    def respond(request: Any) -> InvokeOutcome:
+        if request.session_kind == "master" and request.subject == "personal":
+            return InvokeOutcome(
+                result=StructuredExtractResult(
+                    schema_version=PROFILE_SCHEMA_VERSION,
+                    patches=(
+                        ExtractedPatch(
+                            action="add",
+                            category="values",
+                            content="重视关系中的坦诚沟通",
+                            subject=ProfileSubject.PERSONAL,
+                            source_quote="我很重视坦诚沟通",
+                            confidence=0.9,
+                        ),
+                    ),
+                )
+            )
+        return InvokeOutcome(
+            result=StructuredExtractResult(schema_version=PROFILE_SCHEMA_VERSION)
+        )
+
+    _install_gateway(monkeypatch, respond)
+    token = _make_access_token(user_id=10)
+    with client.websocket_connect(
+        f"/api/v1/voice/moxiang-master?token={token}"
+    ) as ws:
+        ws.send_text(json.dumps({"type": "session_start", "mode": "profile_build"}))
+        _drain_until(ws, "ai_reply")
+        ws.send_text(
+            json.dumps(
+                {
+                    "type": "text_message",
+                    "text": "我很重视坦诚沟通",
+                    "clientTurnId": "ct-personal-background",
+                }
+            )
+        )
+        _drain_until(ws, "ai_reply")
+        ws.send_text(json.dumps({"type": "subject_switch", "subject": "ideal_partner"}))
+        _drain_until(ws, "ai_reply")
+        background = _drain_until(ws, "confirm_card")
+
+    subject_messages = [
+        msg for msg in background if msg["type"] in {"progress", "confirm_card"}
+    ]
+    assert subject_messages
+    assert all(msg["subject"] == "personal" for msg in subject_messages)
+
+
 def test_text_message_persists_turn_and_enqueues(
     build_env: _WSProfileStore,
     monkeypatch: pytest.MonkeyPatch,
@@ -467,6 +1053,75 @@ def test_session_start_without_mode_keeps_pure_chat(
     assert store.sessions == {}
     assert store.turns == []
     assert store.drafts == []
+    assert store.task_store.tasks == {}
+
+
+def test_switching_from_build_to_pure_chat_does_not_write_profile_turn(
+    build_env: _WSProfileStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """同一连接重新声明纯聊后，不能继续沿用之前的 master 绑定。"""
+
+    def respond(request: Any) -> InvokeOutcome:
+        return InvokeOutcome(
+            result=StructuredExtractResult(schema_version=PROFILE_SCHEMA_VERSION)
+        )
+
+    _install_gateway(monkeypatch, respond)
+    store = build_env
+    token = _make_access_token(user_id=10)
+    with client.websocket_connect(
+        f"/api/v1/voice/moxiang-master?token={token}"
+    ) as ws:
+        ws.send_text(
+            json.dumps({"type": "session_start", "mode": "profile_build"})
+        )
+        _drain_until(ws, "ai_reply")
+        ws.send_text(json.dumps({"type": "session_start"}))
+        msgs = _drain_until(ws, "ai_reply")
+        assert [m["type"] for m in msgs] == ["session_ready", "ai_reply"]
+        ws.send_text(json.dumps({"type": "text_message", "text": "只聊聊天"}))
+        _drain_until(ws, "ai_reply")
+
+    assert len(store.sessions) == 1
+    assert store.turns == []
+    assert store.task_store.tasks == {}
+
+
+def test_failed_build_restart_clears_previous_profile_binding(
+    build_env: _WSProfileStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """失败的后续建构请求进入纯聊，不能继续写入此前的 master 会话。"""
+
+    def respond(request: Any) -> InvokeOutcome:
+        return InvokeOutcome(
+            result=StructuredExtractResult(schema_version=PROFILE_SCHEMA_VERSION)
+        )
+
+    _install_gateway(monkeypatch, respond)
+    store = build_env
+    token = _make_access_token(user_id=10)
+    with client.websocket_connect(
+        f"/api/v1/voice/moxiang-master?token={token}"
+    ) as ws:
+        ws.send_text(
+            json.dumps({"type": "session_start", "mode": "profile_build"})
+        )
+        _drain_until(ws, "ai_reply")
+        ws.send_text(
+            json.dumps(
+                {"type": "session_start", "mode": "profile_build", "subject": "bad"}
+            )
+        )
+        failed = _drain_until(ws, "ai_reply")
+        assert any(m.get("code") == "AI_INPUT_INVALID" for m in failed)
+        ws.send_text(json.dumps({"type": "text_message", "text": "只聊聊天"}))
+        chat = _drain_until(ws, "ai_reply")
+
+    assert "confirm_card" not in [m["type"] for m in chat]
+    assert len(store.sessions) == 1
+    assert store.turns == []
     assert store.task_store.tasks == {}
 
 
