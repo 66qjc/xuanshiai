@@ -9,9 +9,8 @@ Contract v1.1 关键引用：
 - §6.1 ``GET /api/v1/ai/moxiang/state``：返回两个主体的会话快照 + 进度 + 邀请状态。
 - §6.2 ``GET /api/v1/ai/profile-sessions/{session_id}/turns``：按 turn_no 升序
   分页（before_turn_no exclusive，limit 1..100）。
-- §7 真实进度：六维固定词表，每维 confirmed 数 0/1/2+ 映射 0/50/100%。
-  overall_percent = 六维平均。confirmation_percent / confidence_percent 由
-  confirmed vs suggested 计数得出（仅 confirmed 才进主进度）。
+- §7 真实进度：六维固定词表，每维有效高置信候选数 0/1/2+ 映射 0/50/100%。
+  overall_percent = 六维平均；确认/发布状态不参与该口径。
 - §1.2 旅程阶段四值：chatting/building/ready/published。
 - §10 隐私：未授权返回 200 + consent_granted=false，绝不暴露内部 ID 之外的资源。
 
@@ -32,9 +31,8 @@ from app.schemas.ai_moxiang import (
     SubjectSummary,
 )
 from app.schemas.ai_profile import ProfileSubject  # noqa: F401
+from app.services.ai.journey_progress import calculate_journey_progress
 
-# 进度阈值（Contract v1.1 §7）：每维 0/1/2+ confirmed → 0/50/100%
-_PER_DIMENSION_PERCENTS: tuple[float, ...] = (0.0, 50.0, 100.0)
 _TOPIC_EXCERPT_MAX_LENGTH = 120
 
 
@@ -43,14 +41,6 @@ async def _resolve(value: Any) -> Any:
     if inspect.isawaitable(value):
         return await value
     return value
-
-
-def _dimension_percent_from_confirmed(confirmed_count: int) -> float:
-    if confirmed_count <= 0:
-        return 0.0
-    if confirmed_count == 1:
-        return 50.0
-    return 100.0
 
 
 @dataclass(frozen=True)
@@ -63,10 +53,7 @@ class SubjectSessionSnapshot:
     last_turn_at: str | None
     last_topic_excerpt: str
     overall_percent: float
-    confidence_percent: float
-    confirmation_percent: float
     dimensions: dict[str, dict[str, float | int]]
-    hard_gate_met: bool
     pending_build_invite_id: str | None
     pending_confirm_card: bool
     published_revision_id: int | None
@@ -113,17 +100,9 @@ class MoxiangStateRepository(Protocol):
         self, session_id: str | None
     ) -> bool | Awaitable[bool]: ...
 
-    def count_dimension_confirmed(
-        self, user_id: int, subject: str
-    ) -> dict[str, int] | Awaitable[dict[str, int]]: ...
-
-    def average_confidence(
-        self, user_id: int, subject: str
-    ) -> float | Awaitable[float]: ...
-
-    def confirmation_percent(
-        self, user_id: int, subject: str
-    ) -> float | Awaitable[float]: ...
+    def list_session_candidates(
+        self, session_id: str
+    ) -> tuple[Any, ...] | Awaitable[tuple[Any, ...]]: ...
 
     def list_session_turns(
         self,
@@ -201,25 +180,46 @@ async def build_subject_session_snapshot(
     last_topic_excerpt = str(session.get("last_topic_excerpt") or "")
     if len(last_topic_excerpt) > _TOPIC_EXCERPT_MAX_LENGTH:
         last_topic_excerpt = last_topic_excerpt[:_TOPIC_EXCERPT_MAX_LENGTH]
-    confirmed_per_dim = await _resolve(
-        repo.count_dimension_confirmed(user_id, subject)
-    )
-    dimensions: dict[str, dict[str, float | int]] = {}
-    per_dim_percents: list[float] = []
-    for dim in PROFILE_DIMENSIONS:
-        count = int(confirmed_per_dim.get(dim, 0))
-        pct = _dimension_percent_from_confirmed(count)
-        dimensions[dim] = {"percent": pct, "confirmed_count": count}
-        per_dim_percents.append(pct)
-    overall_percent = (
-        sum(per_dim_percents) / len(per_dim_percents) if per_dim_percents else 0.0
-    )
-    confidence_percent = (
-        await _resolve(repo.average_confidence(user_id, subject))
-    ) * 100.0
-    confirmation_percent = await _resolve(
-        repo.confirmation_percent(user_id, subject)
-    )
+    # 新旅程仓储以候选池作为实时进度唯一来源；兼容尚未迁移的
+    # 旧仓储/fake 时回退到 confirmed 计数，避免状态页因缺少新方法直接 500。
+    candidate_loader = getattr(repo, "list_session_candidates", None)
+    if candidate_loader is None:
+        confirmed_loader = getattr(repo, "count_dimension_confirmed", None)
+        confirmed = (
+            await _resolve(confirmed_loader(user_id, subject))
+            if confirmed_loader is not None
+            else {}
+        )
+
+        def _confirmed_percent(dimension: str) -> float:
+            count = int(confirmed.get(dimension, 0))
+            if count >= 2:
+                return 100.0
+            if count == 1:
+                return 50.0
+            return 0.0
+
+        dimensions = {
+            dim: {
+                "percent": _confirmed_percent(dim),
+                "evidence_count": int(confirmed.get(dim, 0)),
+            }
+            for dim in PROFILE_DIMENSIONS
+        }
+        overall_percent = sum(
+            item["percent"] for item in dimensions.values()
+        ) / len(dimensions)
+    else:
+        candidates = await _resolve(candidate_loader(session_id))
+        candidate_progress = calculate_journey_progress(candidates)
+        dimensions = {
+            dim: {
+                "percent": candidate_progress.dimensions[dim].percent,
+                "evidence_count": candidate_progress.dimensions[dim].evidence_count,
+            }
+            for dim in PROFILE_DIMENSIONS
+        }
+        overall_percent = candidate_progress.overall_percent
     invite_row = await _resolve(
         repo.find_pending_build_invite(user_id, session_id)
     )
@@ -229,10 +229,6 @@ async def build_subject_session_snapshot(
     has_card = await _resolve(repo.find_pending_confirm_card(session_id))
     pub = await _resolve(repo.find_published_revision(user_id, subject))
     published_revision_id = int(pub["revision_id"]) if pub else None
-    # hard_gate 简化为 overall_percent>=60 + 六维 confirmed 总和≥6（占位定义；
-    # 真实工程实现由 P1-C 仓储协议补齐）。
-    total_confirmed = sum(confirmed_per_dim.values())
-    hard_gate_met = overall_percent >= 60.0 and total_confirmed >= 6
     return SubjectSessionSnapshot(
         session_id=session_id,
         subject=subject,
@@ -240,10 +236,7 @@ async def build_subject_session_snapshot(
         last_turn_at=last_turn_at_iso or None,
         last_topic_excerpt=last_topic_excerpt,
         overall_percent=overall_percent,
-        confidence_percent=confidence_percent,
-        confirmation_percent=confirmation_percent,
         dimensions=dimensions,
-        hard_gate_met=hard_gate_met,
         pending_build_invite_id=pending_invite_id,
         pending_confirm_card=has_card,
         published_revision_id=published_revision_id,
@@ -283,13 +276,10 @@ async def build_state_response(
                 auto_invite_count=0,
                 has_pending_invite=False,
                 overall_percent=0.0,
-                confidence_percent=0.0,
-                confirmation_percent=0.0,
                 dimensions={
-                    dim: {"percent": 0.0, "confirmed_count": 0}
+                    dim: {"percent": 0.0, "evidence_count": 0}
                     for dim in PROFILE_DIMENSIONS
                 },
-                hard_gate_met=False,
             )
         return SubjectSummary(
             subject=snap.subject,
@@ -298,10 +288,7 @@ async def build_state_response(
             last_turn_at=snap.last_turn_at,
             last_topic_excerpt=snap.last_topic_excerpt,
             overall_percent=snap.overall_percent,
-            confidence_percent=snap.confidence_percent,
-            confirmation_percent=snap.confirmation_percent,
             dimensions=snap.dimensions,
-            hard_gate_met=snap.hard_gate_met,
             pending_build_invite_id=snap.pending_build_invite_id,
             pending_confirm_card=snap.pending_confirm_card,
             published_revision_id=snap.published_revision_id,
@@ -318,6 +305,29 @@ async def build_state_response(
     partner_summary = _summary(partner).model_copy(
         update={"subject": ProfileSubject.IDEAL_PARTNER.value}
     )
+    # 发布后 session 置 active_status=0，snapshot 变 None，但 revision 仍在。
+    # 无活动会话时也要暴露 published_revision_id：档案成稿入口、双阶段卡
+    # 「已发布」与 can_start_ideal_partner 判定都依赖这一事实。
+    async def _published_id(
+        snap: SubjectSessionSnapshot | None, subject: str
+    ) -> int | None:
+        if snap is not None:
+            return snap.published_revision_id
+        pub = await _resolve(repo.find_published_revision(user_id, subject))
+        return int(pub["revision_id"]) if pub else None
+
+    personal_published_id = await _published_id(
+        personal, ProfileSubject.PERSONAL.value
+    )
+    partner_published_id = await _published_id(
+        partner, ProfileSubject.IDEAL_PARTNER.value
+    )
+    personal_summary = personal_summary.model_copy(
+        update={"published_revision_id": personal_published_id}
+    )
+    partner_summary = partner_summary.model_copy(
+        update={"published_revision_id": partner_published_id}
+    )
     # Phase 2 P2-01 / P2-04 —— 决定 ideal_partner 是否可开启/恢复。
     # 规则:
     #   1) ideal_partner 已有活动会话/历史记录 → 永远 True(老用户恢复);
@@ -325,13 +335,12 @@ async def build_state_response(
     #   3) 其余情况 False(显示锁定图标,等待 personal 完成过渡)。
     ideal_history_exists = (
         partner is not None
+        or partner_published_id is not None
         or await _resolve(
             repo.has_subject_history(user_id, ProfileSubject.IDEAL_PARTNER.value)
         )
     )
-    personal_published = (
-        personal is not None and personal.published_revision_id is not None
-    )
+    personal_published = personal_published_id is not None
     can_start_partner = ideal_history_exists or personal_published
     partner_summary = partner_summary.model_copy(
         update={"can_start_ideal_partner": can_start_partner}
@@ -345,7 +354,7 @@ async def build_state_response(
     )
 
 
-def list_turns(
+async def list_turns(
     *,
     session_id: str,
     before_turn_no: int | None,
@@ -354,31 +363,30 @@ def list_turns(
 ) -> tuple[dict[str, Any], int | None]:
     """读取会话 turn 列表（升序分页）。返回 (turns, next_before_turn_no)。
 
-    仓储协议约定按 turn_no ASC 拉取；本函数不反转。``next_before_turn_no``
-    为本批最小 turn_no；读完（拿到的不足 limit）时返回 ``None``。
+    仓储取不超过 ``limit + 1`` 条最新记录用于判断是否还有更早一页；本函数
+    统一按 ``turn_no`` 升序输出。``next_before_turn_no`` 为响应页最小 turn_no，
+    读完时返回 ``None``。
     """
     if limit < 1 or limit > 100:
         raise ValueError("limit must be 1..100")
     if before_turn_no is not None and before_turn_no < 1:
         raise ValueError("before_turn_no must be >= 1")
-    rows = tuple(repo.list_session_turns(session_id, before_turn_no, limit))
+    rows = tuple(
+        await _resolve(
+            repo.list_session_turns(session_id, before_turn_no, limit + 1)
+        )
+    )
     if not rows:
         return (), None
-    # 仓储按 ASC 约定；若返回 DESC（rows[0].turn_no > rows[-1].turn_no），
-    # 我们做一次反转以对齐 Contract §6.2 升序要求。
-    if (
-        len(rows) >= 2
-        and int(rows[0].get("turn_no", 0)) > int(rows[-1].get("turn_no", 0))
-    ):
-        ordered = tuple(reversed(rows))
-    else:
-        ordered = rows
+    ordered = tuple(sorted(rows, key=lambda row: int(row.get("turn_no") or 0)))
+    has_older = len(ordered) > limit
+    page = ordered[-limit:] if has_older else ordered
     next_cursor: int | None = None
-    if len(rows) >= limit:
-        next_cursor = int(ordered[0].get("turn_no") or 0)
+    if has_older:
+        next_cursor = int(page[0].get("turn_no") or 0)
         if next_cursor <= 0:
             next_cursor = None
-    return ordered, next_cursor
+    return page, next_cursor
 
 
 # ----------------------------------------------------------------------

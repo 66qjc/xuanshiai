@@ -362,8 +362,9 @@ class PaperPlaneConversationResponse(BaseModel):
 
 class PaperPlaneMessageCreate(BaseModel):
     content: str = Field(default="", max_length=1000)
-    type: Literal[1, 3] = 1
+    type: Literal[1, 2, 3] = 1
     media_url: str | None = Field(default=None, max_length=500)
+    media_id: PositiveInt | None = None
     voice_duration_sec: int | None = Field(default=None, ge=1, le=60)
 
     @field_validator("media_url", mode="before")
@@ -376,6 +377,8 @@ class PaperPlaneMessageCreate(BaseModel):
         text = (self.content or "").strip()
         if self.type == 1 and not text:
             raise ValueError("文本消息不能为空")
+        if self.type == 2 and not (self.media_url or self.media_id):
+            raise ValueError("图片消息需提供 media_id 或 media_url")
         if self.type == 3 and not self.media_url:
             raise ValueError("语音消息需提供 media_url")
         if self.type == 3 and self.voice_duration_sec is None:

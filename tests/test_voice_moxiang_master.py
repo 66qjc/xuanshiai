@@ -11,7 +11,7 @@
 
 from __future__ import annotations
 
-from typing import Any, AsyncIterator
+from typing import AsyncIterator
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -22,6 +22,7 @@ from app.services.voice.master_orchestrator import (
     MasterState,
     MoxiangMasterOrchestrator,
 )
+from app.services.ai.prompts.moxiang_master import AI_ROLE_NAME
 
 
 def _make_mock_ai_gateway() -> MagicMock:
@@ -162,7 +163,7 @@ async def test_narrative_context_injected():
     # messages 应包含 system + narrative system + user
     assert len(captured_messages) >= 3
     assert captured_messages[0]["role"] == "system"
-    assert "墨相师" in captured_messages[0]["content"]
+    assert AI_ROLE_NAME in captured_messages[0]["content"]
     assert captured_messages[1]["role"] == "system"
     assert "慢热的人" in captured_messages[1]["content"]
     assert captured_messages[-1] == {"role": "user", "content": "说说你自己"}

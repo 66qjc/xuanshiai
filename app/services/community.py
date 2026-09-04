@@ -2108,7 +2108,7 @@ async def send_paper_plane_message(
     await ensure_user_allowed(db, user_id, "MESSAGE_RESTRICTED")
     from app.services.content_filter import moderate_text
 
-    # 文本消息过滤敏感词；语音消息（type=3）content 为空，无需过滤
+    # 文本消息过滤敏感词；媒体消息 content 为空，无需过滤
     if request.type == 1 and (request.content or "").strip():
         decision = await moderate_text(db, request.content, field="会话消息")
         if decision.action == "reject":
@@ -2122,7 +2122,23 @@ async def send_paper_plane_message(
     conv = await _require_plane_conversation(db, user_id, conversation_id)
     if int(conv["status"]) != 1:
         raise HTTPException(422, detail="对话已结束")
-    preview = request.content if request.type == 1 else "[语音]"
+
+    media_url = request.media_url
+    media_ids: list[int] = []
+    if request.type == 2:
+        if request.media_id is not None:
+            media_rows = await resolve_owned_ready_media(
+                db, user_id, [int(request.media_id)], purpose="paper_plane", media_type="image"
+            )
+        else:
+            media_rows = await assert_owned_media_urls(
+                db, user_id, [str(request.media_url or "")], purpose="paper_plane", media_type="image"
+            )
+            if any(str(row.get("status") or "") != "ready" for row in media_rows):
+                raise HTTPException(409, detail="图片媒体已绑定或不可重复发送")
+        media_url = str(media_rows[0]["file_url"])
+        media_ids = [int(media_rows[0]["id"])]
+    preview = request.content if request.type == 1 else ("[图片]" if request.type == 2 else "[语音]")
     result = await db.execute(
         text(
             """INSERT INTO paper_plane_message (
@@ -2136,11 +2152,13 @@ async def send_paper_plane_message(
             "from_user_id": user_id,
             "content": decision.display_content if decision else (request.content or ""),
             "type": int(request.type),
-            "media_url": request.media_url,
+            "media_url": media_url,
             "voice_duration_sec": request.voice_duration_sec,
             "moderation_status": "pending" if decision and decision.action == "manual_review" else "approved",
         },
     )
+    if media_ids:
+        await bind_media(db, media_ids=media_ids, target_type="paper_plane_message", target_id=int(result.lastrowid))
     if decision and decision.action != "allow":
         await _record_moderation_task(db, "paper_plane_message", int(result.lastrowid), user_id, decision, raw_content=request.content or "", status="pending" if decision.action == "manual_review" else "replaced")
     if user_id == int(conv["owner_id"]):

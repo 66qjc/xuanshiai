@@ -54,23 +54,19 @@ class _FakeRepo:
         *,
         consent_granted: bool = True,
         sessions: dict[tuple[int, str], dict] | None = None,
-        dimensions: dict[tuple[int, str], dict[str, int]] | None = None,
         pending_invites: dict[tuple[int, str], dict] | None = None,
         pending_confirm_cards: set[str] | None = None,
         published_revisions: dict[tuple[int, str], dict] | None = None,
-        avg_confidence: float = 0.0,
-        confirmation_pct: float = 0.0,
         turns: dict[str, list[dict]] | None = None,
+        candidates: dict[str, tuple] | None = None,
     ):
         self.consent_granted = consent_granted
         self.sessions = sessions or {}
-        self.dimensions = dimensions or {}
         self.pending_invites = pending_invites or {}
         self.pending_confirm_cards = pending_confirm_cards or set()
         self.published_revisions = published_revisions or {}
-        self.avg_confidence = avg_confidence
-        self.confirmation_pct = confirmation_pct
         self.turns = turns or {}
+        self.candidates = candidates
 
     def has_active_consent(self, user_id, scope, version):
         return self.consent_granted
@@ -90,21 +86,15 @@ class _FakeRepo:
     def find_pending_confirm_card(self, session_id):
         return session_id in self.pending_confirm_cards
 
-    def count_dimension_confirmed(self, user_id, subject):
-        return self.dimensions.get((user_id, subject), {})
-
-    def average_confidence(self, user_id, subject):
-        return self.avg_confidence
-
-    def confirmation_percent(self, user_id, subject):
-        return self.confirmation_pct
+    def list_session_candidates(self, session_id):
+        return (self.candidates or {}).get(session_id, ())
 
     def list_session_turns(self, session_id, before_turn_no, limit):
         rows = self.turns.get(session_id, [])
         if before_turn_no is not None:
             rows = [r for r in rows if int(r.get("turn_no", 0)) < int(before_turn_no)]
-        # 仓储按 ASC 约定返回 limit 行
-        rows = sorted(rows, key=lambda r: int(r.get("turn_no", 0)))
+        # 生产仓储先取最新 limit 行；服务层再统一整理为 ASC 响应。
+        rows = sorted(rows, key=lambda r: int(r.get("turn_no", 0)), reverse=True)
         return tuple(rows[:limit])
 
     # Phase 2 P2-01 老用户恢复 fake：默认按"会话或发布过 revision"判定。
@@ -134,14 +124,8 @@ class _AsyncRepo(_FakeRepo):
     async def find_pending_confirm_card(self, session_id):
         return super().find_pending_confirm_card(session_id)
 
-    async def count_dimension_confirmed(self, user_id, subject):
-        return super().count_dimension_confirmed(user_id, subject)
-
-    async def average_confidence(self, user_id, subject):
-        return super().average_confidence(user_id, subject)
-
-    async def confirmation_percent(self, user_id, subject):
-        return super().confirmation_percent(user_id, subject)
+    async def list_session_candidates(self, session_id):
+        return super().list_session_candidates(session_id)
 
     async def has_subject_history(self, user_id, subject):
         return super().has_subject_history(user_id, subject)
@@ -199,43 +183,65 @@ def test_state_response_falls_back_to_ideal_partner_when_personal_absent() -> No
     assert state.active_subject == "ideal_partner"
 
 
-def test_dimension_percent_three_step_mapping() -> None:
-    """0 / 1 / 2+ confirmed map to 0 / 50 / 100 (Contract §7)."""
-    from app.services.ai.moxiang_state import (
-        PROFILE_DIMENSIONS,
-        _dimension_percent_from_confirmed,
-    )
-
-    assert _dimension_percent_from_confirmed(0) == 0.0
-    assert _dimension_percent_from_confirmed(1) == 50.0
-    assert _dimension_percent_from_confirmed(2) == 100.0
-    assert _dimension_percent_from_confirmed(5) == 100.0
-    # All six dimensions must exist in the canonical tuple (Contract §1.3).
-    assert len(PROFILE_DIMENSIONS) == 6
-
-
-def test_overall_percent_is_six_dimension_average() -> None:
-    """overall_percent must be the average of the six per-dimension percents."""
+def test_state_exposes_published_revision_without_active_session() -> None:
+    """发布后 session 关闭（active_status=0）：state 仍须暴露 published_revision_id，
+    并据此解锁 ideal_partner——否则墨相师页与愿遇之相入口双双"失明"。"""
     from app.services.ai.moxiang_state import build_state_response
 
     repo = _FakeRepo(
-        sessions={
-            (1, "personal"): {"session_id": "s-p", "journey_stage": "chatting"},
-        },
-        dimensions={
-            (1, "personal"): {
-                "personality_social": 2,  # 100
-                "intimacy_pattern": 0,  # 0
-                "lifestyle": 1,  # 50
-                "emotional_expression": 0,  # 0
-                "relationship_boundaries": 0,  # 0
-                "future_expectations": 1,  # 50
-            }
-        },
+        published_revisions={(1, "personal"): {"revision_id": 77}},
     )
     state = _await(build_state_response(user_id=1, repo=repo))
-    expected = (100 + 0 + 50 + 0 + 0 + 50) / 6
-    assert abs(state.personal.overall_percent - expected) < 0.01
+    assert state.personal.session_id is None
+    assert state.personal.published_revision_id == 77
+    assert state.can_start_ideal_partner is True
+    assert state.ideal_partner.can_start_ideal_partner is True
+
+
+def test_state_without_session_or_revision_keeps_partner_locked() -> None:
+    """无任何资产时 ideal_partner 仍锁定（回归保护）。"""
+    from app.services.ai.moxiang_state import build_state_response
+
+    state = _await(build_state_response(user_id=1, repo=_FakeRepo()))
+    assert state.personal.published_revision_id is None
+    assert state.can_start_ideal_partner is False
+
+
+def test_state_progress_uses_active_high_confidence_candidates() -> None:
+    """Reconnect state must use the same candidate projection as live WS progress."""
+    from app.schemas.ai_moxiang import CandidateRecord
+    from app.services.ai.moxiang_state import build_state_response
+
+    def candidate(candidate_id: str, dimension: str) -> CandidateRecord:
+        return CandidateRecord(
+            candidate_id=candidate_id,
+            session_id="s-p",
+            user_id=1,
+            subject="personal",
+            profile_dimension=dimension,
+            field_kind="structured",
+            field_key="temperament",
+            category=None,
+            content="偏内敛",
+            value="偏内敛",
+            confidence=0.75,
+            source_turn_ids=("turn-1",),
+            source_span=None,
+            consent_version="profile-text-v1",
+            policy_revision="ai-policy-2026-08-07-v1",
+            status="active",
+            content_hash=(candidate_id + ("x" * 64))[:64],
+        )
+
+    repo = _FakeRepo(
+        sessions={(1, "personal"): {"session_id": "s-p", "journey_stage": "chatting"}},
+        candidates={"s-p": (candidate("one", "lifestyle"),)},
+    )
+    state = _await(build_state_response(user_id=1, repo=repo))
+
+    assert state.personal.dimensions["lifestyle"]["evidence_count"] == 1
+    assert state.personal.dimensions["lifestyle"]["percent"] == 50.0
+    assert state.personal.overall_percent == pytest.approx(50.0 / 6.0)
 
 
 def test_state_response_marks_has_pending_invite() -> None:
@@ -261,8 +267,8 @@ def test_state_response_marks_has_pending_invite() -> None:
 # ---- list_turns pagination ----------------------------------------------
 
 
-def test_list_turns_returns_ascending_with_cursor() -> None:
-    """``list_turns`` must return ASC by turn_no and yield a cursor for next page."""
+def test_list_turns_returns_latest_page_ascending_with_cursor() -> None:
+    """首次读取取最新一页，响应按 turn_no ASC，并给出更早页游标。"""
     from app.services.ai.moxiang_state import list_turns
 
     turns = [
@@ -270,9 +276,11 @@ def test_list_turns_returns_ascending_with_cursor() -> None:
         for i in range(1, 11)  # 10 turns
     ]
     repo = _FakeRepo(turns={"s-1": turns})
-    page, cursor = list_turns(session_id="s-1", before_turn_no=None, limit=3, repo=repo)
-    assert [t["turn_no"] for t in page] == [1, 2, 3]
-    assert cursor == 1  # next_before_turn_no is the smallest turn_no on this page
+    page, cursor = _await(
+        list_turns(session_id="s-1", before_turn_no=None, limit=3, repo=repo)
+    )
+    assert [t["turn_no"] for t in page] == [8, 9, 10]
+    assert cursor == 8  # 下一页读取 turn_no < 8
 
 
 def test_list_turns_exhausted_returns_none_cursor() -> None:
@@ -284,7 +292,9 @@ def test_list_turns_exhausted_returns_none_cursor() -> None:
         for i in range(1, 4)  # 3 turns
     ]
     repo = _FakeRepo(turns={"s-1": turns})
-    page, cursor = list_turns(session_id="s-1", before_turn_no=None, limit=10, repo=repo)
+    page, cursor = _await(
+        list_turns(session_id="s-1", before_turn_no=None, limit=10, repo=repo)
+    )
     assert [t["turn_no"] for t in page] == [1, 2, 3]
     assert cursor is None
 
@@ -295,9 +305,36 @@ def test_list_turns_validates_limit() -> None:
 
     repo = _FakeRepo()
     with pytest.raises(ValueError):
-        list_turns(session_id="s-1", before_turn_no=None, limit=0, repo=repo)
+        _await(list_turns(session_id="s-1", before_turn_no=None, limit=0, repo=repo))
     with pytest.raises(ValueError):
-        list_turns(session_id="s-1", before_turn_no=None, limit=200, repo=repo)
+        _await(list_turns(session_id="s-1", before_turn_no=None, limit=200, repo=repo))
+
+
+def test_list_turns_awaits_async_repository() -> None:
+    """生产 SQL 仓储是 async；服务不能把 coroutine 当作可迭代对象。"""
+    from app.services.ai.moxiang_state import list_turns
+
+    class _AsyncRepo(_FakeRepo):
+        async def list_session_turns(self, session_id, before_turn_no, limit):
+            return super().list_session_turns(session_id, before_turn_no, limit)
+
+    repo = _AsyncRepo(
+        turns={
+            "s-1": [
+                {
+                    "turn_id": "t-1",
+                    "turn_no": 1,
+                    "role": "user",
+                    "answer_text": "你好",
+                }
+            ]
+        }
+    )
+    page, cursor = _await(
+        list_turns(session_id="s-1", before_turn_no=None, limit=50, repo=repo)
+    )
+    assert [t["turn_id"] for t in page] == ["t-1"]
+    assert cursor is None
 
 
 # ---- journey stage state machine ----------------------------------------

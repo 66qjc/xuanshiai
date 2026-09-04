@@ -81,7 +81,6 @@ from app.services.ai.features import (
     build_feature_projection,
 )
 from app.services.ai.gateway import AIGateway
-from app.services.ai.prompts.moxiang_master import _missing_label
 from app.services.ai.prompts.profile_narrative import serialize_fields_for_prompt
 from app.services.ai.tasks import AiTaskRecord, TaskError, enqueue_task, fail_task
 from app.services.content_filter import moderate_text
@@ -2005,12 +2004,16 @@ async def extract_profile_turn(
     )
 
     if session.session_kind == "master":
-        # 设计 Task 6：墨相师对话建构会话——对话整段抽 entry patch + 逐缺失
-        # 硬字段定向抽 structured；空结果合法完成；绝不写澄清 turn（澄清由
-        # 墨相师对话承担）。
-        return await _handle_master_extract(
-            db, session, turn, context, task, worker_id
+        # 新旅程由 moxiang_candidate_extract 写入私有候选池；这里仅为尚未
+        # 执行退役迁移的旧任务保留终态审计，绝不再生成确认式草稿。
+        await fail_task(
+            db,
+            task.task_id,
+            worker_id,
+            error_code="AI_LEGACY_MOXIANG_RETIRED",
+            retryable=False,
         )
+        return None
 
     if session.session_kind == "update":
         # WP-P4：update 会话走澄清式分支——prompt 换澄清契约，输入带会话
@@ -2554,383 +2557,6 @@ async def _write_update_draft(
 
 
 # ----------------------------------------------------------------------
-# 设计 Task 6：master 会话抽取分支（对话抽取 / 白名单过滤 / 草稿写入）
-# ----------------------------------------------------------------------
-
-
-async def _load_published_structured_keys(
-    db: AsyncSession, owner_user_id: int, subject: str
-) -> frozenset[str]:
-    """该维度最近已发布 revision 的 structured field_key 集合（硬字段口径）。
-
-    与 ``_load_published_entry_rows`` 同一只取最新 revision 的语义：更早
-    revision 的字段已被后续发布替换，不再折算为已确认。
-    """
-    latest = await _first_row(
-        await db.execute(
-            text(
-                "SELECT id FROM ai_profile_revision "
-                "WHERE user_id = :user_id AND subject = :subject "
-                "ORDER BY revision_no DESC, id DESC LIMIT 1"
-            ),
-            {"user_id": owner_user_id, "subject": subject},
-        )
-    )
-    if latest is None:
-        return frozenset()
-    result = await db.execute(
-        text(
-            "SELECT field_key FROM ai_profile_revision_field "
-            "WHERE revision_id = :revision_id AND field_kind = 'structured'"
-        ),
-        {"revision_id": int(latest["id"])},
-    )
-    return frozenset(str(row["field_key"]) for row in result.mappings().all())
-
-
-async def _load_known_field_keys(
-    db: AsyncSession, session: ProfileSession
-) -> frozenset[str]:
-    """该维度已存在的 structured field_key 集合（master 硬字段去重口径）。
-
-    两个来源取并集：本会话草稿中的 structured 字段（``_load_field_keys``
-    首元素——**任意确认状态**，suggested 行也算已有），以及该维度最近已
-    发布 revision 的 structured 字段。缺失硬字段 = ``MASTER_HARD_FIELD_KEYS``
-    − 该集合：草稿里已建议未确认的硬字段不重复定向抽取/重复 INSERT
-    （否则第二轮对话撞 ``(draft_id, field_key)`` 唯一键）。
-    """
-    draft_keys, _draft_confirmed = await _load_field_keys(db, session.session_id)
-    published = await _load_published_structured_keys(
-        db, int(session.owner_user_id), session.subject.value
-    )
-    return draft_keys | published
-
-
-async def _handle_master_extract(
-    db: AsyncSession,
-    session: ProfileSession,
-    turn: ProfileTurn,
-    context: AITaskContext,
-    task: AiTaskRecord,
-    worker_id: str,
-) -> tuple[str, RevisionVector] | None:
-    """master 会话抽取（设计 Task 6）：对话整段抽 entry + 逐缺失硬字段抽
-    structured；白名单外=终态失败；空结果合法完成；不写澄清 turn。不 commit。
-
-    与 update 分支共享 patch 复核纪律（``_validate_entry_patches``）；契约
-    违规（模型返回澄清问题）与白名单外 patch 为终态失败。硬字段定向抽取
-    按 best-effort 推进：网关失败或字段级复核违规（build 同款纪律）只跳过
-    该字段，entry 落库不受阻；缺失口径排除草稿已有行与已发布字段。不 commit。
-    """
-    expected_subject = session.subject
-    expected_policy_revision = session.policy_revision or PROFILE_POLICY_REVISION
-    dialogue = await _load_session_dialogue(db, session.session_id)
-    entry_rows = await _load_published_entry_rows(
-        db, int(session.owner_user_id), session.subject.value
-    )
-    gateway = AIGateway(timeout_seconds=settings.ai_gateway_timeout_seconds)
-    request = StructuredExtractRequest(
-        subject=session.subject.value,
-        turn_texts=tuple(dialogue),
-        consent_version=session.consent_version,
-        policy_revision=expected_policy_revision,
-        session_kind="master",
-        entry_digest=_entry_digest_with_keys(entry_rows),
-    )
-    outcome = await gateway.structured_extract(context, request)
-    if outcome.result is None:
-        await fail_task(
-            db, task.task_id, worker_id,
-            error_code=outcome.error_code or "AI_TEMPORARILY_UNAVAILABLE",
-            retryable=outcome.retryable,
-        )
-        if not outcome.retryable:
-            await _fail_extract_session(db, session.session_id)
-        return None
-    # master 契约（设计 Task 6）：澄清由墨相师对话承担，抽取器禁止返回
-    # 澄清问题——模型违约时 fail-closed（与白名单外同纪律）。
-    if outcome.result.clarifying_question:
-        await fail_task(
-            db, task.task_id, worker_id,
-            error_code="AI_INPUT_INVALID", retryable=False,
-        )
-        await _fail_extract_session(db, session.session_id)
-        return None
-    patches = tuple(outcome.result.patches)
-    existing_entry_keys = {str(row.get("field_key")) for row in entry_rows}
-    try:
-        _validate_entry_patches(
-            patches, expected_subject, expected_policy_revision, existing_entry_keys
-        )
-    except (AttributeError, TypeError, ValueError):
-        await fail_task(
-            db, task.task_id, worker_id,
-            error_code="AI_INPUT_INVALID", retryable=False,
-        )
-        await _fail_extract_session(db, session.session_id)
-        return None
-
-    # 硬字段：对每个缺失硬字段做一次定向抽取，字段级复核纪律与 build 分支
-    # 同款（subject/版本/值/证据）。单字段校验违规 = 数据层 fail-closed：
-    # 记 warning 后跳过该字段（不写库），不让一个坏定向调用拖垮 entry 落库
-    # ——与"硬字段失败不阻塞 entry"的容忍语义一致；网关调用失败维持
-    # result is None → continue，下轮对话重试。
-    known_keys = await _load_known_field_keys(db, session)
-    missing = sorted(MASTER_HARD_FIELD_KEYS - known_keys)
-    structured_fields: list[Any] = []
-    for field_key in missing:
-        hard_request = StructuredExtractRequest(
-            subject=session.subject.value,
-            turn_texts=tuple(dialogue),
-            consent_version=session.consent_version,
-            policy_revision=expected_policy_revision,
-            target_field_key=field_key,
-        )
-        hard_outcome = await gateway.structured_extract(context, hard_request)
-        if hard_outcome.result is None:
-            # 硬字段抽取失败不阻塞 entry 落库；下轮对话重试。
-            continue
-        for field in tuple(hard_outcome.result.fields):
-            if field.field_key != field_key:
-                continue
-            try:
-                if not isinstance(field.subject, ProfileSubject):
-                    raise TypeError("provider subject is not typed")
-                if field.subject is not expected_subject:
-                    raise ValueError("provider subject does not match session")
-                if field.schema_version != PROFILE_SCHEMA_VERSION:
-                    raise ValueError("provider schema version does not match")
-                if field.prompt_version != PROFILE_PROMPT_VERSION:
-                    raise ValueError("provider prompt version does not match")
-                if field.policy_revision != expected_policy_revision:
-                    raise ValueError("provider policy revision does not match")
-                field.value = normalize_profile_extracted_value(
-                    field.subject, field.field_key, field.value
-                )
-                if isinstance(field.confidence, bool):
-                    raise TypeError("provider confidence must be numeric")
-                confidence = float(field.confidence)
-                if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
-                    raise ValueError("provider confidence is outside the allowed range")
-                field_span = getattr(field, "source_span", None)
-                field_quote = getattr(field, "source_quote", None)
-                if field_span is not None and not isinstance(field_span, str):
-                    raise ValueError("provider source span must be text")
-                if field_quote is not None and not isinstance(field_quote, str):
-                    raise ValueError("provider source quote must be text")
-                if (
-                    field_span is not None
-                    and field_quote is not None
-                    and field_span != field_quote
-                ):
-                    raise ValueError("provider source evidence does not agree")
-            except (AttributeError, TypeError, ValueError):
-                logger.warning(
-                    "ai_master_hard_field_rejected session_id=%s field_key=%s",
-                    session.session_id,
-                    field_key,
-                )
-                continue
-            structured_fields.append(field)
-
-    if not patches and not structured_fields:
-        # 空 patch 合法完成：对话里没有可固化内容，不写草稿、绝不写澄清
-        # turn；会话从 extracting 回弹 draft（turn 提交把会话推入
-        # extracting，空回合若不回弹会卡死在"提取中"，对话无法继续）——
-        # 与 update 澄清回路的 EXTRACTING→DRAFT 边同款守卫/迁移写法。
-        if session.status is ProfileSessionStatus.EXTRACTING:
-            assert_session_transition(session.status, ProfileSessionStatus.DRAFT)
-            await _update_session_status(
-                db, session.session_id, ProfileSessionStatus.DRAFT
-            )
-        return "profile-master:no-op", session.revision_vector
-
-    draft_id = await _write_master_draft_fields(
-        db, session, turn, patches, structured_fields
-    )
-    if session.status is ProfileSessionStatus.EXTRACTING:
-        assert_session_transition(
-            session.status, ProfileSessionStatus.AWAITING_CONFIRMATION
-        )
-        await _update_session_status(
-            db, session.session_id, ProfileSessionStatus.AWAITING_CONFIRMATION
-        )
-    return f"profile-draft:{draft_id}", session.revision_vector
-
-
-async def _write_master_draft_fields(
-    db: AsyncSession,
-    session: ProfileSession,
-    turn: ProfileTurn,
-    patches: tuple[Any, ...],
-    structured_fields: list[Any],
-) -> str:
-    """master 抽取结果写入会话当前草稿（设计 Task 6）。
-
-    会话已有活动草稿时直接续写（master 草稿随对话累积）；无活动草稿时按
-    ``_write_draft`` 的建壳 SQL 新建（status='draft'）。entry 行照
-    ``_write_update_draft`` 的 patch 行写入（field_kind='entry'、正文在
-    content、value_json 恒 NULL）；structured 行按 ``_DRAFT_FIELD_COLUMNS``
-    形态写入（field_kind='structured'、value_json/display_value 由
-    ``normalize_profile_extracted_value`` 归一后的值序列化）。全部行
-    ``confirmation_status='suggested'``，由用户确认。不 commit。
-    """
-    subject = session.subject.value
-    consent_snapshot = session.consent_snapshot or {}
-    consent_scope = consent_snapshot.get("scope") or PROFILE_CONSENT_SCOPE
-    draft_id = session.draft_id or await _load_active_draft_id_for_session(
-        db, session.session_id
-    )
-    if draft_id is None:
-        draft_id = uuid.uuid4().hex
-        await db.execute(
-            text(
-                "INSERT INTO ai_profile_draft "
-                "(draft_id, user_id, subject, session_id, status, expected_revision, "
-                " consent_snapshot_json, policy_revision, prompt_version, schema_version, "
-                " expires_at, created_at, updated_at) "
-                "VALUES (:draft_id, :user_id, :subject, :session_id, 'draft', 0, "
-                " :consent_snapshot_json, :policy_revision, :prompt_version, :schema_version, "
-                " NULL, UTC_TIMESTAMP(), UTC_TIMESTAMP())"
-            ),
-            {
-                "draft_id": draft_id,
-                "user_id": session.owner_user_id,
-                "subject": subject,
-                "session_id": session.session_id,
-                "consent_snapshot_json": json.dumps(
-                    consent_snapshot, ensure_ascii=False
-                ),
-                "policy_revision": session.policy_revision or PROFILE_POLICY_REVISION,
-                "prompt_version": PROFILE_PROMPT_VERSION,
-                "schema_version": PROFILE_SCHEMA_VERSION,
-            },
-        )
-    master_turn_ids = (turn.turn_id,)
-    # 软删除行复活（控制器交接项）：用户经 REST 删除建议行后行仍占
-    # (draft_id, field_key) 唯一键（confirmation_status='deleted'），而缺失
-    # 口径（``_load_known_field_keys`` 过滤 deleted）会再次产出同一 key——
-    # 直接 INSERT 撞唯一键。先读活动草稿全量行：deleted 行 UPDATE 复活
-    # （suggested + 内容/来源刷新）；非 deleted 的既有 key 走不到这里
-    # （缺失口径已排除），万一出现则记 warning 跳过（数据层 fail-closed，
-    # 不让一个坏重定位拖垮 entry 落库）。entry 行 field_key 带随机段永不
-    # 复用，无需防撞。不 commit。
-    existing_field_keys = {
-        str(row["field_key"]): str(row.get("confirmation_status") or "")
-        for row in await _load_draft_field_rows(db, draft_id)
-    }
-    for patch in patches:
-        content = validate_entry_content(patch.content)
-        entry_key = f"entry_{patch.category}_{uuid.uuid4().hex[:8]}"
-        await db.execute(
-            text(
-                "INSERT INTO ai_profile_draft_field "
-                "(draft_id, field_key, subject, field_kind, category, content, "
-                " replaces_field_key, value_json, display_value, source_type, "
-                " source_turn_ids, source_span, confidence, visibility, consent_scope, "
-                " schema_version, prompt_version, content_hash, confirmation_status, "
-                " created_at, updated_at) "
-                "VALUES (:draft_id, :field_key, :subject, 'entry', :category, :content, "
-                " :replaces_field_key, NULL, :display_value, 'user_answer', "
-                " :source_turn_ids, :source_span, :confidence, 'self', :consent_scope, "
-                " :schema_version, :prompt_version, :content_hash, 'suggested', "
-                " UTC_TIMESTAMP(), UTC_TIMESTAMP())"
-            ),
-            {
-                "draft_id": draft_id,
-                "field_key": entry_key,
-                "subject": subject,
-                "category": patch.category,
-                "content": content,
-                "replaces_field_key": (
-                    str(patch.replaces_field_key) if patch.replaces_field_key else None
-                ),
-                "display_value": content,
-                "source_turn_ids": json.dumps(list(master_turn_ids), ensure_ascii=False),
-                "source_span": getattr(patch, "source_span", None)
-                or getattr(patch, "source_quote", None),
-                "confidence": float(patch.confidence),
-                "consent_scope": consent_scope,
-                "schema_version": PROFILE_SCHEMA_VERSION,
-                "prompt_version": PROFILE_PROMPT_VERSION,
-                "content_hash": _content_hash(
-                    entry_key, subject, content, master_turn_ids
-                ),
-            },
-        )
-    for field in structured_fields:
-        value = getattr(field, "value", None)
-        field_key = str(field.field_key)
-        existing_status = existing_field_keys.get(field_key)
-        if existing_status is not None and existing_status != "deleted":
-            # 缺失口径排除非 deleted 既有 key；出现即数据层异常，跳过防撞。
-            logger.warning(
-                "ai_master_draft_field_skip_existing session_id=%s "
-                "field_key=%s status=%s",
-                session.session_id,
-                field_key,
-                existing_status,
-            )
-            continue
-        if existing_status == "deleted":
-            # 复活软删除行：重置为 suggested 并刷新值/来源/摘要（不 INSERT）。
-            await db.execute(
-                text(
-                    "UPDATE ai_profile_draft_field "
-                    "SET confirmation_status = 'suggested', value_json = :value_json, "
-                    "display_value = :display_value, source_turn_ids = :source_turn_ids, "
-                    "content_hash = :content_hash, updated_at = UTC_TIMESTAMP() "
-                    "WHERE draft_id = :draft_id AND field_key = :field_key"
-                ),
-                {
-                    "draft_id": draft_id,
-                    "field_key": field_key,
-                    "value_json": json.dumps(value, ensure_ascii=False),
-                    "display_value": _display_value(value),
-                    "source_turn_ids": json.dumps(
-                        list(master_turn_ids), ensure_ascii=False
-                    ),
-                    "content_hash": _content_hash(
-                        field_key, subject, value, master_turn_ids
-                    ),
-                },
-            )
-            continue
-        await db.execute(
-            text(
-                "INSERT INTO ai_profile_draft_field "
-                "(draft_id, field_key, subject, field_kind, category, content, "
-                " replaces_field_key, value_json, display_value, source_type, "
-                " source_turn_ids, source_span, confidence, visibility, consent_scope, "
-                " schema_version, prompt_version, content_hash, confirmation_status, "
-                " created_at, updated_at) "
-                "VALUES (:draft_id, :field_key, :subject, 'structured', NULL, NULL, "
-                " NULL, :value_json, :display_value, 'user_answer', "
-                " :source_turn_ids, :source_span, :confidence, 'self', :consent_scope, "
-                " :schema_version, :prompt_version, :content_hash, 'suggested', "
-                " UTC_TIMESTAMP(), UTC_TIMESTAMP())"
-            ),
-            {
-                "draft_id": draft_id,
-                "field_key": field_key,
-                "subject": subject,
-                "value_json": json.dumps(value, ensure_ascii=False),
-                "display_value": _display_value(value),
-                "source_turn_ids": json.dumps(list(master_turn_ids), ensure_ascii=False),
-                "source_span": getattr(field, "source_span", None)
-                or getattr(field, "source_quote", None),
-                "confidence": float(field.confidence),
-                "consent_scope": consent_scope,
-                "schema_version": getattr(field, "schema_version", None)
-                or PROFILE_SCHEMA_VERSION,
-                "prompt_version": PROFILE_PROMPT_VERSION,
-                "content_hash": _content_hash(field_key, subject, value, master_turn_ids),
-            },
-        )
-    return draft_id
-
-
-# ----------------------------------------------------------------------
 # 暂停 / 恢复 / 软删除
 # ----------------------------------------------------------------------
 
@@ -3083,112 +2709,6 @@ def ensure_revision(current: int, expected: int) -> None:
 # 可编辑/可发布草稿状态白名单。deleted/published/cancelled 等终态草稿只读
 # （文档 §7「已发布/已删除草稿只读」），不允许再 PATCH 或 publish。
 _DRAFT_EDITABLE_STATUSES = frozenset({"draft", "awaiting_confirmation"})
-
-
-# 墨相师对话建构（设计 Task 3）：搜索与匹配强依赖的地基字段，发布前必须全部
-# 确认。settings.ai_master_hard_fields 可覆盖（逗号分隔）。
-MASTER_HARD_FIELD_KEYS: frozenset[str] = frozenset(
-    k.strip() for k in settings.ai_master_hard_fields.split(",") if k.strip()
-) if getattr(settings, "ai_master_hard_fields", "") else frozenset(
-    {"city_code", "age", "marriage_status"}
-)
-
-_MASTER_PROGRESS_DENOMINATOR = 10.0
-_MASTER_ENTRY_SCORE = 0.5
-_MASTER_ENTRY_SCORE_CAP = 2.0
-
-
-@dataclass
-class MasterProgress:
-    percent: float
-    hard_done: int
-    hard_total: int
-    entry_score: float
-    gate_met: bool
-
-
-def master_progress(
-    confirmed_structured: frozenset[str], confirmed_entries: int
-) -> MasterProgress:
-    """折算公式（设计第六节）：structured 1 分/个 + entry 0.5 分/条（上限 2 分），
-    分母 10；门槛 = 硬字段全齐 且 percent >= settings.ai_master_build_gate*100。"""
-    hard_total = len(MASTER_HARD_FIELD_KEYS)
-    hard_done = len(confirmed_structured & MASTER_HARD_FIELD_KEYS)
-    entry_score = min(float(max(confirmed_entries, 0)) * _MASTER_ENTRY_SCORE,
-                      _MASTER_ENTRY_SCORE_CAP)
-    score = len(confirmed_structured) + entry_score
-    percent = min(100.0, score / _MASTER_PROGRESS_DENOMINATOR * 100.0)
-    gate_met = hard_total > 0 and hard_done == hard_total and (
-        percent >= settings.ai_master_build_gate * 100.0
-    )
-    return MasterProgress(percent=round(percent, 1), hard_done=hard_done,
-                          hard_total=hard_total, entry_score=entry_score,
-                          gate_met=gate_met)
-
-
-@dataclass(frozen=True)
-class MasterProgressSnapshot:
-    """WS 进度推送的读取端聚合（设计 Task 7）。
-
-    ``progress`` 供 WS progress 推送与确认门槛判定；``missing_hard`` 为缺失
-    硬字段英文 key（中文渲染由调用方经 prompts.moxiang_master._missing_label
-    完成，保持服务层与提示词层解耦）；``confirmed_summary`` 为已确认内容的
-    中文摘要行。
-    """
-
-    progress: MasterProgress
-    missing_hard: tuple[str, ...]
-    confirmed_summary: str
-
-
-async def load_master_progress_snapshot(
-    db: AsyncSession, session_id: str, owner_user_id: int
-) -> MasterProgressSnapshot:
-    """墨相师建构进度快照（设计 Task 7，WS 推送读取端）。
-
-    已确认口径 = 本会话草稿 confirmed 行 ∪ 该维度最近已发布 revision 的
-    structured 字段/entry 条目（与抽取缺失口径 ``_load_known_field_keys``
-    的「草稿 ∪ 已发布」同源，进度才与抽取行为一致）。``missing_hard`` 同时
-    排除用户跳过（不想答）的字段。会话不存在/非本人抛 ``ProfileSessionNotFound``
-    （与 ``load_owned_session`` 同款）。不 commit。
-    """
-    session = await load_owned_session(db, session_id, owner_user_id)
-    owner = int(session.owner_user_id)
-    subject_value = session.subject.value
-    published_keys = await _load_published_structured_keys(db, owner, subject_value)
-    published_entries = await _load_published_entry_rows(db, owner, subject_value)
-    draft_id = session.draft_id or await _load_active_draft_id_for_session(
-        db, session_id
-    )
-    rows = await _load_draft_field_rows(db, draft_id) if draft_id else []
-    confirmed_structured: set[str] = set(session.confirmed_keys) | set(published_keys)
-    confirmed_entries = len(published_entries)
-    summary_lines: list[str] = []
-    confirmed_value = ProfileFieldConfirmationStatus.CONFIRMED.value
-    for row in rows:
-        if str(row.get("confirmation_status") or "") != confirmed_value:
-            continue
-        if str(row.get("field_kind") or "structured") == "entry":
-            confirmed_entries += 1
-            content = str(row.get("content") or "").strip()
-            if content:
-                summary_lines.append(f"{row.get('category') or '条目'}：{content}")
-        else:
-            field_key = str(row["field_key"])
-            confirmed_structured.add(field_key)
-            display = str(row.get("display_value") or "").strip()
-            if display:
-                summary_lines.append(f"{_missing_label(field_key)}：{display}")
-    return MasterProgressSnapshot(
-        progress=master_progress(frozenset(confirmed_structured), confirmed_entries),
-        missing_hard=tuple(sorted(
-            MASTER_HARD_FIELD_KEYS
-            - frozenset(session.field_keys)
-            - published_keys
-            - frozenset(session.skipped_keys)
-        )),
-        confirmed_summary="；".join(summary_lines),
-    )
 
 
 def min_confirmed_fields_to_publish() -> int:
@@ -3892,9 +3412,13 @@ async def insert_immutable_profile_revision(
         {"revision_id": revision_id, "draft_id": draft.draft_id},
     )
     if draft.session_id:
+        # journey_stage 同步推进到 published（Contract §1.2 终态；published 是
+        # advance_journey_stage 顺序链的最大值，对任何合法当前态结果一致）。
+        # 否则发布后 state 永远报 building，前端无法感知旅程已完成。
         await db.execute(
             text(
                 "UPDATE ai_profile_session SET status = 'published', active_status = 0, "
+                "journey_stage = 'published', "
                 "ended_at = UTC_TIMESTAMP(), updated_at = UTC_TIMESTAMP() "
                 "WHERE session_id = :session_id AND status IN "
                 "('draft','extracting','awaiting_confirmation','paused')"
@@ -3969,6 +3493,44 @@ async def enqueue_cleanup_or_projection_task(
     return task
 
 
+async def _is_master_session(db: AsyncSession, session_id: str) -> bool:
+    """判断草稿所属会话是否为墨相师旅程会话（session_kind='master'）。"""
+    row = (
+        await db.execute(
+            text(
+                "SELECT session_kind FROM ai_profile_session "
+                "WHERE session_id = :session_id LIMIT 1"
+            ),
+            {"session_id": session_id},
+        )
+    ).mappings().first()
+    return row is not None and str(row.get("session_kind") or "") == "master"
+
+
+# 2026-09-03 产品决策（PRODUCT.md）：墨相师自然对话的「我的墨相」发布前，
+# 必须已确认年龄与所在城市——缺任一项，匹配链路无意义，发布 fail-closed。
+# 仅约束 personal 主体的 master 草稿；愿遇之相与旧 build/update 会话语义不变。
+_MASTER_PERSONAL_FLOOR_FIELDS = ("age", "city_code")
+_MASTER_FLOOR_LABELS = {"age": "年龄", "city_code": "所在城市"}
+
+
+def missing_master_publish_floor_fields(
+    subject: str, confirmed_structured_keys: set[str]
+) -> list[str]:
+    """Return the master-personal publish-floor fields absent from confirmed keys.
+
+    Pure helper so the gate is unit-testable without a DB. Non-personal subjects
+    have no floor and always return an empty list.
+    """
+    if subject != "personal":
+        return []
+    return [
+        key
+        for key in _MASTER_PERSONAL_FLOOR_FIELDS
+        if key not in confirmed_structured_keys
+    ]
+
+
 async def publish_profile_draft(
     db: AsyncSession,
     draft_id: str,
@@ -4020,13 +3582,40 @@ async def publish_profile_draft(
     min_fields = min_confirmed_fields_to_publish()
     # WP-P1 锁定语义：发布门槛只数 structured 确认字段，entry 条目不计入
     # （条目是丰富度增强，不改变建构门槛边界；测试在消费处防回归）。
+    # 旅程例外：session_kind='master' 的墨相师自然对话草稿以 entry 为主要
+    # 产物，且自动邀请每会话仅 2 张——若仍沿用 structured-only 门槛，用户
+    # 在聊到结构化事实前耗尽邀请后会被永久卡死在无法发布的状态。此处把
+    # entry 计入门槛，让六维理解本身可支撑发布；旧 build/update 会话语义不变。
     structured_confirmed_count = sum(
         1 for field in fields if field.field_kind == "structured"
     )
-    if structured_confirmed_count < min_fields:
+    is_master_draft = bool(draft.session_id) and await _is_master_session(
+        db, draft.session_id
+    )
+    confirmed_count = structured_confirmed_count
+    if is_master_draft:
+        confirmed_count += sum(
+            1 for field in fields if field.field_kind == "entry"
+        )
+    if confirmed_count < min_fields:
         raise AIInputError(
             f"at least {min_fields} confirmed fields are required"
         )
+    # 旅程个人画像发布底线：年龄与所在城市必须已确认（见上方产品决策注释）。
+    if is_master_draft:
+        confirmed_structured_keys = {
+            field.field_key
+            for field in fields
+            if field.field_kind == "structured" and field.field_key
+        }
+        missing_floor = missing_master_publish_floor_fields(
+            draft.subject, confirmed_structured_keys
+        )
+        if missing_floor:
+            raise AIInputError(
+                "发布前请先确认："
+                + "、".join(_MASTER_FLOOR_LABELS.get(key, key) for key in missing_floor)
+            )
     current_revision = await _load_revision_vector(db, owner_user_id)
     # Reserve the unique task key before mutating the immutable revision. The
     # unique owner/type/key constraint plus the draft lock makes the whole

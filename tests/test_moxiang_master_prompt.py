@@ -1,6 +1,10 @@
 """墨相师人设提示词：白名单段必须存在；构建上下文注入 system 消息。"""
+from datetime import datetime
+
 from app.services.ai.prompts.moxiang_master import (
+    AI_ROLE_NAME,
     _SYSTEM_HEADER,
+    _greeting_for_hour,
     build_build_context,
     build_master_prompt,
     opening_message_for_subject,
@@ -42,6 +46,72 @@ def test_master_extract_prompt_protects_specific_people_and_requires_preference(
         assert phrase in _MASTER_SYSTEM_HEADER
 
 
+def test_master_extract_prompt_requests_allowlisted_structured_fields_and_patches() -> None:
+    """墨相师抽取同时沉淀可确认字段与六维自由条目，不能只产 patch。"""
+    prompt = build_profile_master_extract_prompt(
+        subject="personal", turn_texts=("我住杭州，周末喜欢看展。",)
+    )
+
+    assert '"fields"' in prompt
+    assert "city_code" in prompt
+    assert "interest_tags" in prompt
+    assert '"patches"' in prompt
+
+
+def test_master_extract_prompt_requires_exhaustive_semantic_atomization() -> None:
+    """30 轮基线暴露出一条回答中的第二个维度容易被合并或漏掉。"""
+    prompt = build_profile_master_extract_prompt(
+        subject="personal",
+        turn_texts=(
+            "我刚认识时话不多，熟了以后愿意倾听；未来也想和伴侣一起安定生活。",
+        ),
+        existing_digest="性格：慢热",
+    )
+
+    for rule in (
+        "逐句扫描",
+        "最小独立事实",
+        "同一句可以输出多条 patch",
+        "一条 patch 只表达一个事实",
+        "同一主题不等于重复",
+        "新增维度",
+    ):
+        assert rule in prompt
+
+
+def test_master_extract_prompt_has_dimension_precedence_for_baseline_misses() -> None:
+    """情绪表达、长期愿景与个人空间必须先按语义分桶，再考虑通用词。"""
+    prompt = build_profile_master_extract_prompt(
+        subject="personal",
+        turn_texts=("我不太会说甜言蜜语，但会用行动表达。",),
+    )
+
+    for example in (
+        "不擅长甜言蜜语但会用行动表达",
+        "先倾听、后给建议",
+        "三五年",
+        "十年后",
+        "婚姻里成为队友",
+        "个人空间",
+        "从具体关系经历中总结出的自我模式",
+    ):
+        assert example in prompt
+    assert "长期关系愿景优先归入 future_expectations" in prompt
+    assert "情绪表达优先归入 emotional_expression" in prompt
+
+
+def test_master_extract_prompt_retains_supported_soft_evidence_without_guessing() -> None:
+    """软证据可以低置信保留，但无原文支撑的内容仍必须丢弃。"""
+    prompt = build_profile_master_extract_prompt(
+        subject="personal",
+        turn_texts=("现在想想，我更在意相处时的性格互动。",),
+    )
+
+    assert "有直接原文支撑但需要轻度归纳" in prompt
+    assert "不要仅因不是正式结论就丢弃" in prompt
+    assert "把握不足 0.5 就不要输出" in prompt
+
+
 # ===== Phase 1 Contract v1.1 P1-B：subject boundary + opening message guards =====
 
 
@@ -56,14 +126,61 @@ def test_system_header_declares_two_subjects_no_cross_write() -> None:
 def test_opening_messages_are_subject_specific() -> None:
     """``OPENING_MESSAGE`` and ``IDEAL_PARTNER_OPENING_MESSAGE`` must be distinct."""
     assert OPENING_MESSAGE != IDEAL_PARTNER_OPENING_MESSAGE
-    assert opening_message_for_subject("personal") == OPENING_MESSAGE
-    assert opening_message_for_subject("ideal_partner") == IDEAL_PARTNER_OPENING_MESSAGE
+    # 批次3 #1：variant=0 是稳定基准开场，正文与兼容常量一致（问候语时段化）。
+    noon = datetime(2026, 9, 3, 12, 0)
+    personal = opening_message_for_subject("personal", now=noon, variant=0)
+    partner = opening_message_for_subject("ideal_partner", now=noon, variant=0)
+    assert personal != partner
+    assert "中午好，我是知遇。" in personal
+    assert "中午好，我是知遇。" in partner
+
+
+def test_opening_personalizes_by_time_and_rotates_variants() -> None:
+    """#1：问候语按时段变化；不同 variant 给出不同首个话题。"""
+    assert _greeting_for_hour(7) == "早上好"
+    assert _greeting_for_hour(15) == "下午好"
+    assert _greeting_for_hour(20) == "晚上好"
+    assert _greeting_for_hour(1) == "夜深了"
+    morning = datetime(2026, 9, 3, 7, 30)
+    variants = [
+        opening_message_for_subject("personal", now=morning, variant=i)
+        for i in range(3)
+    ]
+    assert len(set(variants)) == 3
+    assert all(v.startswith("早上好，我是知遇。") for v in variants)
+    # variant 越界按套数取模，不抛错。
+    assert opening_message_for_subject("personal", now=morning, variant=3) == variants[0]
+    # 默认（variant=None）随机轮换，但结构不变。
+    default = opening_message_for_subject("personal")
+    assert "我是知遇。" in default
+
+
+def test_master_prompt_forbids_repetitive_follow_up_phrases() -> None:
+    """#2：人设 prompt 必须带追问句式库与反重复约束。"""
+    assert "不得连续两轮使用相同的引导句式" in _SYSTEM_HEADER
+    assert "那我好奇的是" in _SYSTEM_HEADER  # 反例点名，限制口头禅
+    for cue in ("最近的例子", "什么样的时刻", "画面"):
+        assert cue in _SYSTEM_HEADER
 
 
 def test_opening_messages_do_not_leak_into_the_other_subject() -> None:
     """The two opening strings must not reference the other subject's vocabulary."""
     assert "理想" not in OPENING_MESSAGE
     assert "我自己" not in IDEAL_PARTNER_OPENING_MESSAGE
+
+
+def test_opening_uses_dedicated_ai_identity_not_product_or_model_name() -> None:
+    """角色名属于产品 persona，不应退化成产品名、旧昵称或 LLM 名称。"""
+    assert AI_ROLE_NAME == "知遇"
+    assert f"我是{AI_ROLE_NAME}" in OPENING_MESSAGE
+    assert f"我是{AI_ROLE_NAME}" in IDEAL_PARTNER_OPENING_MESSAGE
+    assert AI_ROLE_NAME in _SYSTEM_HEADER
+    for internal_term in ("供应商", "模型", "LLM"):
+        assert internal_term in _SYSTEM_HEADER
+    assert "我是点点" not in OPENING_MESSAGE
+    assert "墨相师" not in OPENING_MESSAGE
+    assert "deepseek" not in OPENING_MESSAGE.lower()
+    assert "dots" not in OPENING_MESSAGE.lower()
 
 
 def test_build_context_personal_and_ideal_partner_are_distinct() -> None:
@@ -77,6 +194,44 @@ def test_build_context_personal_and_ideal_partner_are_distinct() -> None:
     assert "我的墨相" in personal
     assert "愿遇之相" in partner
     assert personal != partner
+
+
+def test_build_context_injects_dimension_progress() -> None:
+    """六维进度行注入后，知遇必须能看到每维状态并被引导优先问空白维度。"""
+    ctx = build_build_context(
+        [], "", 25.0,
+        dimension_lines=[
+            "- 性格与社交：已理解",
+            "- 亲密模式：空白",
+            "- 生活方式：部分理解（1条）",
+        ],
+    )
+    assert "六维建构进度" in ctx
+    assert "- 亲密模式：空白" in ctx
+    assert "优先围绕「空白」与「部分理解」的维度" in ctx
+    assert "不要连续多轮停留在同一维度" in ctx
+
+
+def test_build_context_without_dimension_lines_has_no_progress_section() -> None:
+    """不传 dimension_lines 时保持旧行为，不出现六维段。"""
+    ctx = build_build_context(["age"], "", 0.0)
+    assert "六维建构进度" not in ctx
+
+
+def test_journey_dimension_status_rendering() -> None:
+    """journey._dimension_status 与进度口径（0/50/100）一致。"""
+    from app.services.ai.journey import _dimension_status
+    from app.services.ai.journey_progress import JourneyDimensionProgress
+
+    assert _dimension_status(JourneyDimensionProgress(percent=0.0, evidence_count=0)) == "空白"
+    assert (
+        _dimension_status(JourneyDimensionProgress(percent=50.0, evidence_count=1))
+        == "部分理解（1条）"
+    )
+    assert (
+        _dimension_status(JourneyDimensionProgress(percent=100.0, evidence_count=2))
+        == "已理解"
+    )
 
 
 def test_master_extract_prompt_injects_per_subject_label() -> None:

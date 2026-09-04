@@ -1,5 +1,0 @@
-...........................s...s                                         [100%]
-=========================== short test summary info ===========================
-SKIPPED [1] tests\integration\ai\test_ai_search_real_db.py:679: snapshot has <= page_size results, no cursor to test
-SKIPPED [1] tests\integration\ai\test_ai_worker_real_db.py:34: Windows 下 spawn 独立 worker 子进程继承事件循环句柄失败（WinError 6/50）；跨进程 claim 验证改在 Linux 容器内执行：docker compose -f compose.ai-test.yml run --rm worker-a python -m pytest tests/integration/ai/test_ai_worker_real_db.py -q
-30 passed, 2 skipped in 22.08s

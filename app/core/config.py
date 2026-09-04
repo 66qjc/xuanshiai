@@ -125,10 +125,6 @@ class Settings(BaseSettings):
     # 良配对齐：默认 7/10 ≈ 67%，"无需完成全部题目，进度 67% 左右可提前
     # 建构画像"。进度提示与发布硬门槛共用此值，避免两套数字漂移。
     ai_profile_min_fields: int = Field(default=7, ge=1, le=20)
-    # 墨相师对话建构门槛（设计 D2/D6）：硬字段全齐 + 折算总分百分比阈值。
-    ai_master_build_gate: float = 0.60
-    # 墨相师硬字段白名单（逗号分隔，空串=内置默认 城市/年龄/婚姻状态）。
-    ai_master_hard_fields: str = ""
     # 匹配度外显灰度（方案 WP-C2 / 决策 D6）：off=影子运行不外显（现状）；
     # bucket=按 viewer 稳定哈希放量 ai_compatibility_display_bucket_pct%；
     # on=全量外显。仅改变 ai_compatibility_snapshot.display_eligible 的写入值，
@@ -228,7 +224,7 @@ class Settings(BaseSettings):
     # ==================== 墨相师四阶段融合 Journey 开关（Contract v1.1 §10）====================
     # 墨相师新旅程（候选理解池 + 自动整理邀请）默认关闭。生产启用需经过
     # _validate_ai_feature_gates 的三道审批门禁。关闭时不产生新候选、不推
-    # 新邀请，新前端显示暂不可用并保留旧备用入口；旧 profile_build 不受影响。
+    # 新旅程默认关闭；生产启用前必须通过 _validate_ai_feature_gates 三道审批。
     ai_moxiang_journey_enabled: bool = False
 
     # Task 12 审计/指标开关（非敏感，不影响 production fail-closed）。

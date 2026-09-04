@@ -19,7 +19,8 @@ from typing import Any
 from pydantic import SecretStr, ValidationError
 
 from app.core.config import settings
-from app.schemas.ai_profile import ProfileSubject
+from app.schemas.ai_profile import ProfileSubject, normalize_entry_category
+from app.services.ai.audit import emit_ai_metric
 from app.services.ai.base import (
     AIProvider,
     ExtractedEntry,
@@ -111,6 +112,9 @@ _PERSONAL_PROFILE_FIXTURE_FIELDS: dict[str, tuple[Any, str | None, float]] = {
     "occupation_group": ("technology", "互联网做技术", 0.85),
     "lifestyle_tags": (["户外"], "周末愿意户外", 0.78),
     "relationship_goal": ("marriage", "想认真奔着结婚", 0.88),
+    # 2026-09-03：个人画像发布底线要求 age+city_code（PRODUCT.md），mock 个人
+    # fixture 补齐 age，使旅程 master 草稿在 mock 下也能走通发布链。
+    "age": (28, "今年28岁", 0.94),
 }
 
 _IDEAL_PARTNER_FIXTURE_FIELDS: dict[str, tuple[Any, str | None, float]] = {
@@ -548,6 +552,22 @@ def _safe_confidence(value: Any) -> float:
     if isinstance(value, (int, float)):
         return float(value)
     return 1.0
+
+
+def _drop_invalid_extract_item(scene: str, item: dict[str, Any]) -> None:
+    """批次3 #9/#25：provider 边界丢弃非法条目时留痕，不再静默 continue。
+
+    category 先经 :func:`normalize_entry_category` 归一；仍不合法的条目
+    被 Pydantic 拒绝后记 warning（含 prompt 场景与原始 category）并计入
+    ``schema_invalid`` 指标，便于离线回归发现模型输出格式的漂移。
+    """
+    logger.warning(
+        "ai_extract_item_dropped scene=%s category=%r content_head=%r",
+        scene,
+        item.get("category"),
+        str(item.get("content", ""))[:40],
+    )
+    emit_ai_metric("schema_invalid", 1, {"scene": scene})
 
 
 def _parse_json_response(content: str) -> Any:
@@ -989,8 +1009,9 @@ class _OpenAICompatProvider:
                     policy_revision=request.policy_revision,
                 )
             )
-        # WP-P1：条目通道。category/content 由 ExtractedEntry 的 Pydantic
-        # 校验把关（9 枚举 + ≤200 字）；非法条目整条丢弃，不让坏数据进草稿。
+        # WP-P1：条目通道。category 先归一再校验（批次3 #9），content 由
+        # ExtractedEntry 的 Pydantic 校验把关（9 枚举 + ≤200 字）；归一后
+        # 仍非法的条目整条丢弃并留痕，不让坏数据进草稿。
         entries_data = data.get("entries", []) if isinstance(data, dict) else []
         entries: list[ExtractedEntry] = []
         for item in entries_data:
@@ -999,7 +1020,7 @@ class _OpenAICompatProvider:
             try:
                 entries.append(
                     ExtractedEntry(
-                        category=item.get("category", ""),
+                        category=normalize_entry_category(item.get("category")),
                         content=item.get("content", ""),
                         subject=subject,
                         source_quote=item.get("source_quote"),
@@ -1012,6 +1033,7 @@ class _OpenAICompatProvider:
                     )
                 )
             except ValidationError:
+                _drop_invalid_extract_item("profile_entry", item)
                 continue
         return StructuredExtractResult(
             schema_version=_PROFILE_SCHEMA_VERSION,
@@ -1039,7 +1061,7 @@ class _OpenAICompatProvider:
                 patches.append(
                     ExtractedPatch(
                         action=item.get("action", ""),
-                        category=item.get("category", ""),
+                        category=normalize_entry_category(item.get("category")),
                         content=item.get("content", ""),
                         replaces_field_key=item.get("replaces_field_key"),
                         subject=subject,
@@ -1053,6 +1075,7 @@ class _OpenAICompatProvider:
                     )
                 )
             except ValidationError:
+                _drop_invalid_extract_item("profile_update_patch", item)
                 continue
         question = data.get("clarifying_question") if isinstance(data, dict) else None
         if not isinstance(question, str) or not question.strip():
@@ -1068,20 +1091,46 @@ class _OpenAICompatProvider:
     async def _structured_extract_master(
         self, request: StructuredExtractRequest
     ) -> StructuredExtractResult:
-        """master 会话对话抽取（设计 Task 6）：只产 entry patch，禁止澄清问题。
+        """master 会话对话抽取：产出白名单字段与六维 entry patch，禁止澄清。
 
-        解析与 update 同构（patches + clarifying_question 透传）：master prompt
-        契约禁止澄清问题、允许 0 条 patch；若模型违反契约仍返回非空
-        clarifying_question，原样透传给 handler——handler 侧对契约违规终态
-        失败（fail-closed），provider 不静默吞掉。
+        ``fields`` 解析遵循普通建构抽取相同的 allowlist 纪律；``patches``
+        保留六维自由条目。master prompt 契约禁止澄清问题、允许 0 条结果；若
+        模型违反契约仍返回非空 clarifying_question，原样透传给 handler——
+        handler 侧对契约违规终态失败（fail-closed），provider 不静默吞掉。
         """
         prompt = build_profile_master_extract_prompt(
             request.subject,
             request.turn_texts,
             entry_digest=request.entry_digest,
+            existing_digest=request.existing_digest,
         )
         data = await self._chat_json(prompt)
         subject = ProfileSubject(request.subject)
+        fields_data = data.get("fields", []) if isinstance(data, dict) else []
+        fields: list[ExtractedField] = []
+        for item in fields_data:
+            if not isinstance(item, dict):
+                continue
+            field_key = item.get("field_key", "")
+            if field_key not in request.allowlist:
+                continue
+            try:
+                fields.append(
+                    ExtractedField(
+                        field_key=field_key,
+                        subject=subject,
+                        value=item.get("value"),
+                        source_quote=item.get("source_quote"),
+                        confidence=_safe_confidence(item.get("confidence")),
+                        needs_confirmation=True,
+                        confirmation_status="suggested",
+                        schema_version=_PROFILE_SCHEMA_VERSION,
+                        prompt_version=_PROFILE_PROMPT_VERSION,
+                        policy_revision=request.policy_revision,
+                    )
+                )
+            except ValidationError:
+                continue
         patches_data = data.get("patches", []) if isinstance(data, dict) else []
         patches: list[ExtractedPatch] = []
         for item in patches_data:
@@ -1091,7 +1140,7 @@ class _OpenAICompatProvider:
                 patches.append(
                     ExtractedPatch(
                         action=item.get("action", ""),
-                        category=item.get("category", ""),
+                        category=normalize_entry_category(item.get("category")),
                         content=item.get("content", ""),
                         replaces_field_key=item.get("replaces_field_key"),
                         subject=subject,
@@ -1105,13 +1154,14 @@ class _OpenAICompatProvider:
                     )
                 )
             except ValidationError:
+                _drop_invalid_extract_item("profile_master_patch", item)
                 continue
         question = data.get("clarifying_question") if isinstance(data, dict) else None
         if not isinstance(question, str) or not question.strip():
             question = None
         return StructuredExtractResult(
             schema_version=_PROFILE_SCHEMA_VERSION,
-            fields=(),
+            fields=tuple(fields),
             entries=(),
             clarifying_question=question,
             patches=tuple(patches),

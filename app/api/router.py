@@ -41,6 +41,8 @@ from app.api.routes import (
     organization,
     payments,
     points,
+    paper_plane_unlock,
+    paper_plane_contact_exchange,
     presence,
     profile,
     regions,
@@ -64,6 +66,8 @@ api_router.include_router(certifications.router, tags=["认证审核"])
 api_router.include_router(membership.router, tags=["会员"])
 api_router.include_router(payments.router, tags=["支付"])
 api_router.include_router(points.router, tags=["积分"])
+api_router.include_router(paper_plane_unlock.router, tags=["社区"])
+api_router.include_router(paper_plane_contact_exchange.router, tags=["社区"])
 api_router.include_router(regions.router, tags=["地区"])
 api_router.include_router(presence.router, tags=["消息"])
 api_router.include_router(identity.router, tags=["账号与认证"])

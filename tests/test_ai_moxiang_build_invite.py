@@ -54,7 +54,7 @@ def test_threshold_constants_match_contract() -> None:
         ("MIN_EFFECTIVE_TURNS", "4"),
         ("MIN_DIMENSION_COUNT", "3"),
         ("MIN_HIGH_CONFIDENCE_CANDIDATES", "3"),
-        ("MAX_AUTO_INVITES_PER_SESSION", "2"),
+        ("MAX_AUTO_INVITES_PER_SESSION", "3"),
     ):
         assert const in source, f"build_invite.py missing {const} constant"
         # The numeric value must appear (allow whitespace / type coercion).
@@ -88,15 +88,22 @@ def test_should_offer_invite_blocks_below_threshold() -> None:
 
 
 def test_should_offer_invite_blocks_after_max_auto_invites() -> None:
-    """The auto invite counter caps at 2 per session; further attempts are blocked."""
+    """The auto invite counter caps at 3 per session; further attempts are blocked."""
     from app.services.ai.build_invite import should_offer_invite
 
     assert should_offer_invite(
         effective_turn_count=10,
         dimension_count=6,
         high_confidence_candidate_count=10,
-        auto_invite_count=2,
+        auto_invite_count=3,
     ) is False
+    # Below the raised cap, the 3rd invite is still allowed.
+    assert should_offer_invite(
+        effective_turn_count=10,
+        dimension_count=6,
+        high_confidence_candidate_count=10,
+        auto_invite_count=2,
+    ) is True
 
 
 def test_should_offer_invite_passes_at_threshold() -> None:

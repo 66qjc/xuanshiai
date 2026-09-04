@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from contextvars import ContextVar
 from logging.handlers import TimedRotatingFileHandler
@@ -50,8 +51,13 @@ def configure_logging(settings: Settings) -> None:
 
     log_dir = Path("logs")
     log_dir.mkdir(parents=True, exist_ok=True)
+    # 按进程分文件（仅 Windows）：API 与 worker 共写同一 app.log 时，任一进程
+    # 触发午夜滚动都会 rename 另一进程仍持有的文件，Windows 上抛 WinError 32
+    # （PermissionError）且丢日志。Linux 的 rename 对打开文件合法，保持单文件
+    # 以兼容生产环境的日志采集习惯。
+    log_filename = f"app-{os.getpid()}.log" if os.name == "nt" else "app.log"
     file_handler = TimedRotatingFileHandler(
-        log_dir / "app.log",
+        log_dir / log_filename,
         when="midnight",
         backupCount=14,
         encoding="utf-8",

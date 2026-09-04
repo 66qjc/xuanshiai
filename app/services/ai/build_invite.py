@@ -30,10 +30,11 @@ from app.schemas.ai_moxiang import (
 )
 
 # Contract v1.1 §3.1 邀请触发门槛。append-only；旧邀请不可被新门槛追溯。
+# 2026-09-03 产品决策：单会话自动整理邀请上限由 2 提升到 3（见 PRODUCT.md）。
 MIN_EFFECTIVE_TURNS = 4
 MIN_DIMENSION_COUNT = 3
 MIN_HIGH_CONFIDENCE_CANDIDATES = 3
-MAX_AUTO_INVITES_PER_SESSION = 2
+MAX_AUTO_INVITES_PER_SESSION = 3
 
 # 摘要最多条数（每维 1 条，六维上限 6）。
 SUMMARY_MAX_ITEMS = 6

@@ -890,6 +890,33 @@ async def test_fail_task_retryable_moves_to_retry_wait_with_backoff(task_store) 
 
 
 @pytest.mark.asyncio
+async def test_fail_task_retry_wait_emits_task_retry_metric(task_store) -> None:
+    """#24：进入 retry_wait 必须计入 task_retry 指标（带 task_type/error_code）。"""
+    from app.services.ai.audit import metric_snapshot
+
+    db = task_store.session
+    now = _utc(2026, 8, 7, 8, 0)
+    task = await task_store.seed(
+        status="running",
+        lease_owner="worker-1",
+        lease_until=now + timedelta(seconds=60),
+    )
+    await fail_task(
+        db,
+        task.task_id,
+        "worker-1",
+        error_code="AI_TEMPORARILY_UNAVAILABLE",
+        retryable=True,
+    )
+    samples = metric_snapshot().get("task_retry", [])
+    assert samples, "task_retry metric must be emitted on retry_wait"
+    value, tags = samples[-1]
+    assert value == 1
+    assert tags["error_code"] == "AI_TEMPORARILY_UNAVAILABLE"
+    assert tags["task_type"] == task.task_type
+
+
+@pytest.mark.asyncio
 async def test_fail_task_non_retryable_moves_to_failed(task_store) -> None:
     db = task_store.session
     task = await task_store.seed(status="running", lease_owner="worker-1")

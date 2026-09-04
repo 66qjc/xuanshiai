@@ -3,8 +3,7 @@
 数据面（与 ``app/services/ai/moxiang_state.py`` 协议一一对应）:
 
 - ``ai_profile_session`` —— 活动会话;``journey_stage`` 来自 Phase 1。
-- ``ai_profile_candidate`` —— 候选池（仅 Phase 2 借用 effective_turn_count 与
-  dimension 覆盖统计;真实 progress 用 confirmed 草稿,见 ``profile.py``）。
+- ``ai_profile_candidate`` —— 候选池，是六维理解进度的唯一事实来源。
 - ``ai_profile_build_invite`` —— 单 pending 邀请 + 已触发/已接受计数。
 - ``ai_profile_revision`` —— 历史 revision(用于"老用户恢复"判定)。
 - ``ai_consent_grant`` —— ``profile_text_extract`` 授权存在性。
@@ -19,6 +18,8 @@ from typing import Any
 
 from sqlalchemy import text as sql_text
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.services.ai.journey import list_session_candidates
 
 
 # Phase 2 P2-01 —— 个人画像"是否已发布"的判定阈值（只数 revision 行,不限时间)。
@@ -128,85 +129,11 @@ class MoxiangStateSqlRepository:
         )
         return result.first() is not None
 
-    async def count_dimension_confirmed(
-        self, user_id: int, subject: str
-    ) -> dict[str, int]:
-        """每个维度已 confirmed 字段数(主进度唯一来源,Contract §7)。"""
-        result = await self._db.execute(
-            sql_text(
-                "SELECT f.profile_dimension, COUNT(*) AS n "
-                "FROM ai_profile_revision r "
-                "JOIN ai_profile_revision_field f ON f.revision_id = r.id "
-                "WHERE r.user_id = :user_id AND r.subject = :subject "
-                "AND f.profile_dimension IS NOT NULL "
-                "GROUP BY f.profile_dimension"
-            ),
-            {"user_id": user_id, "subject": subject},
+    async def list_session_candidates(self, session_id: str):
+        """Return only active candidates for the shared journey projection."""
+        return await list_session_candidates(
+            self._db, session_id=session_id, active_only=False
         )
-        rows = result.fetchall()
-        out: dict[str, int] = {}
-        for row in rows:
-            try:
-                m = row._mapping
-            except AttributeError:
-                m = row
-            dim = str(m["profile_dimension"])
-            out[dim] = int(m["n"])
-        return out
-
-    async def average_confidence(
-        self, user_id: int, subject: str
-    ) -> float:
-        result = await self._db.execute(
-            sql_text(
-                "SELECT AVG(f.confidence) AS avg_conf "
-                "FROM ai_profile_revision r "
-                "JOIN ai_profile_revision_field f ON f.revision_id = r.id "
-                "WHERE r.user_id = :user_id AND r.subject = :subject"
-            ),
-            {"user_id": user_id, "subject": subject},
-        )
-        row = result.first()
-        if row is None:
-            return 0.0
-        try:
-            m = row._mapping
-        except AttributeError:
-            m = row
-        val = m["avg_conf"]
-        return float(val or 0.0)
-
-    async def confirmation_percent(
-        self, user_id: int, subject: str
-    ) -> float:
-        """confirmed / (confirmed + suggested) over current active draft, *100。
-
-        无活动草稿或无字段 → 返回 0(Contract §7)。
-        """
-        result = await self._db.execute(
-            sql_text(
-                "SELECT "
-                "SUM(CASE WHEN f.confirmation_status = 'confirmed' THEN 1 ELSE 0 END) AS c, "
-                "SUM(CASE WHEN f.confirmation_status IN ('confirmed','suggested') THEN 1 ELSE 0 END) AS t "
-                "FROM ai_profile_draft d "
-                "JOIN ai_profile_draft_field f ON f.draft_id = d.draft_id "
-                "WHERE d.user_id = :user_id AND d.subject = :subject "
-                "AND d.status NOT IN ('deleted', 'cancelled', 'stale')"
-            ),
-            {"user_id": user_id, "subject": subject},
-        )
-        row = result.first()
-        if row is None:
-            return 0.0
-        try:
-            m = row._mapping
-        except AttributeError:
-            m = row
-        c = int(m["c"] or 0)
-        t = int(m["t"] or 0)
-        if t <= 0:
-            return 0.0
-        return c / t * 100.0
 
     async def list_session_turns(
         self,
@@ -223,7 +150,7 @@ class MoxiangStateSqlRepository:
             sql_text(
                 "SELECT turn_id, session_id, client_turn_id, user_id, turn_no, role, "
                 "answer_text, created_at "
-                f"FROM ai_profile_turn WHERE {where} ORDER BY turn_no ASC LIMIT :limit"
+                f"FROM ai_profile_turn WHERE {where} ORDER BY turn_no DESC LIMIT :limit"
             ),
             params,
         )

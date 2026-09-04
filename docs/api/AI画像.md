@@ -1,6 +1,6 @@
-# AI 画像接口（M04 文字会话、回答与草稿抽取）
+# AI 画像接口（M04 文字会话、墨相师旅程与画像抽取）
 
-接口前缀：`/api/v1`。本文件是 M04 AI 画像文字会话与结构化抽取（统一方案 §7，执行计划 Task 7）对外的完整契约。M04 是结构化个人画像与理想型画像，**不是 AI 生图**；一期只支持文字输入与 MockAIProvider，语音/ASR/TTS 属于 `P-04`（Phase 4），本文件只在文末记录启动条件，不提供任何语音路由。
+接口前缀：`/api/v1`。本文件覆盖 M04 AI 画像 REST 会话、结构化抽取与墨相师统一旅程的业务边界。M04 是结构化个人画像与理想型画像，**不是 AI 生图**。`profile-sessions` REST 接口的输入模式固定为文字；墨相师统一旅程另通过 `/api/v1/voice/moxiang-master` WebSocket 提供 `text_message`，其音频分支受 P-04 门禁约束。MockAIProvider 仅用于开发/验收，DeepSeek/Dots 等真实 Provider 仍需通过生产审批门禁。本文件保留语音启用条件，WebSocket 消息细节见《墨相师六维实时整理 WebSocket》。
 
 ### 变更记录
 
@@ -8,6 +8,9 @@
 - 2026-08-08：新增 6 个草稿确认/发布/历史/删除路径（§7-§12）；发布只接受 `confirmed` 字段并写不可变 `ai_profile_revision`；删除在同步响应前令草稿与派生结果不可读；补上创建会话错误表缺失的 `409 PROFILE_SESSION_STALE` 行。
 - 2026-08-08（Task 12 纠偏）：§8 PATCH 错误表、§9 publish 错误表补 `409 RESULT_STALE` 行；§13 稳定错误码总表补 `RESULT_STALE`。删除不递增草稿 `expected_revision`，客户端持旧 revision 操作已删除草稿返回 `409 RESULT_STALE`（守卫先于乐观锁），而非文档此前声称的 `DRAFT_VERSION_CONFLICT`。
 - 2026-08-26（Task 1）：§9 publish 的最低发布门槛统一为 `confirmed_count >= 5`；`suggested`/`rejected`/`deleted` 不计入确认数且不进入 revision；202 响应增加可选异步叙事生成任务 ID `narrative_task_id`。
+- 2026-09-02（墨相师候选链补强）：`moxiang_candidate_extract` 的内部 Provider 契约由“仅 `patches`”扩展为“allowlist `fields` + 六维 `patches`”；不改变任何 HTTP/WS 请求或响应字段。明确陈述的结构化事实会先以 `suggested` 候选进入用户确认流程，非白名单和敏感字段仍被服务端丢弃。
+- 2026-09-03（旅程发布门槛与提问引导）：§9 发布门槛修正为可配置 `ai_profile_min_fields`（默认 7，取代上文历史值 5）；墨相师 `master` 会话 entry 条目计入 `confirmed_count`，且 personal 发布前必须已确认 `age`+`city_code`（缺项 `400 AI_INPUT_INVALID`）。抽取 prompt 增加六维归属、置信度 rubric 与跨轮去重（`existing_digest`）；知遇每轮按整理进度与缺失硬字段感知提问。单会话自动整理邀请上限由 2 提升到 3（见 WS 文档）。
+- 2026-09-03（会话历史 405 修复）：同一 `/profile-sessions/{session_id}/turns` 路径新增 `GET` 历史分页方法，保留原 `POST` 提交方法；首次读取返回最新一页并按 `turn_no` 升序输出，只允许读取本人会话。
 
 通用请求头（所有接口）：
 
@@ -344,6 +347,114 @@ Content-Type: application/json
 | 429 | `AI_QUOTA_EXCEEDED` | 用户或 Provider 额度耗尽 | true | 展示冷却时间或手工路径 |
 | 503 | `AI_TEMPORARILY_UNAVAILABLE` | Provider/任务基础设施临时失败 | true | 重试同一 task，不重复提交 turn |
 | 503 | `AI_FEATURE_DISABLED` | 功能开关/批准门禁未满足 | false | 展示稳定禁用状态 |
+
+---
+
+### 3.1 分页读取墨相师会话历史
+
+**基本信息**：恢复墨相师页面中的已持久化用户消息与助手回复；完整 URL `GET /api/v1/ai/profile-sessions/{session_id}/turns`；HTTP Method `GET`；需要登录（Bearer Token）；权限：仅本人；请求 `Content-Type`：无请求体；响应 `Content-Type`：`application/json`；成功状态码 `200 OK`。这是对同路径既有 `POST` 方法的加法兼容，不改变提交回答契约。
+
+#### 请求参数
+
+| 参数名 | 位置 | 类型 | 必填 | 默认值 | 校验规则 | 业务含义 | 合法示例 | 非法示例 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `session_id` | path | string | 是 | 无 | 1-64 位，`^[a-z0-9_]+$` | 要恢复的会话 ID | `3f2a9c0e1b4d4a5b8c7d6e5f4a3b2c1d` | `../../other` |
+| `before_turn_no` | query | integer 或 null | 否 | `null` | `>=1`，exclusive | 读取该轮次之前的更早记录；首次请求省略 | `39` | `0` |
+| `limit` | query | integer | 否 | `50` | `1..100` | 单页最多返回的 turn 数 | `50` | `101` |
+
+#### 请求体示例
+
+无请求体。
+
+合法请求：
+
+```http
+GET /api/v1/ai/profile-sessions/3f2a9c0e1b4d4a5b8c7d6e5f4a3b2c1d/turns?limit=50 HTTP/1.1
+Authorization: Bearer <access_token>
+```
+
+更早一页：
+
+```http
+GET /api/v1/ai/profile-sessions/3f2a9c0e1b4d4a5b8c7d6e5f4a3b2c1d/turns?before_turn_no=39&limit=50 HTTP/1.1
+Authorization: Bearer <access_token>
+```
+
+非法请求（游标为 0）：
+
+```http
+GET /api/v1/ai/profile-sessions/3f2a9c0e1b4d4a5b8c7d6e5f4a3b2c1d/turns?before_turn_no=0 HTTP/1.1
+Authorization: Bearer <access_token>
+```
+
+响应：`422 Unprocessable Entity`，不访问会话数据。
+
+#### 返回参数
+
+| 字段 | 类型 | 必返 | 空值含义 | 枚举含义 | 业务含义 | 示例值 |
+| --- | --- | --- | --- | --- | --- | --- |
+| `session_id` | string | 是 | — | — | 当前会话 ID | `3f2a9c0e...` |
+| `subject` | string | 是 | — | `personal/ideal_partner` | 会话画像主体 | `personal` |
+| `turns` | array | 是 | 空数组表示会话尚无消息或该页已读完 | — | 当前页历史，始终按 `turn_no` 升序 | 见下 |
+| `turns[].turn_id` | string | 是 | — | — | 服务端 turn ID，用于前端重连去重 | `t-39` |
+| `turns[].turn_no` | integer | 是 | — | `>=1` | 会话内严格递增轮次 | `39` |
+| `turns[].role` | string | 是 | — | `user/assistant` | 消息角色 | `user` |
+| `turns[].answer_text` | string | 是 | — | 1-2000 字 | 持久化消息正文；前端适配为 `content` | `我在关系里比较慢热` |
+| `turns[].client_turn_id` | string | 是 | — | — | 客户端或助手持久化轮次 ID | `client-39` |
+| `turns[].created_at` | string(datetime) 或 null | 否 | 历史兼容行没有时间时为 `null` | UTC ISO-8601 | 消息创建时间 | `2026-09-03T10:00:00` |
+| `next_before_turn_no` | integer 或 null | 是 | `null` 表示没有更早记录 | `>=1` | 下一页应传入的 exclusive 游标，即本页最小 `turn_no` | `39` |
+
+#### 返回示例
+
+成功（200）：
+
+```json
+{
+  "session_id": "3f2a9c0e1b4d4a5b8c7d6e5f4a3b2c1d",
+  "subject": "personal",
+  "turns": [
+    {
+      "turn_id": "t-39",
+      "turn_no": 39,
+      "role": "user",
+      "answer_text": "我在关系里比较慢热",
+      "client_turn_id": "client-39",
+      "created_at": "2026-09-03T10:00:00"
+    }
+  ],
+  "next_before_turn_no": 39
+}
+```
+
+无消息或已读完（200）：
+
+```json
+{
+  "session_id": "3f2a9c0e1b4d4a5b8c7d6e5f4a3b2c1d",
+  "subject": "personal",
+  "turns": [],
+  "next_before_turn_no": null
+}
+```
+
+#### 使用方法与业务规则
+
+- 前置条件：已登录；会话存在且属于当前用户。不存在和非本人统一返回相同 404，防止枚举他人会话。
+- 调用顺序：进入或 WebSocket 恢复会话后，首次省略 `before_turn_no` 读取最近一页；上拉时把响应的 `next_before_turn_no` 原样传回，直到它为 `null`。
+- 幂等与防重：`GET` 幂等且不需要 `Idempotency-Key`；前端按 `turn_id` 与本地消息去重。
+- 频率/额度/次数限制：无独立额度；遵守登录与全局只读请求限流。
+- 状态流转：只读，不改变会话、turn、草稿或任务状态；已结束会话历史仍可由本人恢复查看。
+- 边界场景：首次页读取最新 `limit` 条但按升序返回；游标 exclusive，页间不重复；历史读取失败不得清空前端已有消息。
+- 兼容性：加法接口；原 `POST /profile-sessions/{session_id}/turns` 保持不变。响应继续使用数据库字段名 `answer_text`，现有前端已兼容映射为 `content`。
+
+#### 错误
+
+| HTTP | 业务码 | 触发条件 | retryable | 错误响应摘要 | 前端处理建议 |
+| --- | --- | --- | --- | --- | --- |
+| 401 | — | 未登录或 Token 失效 | false | `{"detail":"请先登录"}` | 引导重新登录 |
+| 404 | `PROFILE_SESSION_NOT_FOUND` | 会话不存在或不属于当前用户 | false | `detail.code=PROFILE_SESSION_NOT_FOUND` | 停止恢复，不区分不存在与越权 |
+| 422 | — | `session_id` 格式非法、`before_turn_no < 1` 或 `limit` 超出 1..100 | false | FastAPI 参数校验错误 | 修正参数，不重试原请求 |
+| 503 | `AI_TEMPORARILY_UNAVAILABLE` | 数据库或历史仓储暂时失败 | true | `detail.code=AI_TEMPORARILY_UNAVAILABLE` | 保留本地消息，稍后重试同一 GET |
 
 ---
 
@@ -749,7 +860,9 @@ Content-Type: application/json
 
 ## 9. 发布已确认字段
 
-**基本信息**：只把 `confirmed` 字段写入不可变 `ai_profile_revision` 并创建投影任务；完整 URL `POST /api/v1/ai/profile-drafts/{draft_id}/publish`；HTTP Method `POST`；需要登录（Bearer Token）；权限：仅本人、至少 5 个 confirmed 字段（`confirmed_count >= 5`）、主体权限正确；请求 `Content-Type`：无请求体（`expected_revision` 通过查询参数）；响应 `Content-Type`：`application/json`；成功状态码 `202 Accepted`。
+**基本信息**：只把 `confirmed` 字段写入不可变 `ai_profile_revision` 并创建投影任务；完整 URL `POST /api/v1/ai/profile-drafts/{draft_id}/publish`；HTTP Method `POST`；需要登录（Bearer Token）；权限：仅本人、至少 `ai_profile_min_fields` 个 confirmed 字段（默认 7）、主体权限正确；请求 `Content-Type`：无请求体（`expected_revision` 通过查询参数）；响应 `Content-Type`：`application/json`；成功状态码 `202 Accepted`。
+
+> **墨相师 master 会话门槛（2026-09-03）**：草稿所属会话 `session_kind='master'` 时，`entry` 条目与 `structured` 字段一并计入 `confirmed_count`（自然对话以六维条目为主要产物，沿用 structured-only 会卡死发布）；且「我的墨相」（personal）发布前必须已确认 `age` 与 `city_code`，缺任一项返回 `400 AI_INPUT_INVALID`。愿遇之相不受此底线约束；旧 build/update 会话仍只数 structured 字段。
 
 ### 请求参数
 
@@ -795,7 +908,7 @@ Idempotency-Key: profile-publish-20260807-02
 | `revision_id` | integer | 否 | `null` 表示回放 | — | 新建的不可变版本 ID | `42` |
 | `revision_no` | integer | 否 | `null` 表示回放 | `>=1` | 该主体的发布版本号 | `1` |
 | `subject` | string | 否 | `null` 表示回放 | `personal/ideal_partner` | 发布主体 | `personal` |
-| `field_count` | integer | 否 | `null` 表示回放 | `>=5`（新建发布至少 5 个） | 本次发布写入的 confirmed 字段数 | `5` |
+| `field_count` | integer | 否 | `null` 表示回放 | `>=` 发布门槛（默认 7；master 含 entry） | 本次发布写入的 confirmed 字段数 | `7` |
 
 ### 返回示例
 
@@ -837,19 +950,19 @@ Idempotency-Key: profile-publish-20260807-02
 
 ### 使用方法与业务规则
 
-- 前置条件：草稿属于本人；至少 5 个 `confirmed` 字段（`confirmed_count >= 5`）；`expected_revision` 匹配。
+- 前置条件：草稿属于本人；至少 `ai_profile_min_fields` 个 `confirmed` 字段（默认 7；master 会话 entry 计入，personal 另需已确认 `age`+`city_code`，见 §9 门槛说明）；`expected_revision` 匹配。
 - 调用顺序：先 PATCH 确认字段，再 publish；发布成功后草稿置为 `published`、所属会话 `published`（历史只读）。
 - 幂等与防重：`Idempotency-Key` 必填；同 key 同 `draft_id + expected_revision` 回放同一投影任务，**不重复写 revision、不重复递增 revision 向量**；不同 payload 返回 `409 TASK_IDEMPOTENCY_CONFLICT`。
 - 频率/额度/次数限制：无独立额度。
 - 状态流转：`confirmed` 字段 → 不可变 `ai_profile_revision`（含逐字段 content_hash/source revision）→ 只递增对应主体 revision（personal → `profile_revision`，ideal_partner → `preference_revision`，互不干扰）→ 写一条 outbox 事件 → 入队投影任务。**未确认字段永不进入发布版本与投影。**
-- 边界场景：`confirmed_count < 5` 返回 `400 AI_INPUT_INVALID`（仅 `confirmed` 计数，`suggested`/`rejected`/`deleted` 不计入且不进入 revision）；版本不匹配返回 `409 DRAFT_VERSION_CONFLICT`；主体隔离保证 ideal_partner 永不写 personal 事实。
+- 边界场景：`confirmed_count` 低于门槛（默认 7）返回 `400 AI_INPUT_INVALID`（build/update 仅 `confirmed` structured 计数，`suggested`/`rejected`/`deleted` 不计入且不进入 revision；master 会话 entry 计入，personal 另需 `age`+`city_code`）；版本不匹配返回 `409 DRAFT_VERSION_CONFLICT`；主体隔离保证 ideal_partner 永不写 personal 事实。
 - 前端处理建议：保存 `revision_no`/`revision_id` 用于历史展示；通过 `GET /api/v1/ai/tasks/{task_id}` 轮询投影任务。
 
 ### 错误
 
 | HTTP | 业务码 | 触发条件 | retryable | 前端处理建议 |
 | --- | --- | --- | --- | --- |
-| 400 | `AI_INPUT_INVALID` | 缺少/非法 `expected_revision` 查询参数、`confirmed_count < 5`、Idempotency-Key 非法 | false | 修正参数或先确认至少五个字段，不重试版本类错误 |
+| 400 | `AI_INPUT_INVALID` | 缺少/非法 `expected_revision` 查询参数、`confirmed_count` 低于门槛（默认 7）、master personal 缺 `age`/`city_code`、Idempotency-Key 非法 | false | 修正参数或先确认足够字段（master 个人画像补齐年龄与城市），不重试版本类错误 |
 | 404 | `PROFILE_DRAFT_NOT_FOUND` | 草稿不存在或非本人 | false | 提示草稿不存在 |
 | 409 | `DRAFT_VERSION_CONFLICT` | `expected_revision` 不匹配 | false | 拉取最新草稿，提示合并 |
 | 409 | `RESULT_STALE` | 草稿已进入只读终态（`published`/`deleted`/`cancelled`）；守卫先于乐观锁，已删除草稿不得用原 `expected_revision` 重新发布 | false | 提示草稿已终态；删除意图不可被静默撤销 |
@@ -1184,11 +1297,53 @@ Idempotency-Key: profile-field-delete-20260807-01
 
 ---
 
-## 16. P-04 语音/ASR（本期不实现，仅记录启动条件）
+## 16. P-04 语音/ASR（协议已实现，默认关闭）
 
-P-04 语音输入、ASR、TTS **不在本任务实现，也不提供任何音频路由**。只有以下条件全部满足后才可另立计划启动：
+P-04 的 STT/TTS 与实时 ASR 协议已经存在，但默认关闭，且不作为本次画像链路的验收前置。`/api/v1/voice/conversation` 与 `/api/v1/voice/moxiang-master` 的音频分支只有在以下条件全部满足后才能启用：
 
 - 产品和合规书面批准语音/转写用途、语言、地域、原始音频与 transcript 保留期、导出和删除 API。
 - Provider 完成 DPA/数据出境/训练用途审查，且可以按 task/user 证明删除。
 - 音频上传有格式、时长、病毒、内容治理和访问控制；失败可稳定回退文字输入，不重复扣费。
-- 未获批前所有 AI 开关保持关闭（`AI_FEATURE_DISABLED`）。
+- 未获批前语音相关开关保持关闭（`AI_FEATURE_DISABLED`）；墨相师 WebSocket 的 `text_message` 文字旅程不依赖 ASR。
+
+---
+
+## 17. 墨相师统一旅程与下游投影（2026-09-02）
+
+墨相师生产主路径统一为 `moxiang_journey`：
+
+```text
+WS /voice/moxiang-master
+  → ai_profile_turn（用户回答先落库）
+  → moxiang_candidate_extract（候选理解池）
+  → 六维进度 / build_invite
+  → 接受邀请后写 ai_profile_draft_field(suggested)
+  → PATCH confirm
+  → POST publish
+  → ai_profile_revision + profile_projection
+  → personal_searchable / personal_compatibility
+  → AI 搜索、资料合拍参考读取
+```
+
+六个固定维度为 `personality_social`、`intimacy_pattern`、`lifestyle`、
+`emotional_expression`、`relationship_boundaries`、`future_expectations`。
+候选理解可以来自结构化字段或自由条目；维度只由服务端白名单映射，客户端不能提交任意维度。
+每一条已持久化的用户 turn 由 `moxiang_candidate_extract` 经统一
+`AIGateway.structured_extract(session_kind="master")` 生成候选；任务载荷只保存
+`session_id/turn_id/client_turn_id/subject`，不保存原文。Provider 超时或校验失败时
+任务按统一重试/失败规则处理，不会用未验证文本直接写候选池。
+
+其中，master Provider 对用户明确陈述的白名单事实输出 `fields`（例如城市、兴趣、
+关系目标），并对无法归入固定字段但属于六维画像的内容输出 `patches`。两类结果均先
+写入 `ai_profile_candidate`，只有用户接受构建邀请并逐项确认后才可能进入发布版本；
+这不是对现有 REST/WS 协议的破坏性变更。
+
+下游准入规则：
+
+- 只有 `confirmed` 字段能进入不可变 `ai_profile_revision`。
+- 只有已发布 revision 且 `profile_text_extract` 授权仍有效，才会生成 `personal_searchable` 与 `personal_compatibility` 投影。
+- `ideal_partner_preference` 仅 `self_only`，不会作为候选资料泄露。
+- 搜索与匹配读取投影时重新校验授权、版本向量、可见性和过期状态；撤回或删除会使结果失效。
+- 当前搜索页和首页展示不主动调用新 AI 搜索/兼容度接口；接口已提供给后续接入，旧推荐 `match_score` 继续保持 `legacy-rule-v1` 语义。
+
+历史恢复契约：统一请求层的 `{ success, data }` 包由前端 `api/ai-moxiang.uts` 解包；后端 `answer_text` 映射为消息 `content`。错误响应不会覆盖当前本地消息流，空会话可安全恢复。

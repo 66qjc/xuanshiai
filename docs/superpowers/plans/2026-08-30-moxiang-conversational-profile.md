@@ -1,4 +1,8 @@
-# 墨相师对话建构（Moxiang Conversational Profile）实施计划
+# 墨相师对话建构（Moxiang Conversational Profile）实施计划（已于 2026-09-02 被实时整理旅程替代）
+
+> 历史记录：本计划描述的 `profile_build`、确认式 `progress` 和 master
+> `profile_extract` 已退役。当前对外协议以
+> [`docs/api/墨相师实时整理WebSocket.md`](../../api/墨相师实时整理WebSocket.md) 为准。
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 

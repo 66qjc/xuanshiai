@@ -38,6 +38,7 @@ from app.services.ai.profile import (
     delete_ai_profile_field,
     list_profile_revisions,
     load_owned_draft,
+    missing_master_publish_floor_fields,
     publish_profile_draft,
     restore_profile_revision,
 )
@@ -164,6 +165,9 @@ class PublishFakeSession(FakeProfileSession):
             if session is not None:
                 session["status"] = "published"
                 session["active_status"] = 0
+                # 生产 SQL 同步推进 journey_stage（Contract §1.2 终态）。
+                if "journey_stage = 'published'" in sql:
+                    session["journey_stage"] = "published"
                 session["ended_at"] = _now()
                 session["updated_at"] = _now()
             return _WriteResult(rowcount=1)
@@ -779,6 +783,27 @@ async def test_publish_writes_confirmed_fields_only(profile_store) -> None:
         "income_band",
         "marriage_status",
     ]
+
+
+@pytest.mark.asyncio
+async def test_publish_advances_session_journey_stage(profile_store) -> None:
+    """发布必须把旅程推到 published 终态，否则 state 永远报 building。"""
+    session = await profile_store.seed_session(owner_user_id=10, subject="personal")
+    session["journey_stage"] = "building"
+    draft = await profile_store.seed_draft(
+        owner_user_id=10,
+        subject="personal",
+        fields=_PUBLISHABLE_CONFIRMED_FIELDS,
+        revision=1,
+    )
+    profile_store.drafts_by_id[draft["draft_id"]]["session_id"] = session["session_id"]
+    await profile_store.confirm_all(draft["draft_id"], owner_user_id=10, expected_revision=1)
+    await profile_store.publish(
+        draft["draft_id"], owner_user_id=10, expected_revision=2
+    )
+    stored = profile_store.sessions[session["session_id"]]
+    assert stored["status"] == "published"
+    assert stored["journey_stage"] == "published"
 
 
 @pytest.mark.asyncio
@@ -1585,3 +1610,40 @@ async def test_delete_queued_task_is_persisted(profile_store) -> None:
     assert set(payload) == {"scope", "resource_id", "version", "purge_deadline"}
     assert payload["scope"] == "profile"
     assert payload["resource_id"] == "profile:10:personal"
+
+
+# --- 2026-09-03 产品决策 #14：旅程个人画像发布底线（age + city_code）纯函数单测 ---
+
+
+def test_master_publish_floor_personal_complete() -> None:
+    """个人 master 草稿同时确认 age 与 city_code 时无缺口。"""
+    assert missing_master_publish_floor_fields(
+        "personal", {"age", "city_code", "interest_tags"}
+    ) == []
+
+
+def test_master_publish_floor_personal_missing_age() -> None:
+    """缺年龄时只报 age（保持声明顺序）。"""
+    assert missing_master_publish_floor_fields(
+        "personal", {"city_code"}
+    ) == ["age"]
+
+
+def test_master_publish_floor_personal_missing_both() -> None:
+    """两项都缺时按 age、city_code 顺序返回。"""
+    assert missing_master_publish_floor_fields("personal", set()) == [
+        "age",
+        "city_code",
+    ]
+
+
+def test_master_publish_floor_personal_missing_city() -> None:
+    """缺城市时只报 city_code。"""
+    assert missing_master_publish_floor_fields("personal", {"age"}) == [
+        "city_code",
+    ]
+
+
+def test_master_publish_floor_ideal_partner_has_no_floor() -> None:
+    """愿遇之相不受个人发布底线约束。"""
+    assert missing_master_publish_floor_fields("ideal_partner", set()) == []

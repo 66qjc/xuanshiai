@@ -5,7 +5,7 @@
 与 ``/voice/conversation`` 的区别：
 - 使用墨相师人设提示词（非 voice_reply 的 ≤30 字资料采集）
 - 维护多轮对话历史（持久化轮次在 WS 建立时恢复，连接内继续累积）
-- 不做画像字段抽取
+- 最终文本进入异步候选抽取，候选完成后实时推进六维理解进度
 - 新增 ``text_message`` 文字通道（文字模式不经 ASR）
 - 流式推送 ``ai_content`` 增量
 
@@ -13,7 +13,7 @@
 
 前端 → 后端::
 
-    {"type": "session_start", "mode": "profile_build"?,
+    {"type": "session_start", "mode": "moxiang_journey",
      "subject": "personal"?,
      "consentVersion": "profile-text-v1"?}
     {"type": "subject_switch", "subject": "ideal_partner"}
@@ -27,13 +27,12 @@
 
 后端 → 前端::
 
-    {"type": "session_ready", "session_id": "...", "subject": "personal",
-     "resumed": true, "new_session": false}
-    {"type": "subject_changed", "subject": "ideal_partner", "session_id": "...",
-     "resumed": true, "new_session": false}
-    {"type": "progress", "subject": "personal", "percent": 40.0,
-     "hard_done": 1, "hard_total": 3,
-     "entry_score": 1.5, "gate_met": false}      # 仅建构模式（mode=profile_build）
+    {"type": "journey_ready", "session_id": "...", "subject": "personal",
+     "journey_stage": "chatting", "resumed": true}
+    {"type": "extraction_status", "subject": "personal", "task_id": "...",
+     "status": "queued|processing|completed|failed"}
+    {"type": "journey_progress", "subject": "personal", "overall_percent": 40.0,
+     "dimensions": {"lifestyle": {"percent": 50.0, "evidence_count": 1}}}
     {"type": "confirm_card", "subject": "personal", "card_id": "c-...",
      "draft_id": "d-...",
      "expected_revision": 3, "items": [{"field_key": "...", "kind": "entry",
@@ -48,12 +47,9 @@
     {"type": "tts_audio", "audio_url": "...", "duration_ms": 3000}
     {"type": "error", "code": "...", "message": "..."}
 
-建构模式：``session_start`` 带 ``mode=profile_build`` 时绑定（或复用）master
-会话；``subject_switch`` 在同一聊天时间线内切换 personal / ideal_partner，
-两个主体分别维护 master 会话、进度、卡片与抽取轮询。用户轮次经
-``submit_profile_turn`` 落库并入队 ``profile_extract`` 任务，任务终态后推送
-带主体的 progress / confirm_card。不带 ``mode`` 为纯聊，行为与既有协议一致
-（不建会话、不推进度）。
+旅程模式：``session_start`` 必须带 ``mode=moxiang_journey``，绑定（或复用）
+master 会话。每一轮最终文本先持久化再入队独立候选任务；聊天回复不等待任务，
+任务完成后只推送安全的状态和六维进度，不向消息流泄露候选内容。
 
 门禁：语音模式需 ``ai_voice_conversation_enabled`` + ``ai_voice_enabled``；
 文字模式仅需 AI provider 非 mock。fail closed。
@@ -79,20 +75,22 @@ from app.services.ai.gateway import AIGateway
 from app.services.ai.base import ProviderError as AIProviderError
 from app.services.ai.profile import (
     AIConsentRequired,
+    AIInputError,
     ProfileSubject,
-    _load_active_draft_id_for_session,
-    _load_draft_field_rows,
-    _load_draft_row,
     create_master_session,
-    load_master_progress_snapshot,
     persist_master_assistant_reply,
-    submit_profile_turn,
 )
+from app.services.ai.journey import (
+    compose_journey_build_context,
+    list_session_candidates,
+    maybe_create_build_invite,
+    resolve_journey_invite,
+    submit_journey_turn,
+)
+from app.services.ai.journey_progress import calculate_journey_progress
 from app.services.ai.prompts.moxiang_master import (
-    OPENING_MESSAGE,
+    AI_ROLE_NAME,
     _format_narrative_context,
-    _missing_label,
-    build_build_context,
     opening_message_for_subject,
 )
 from app.services.voice.base import (
@@ -118,7 +116,7 @@ WS_MESSAGE_MAX_BYTES = STREAM_CHUNK_MAX_BYTES * 2
 # 用户消息文本长度上限。
 _MAX_TEXT_LENGTH = 2000
 
-_PROFILE_BUILD_MODE = "profile_build"
+_MOXIANG_JOURNEY_MODE = "moxiang_journey"
 
 
 def _check_voice_feature() -> str | None:
@@ -129,6 +127,17 @@ def _check_voice_feature() -> str | None:
         return "AI_FEATURE_DISABLED"
     try:
         require_ai_feature(AiFeature.VOICE_CONVERSATION, settings)
+    except Exception:  # noqa: BLE001
+        return "AI_FEATURE_DISABLED"
+    return None
+
+
+def _check_journey_feature() -> str | None:
+    """The real-time journey is opt-in and inherits the profile safety gate."""
+    if not bool(getattr(settings, "ai_moxiang_journey_enabled", False)):
+        return "AI_FEATURE_DISABLED"
+    try:
+        require_ai_feature(AiFeature.PROFILE, settings)
     except Exception:  # noqa: BLE001
         return "AI_FEATURE_DISABLED"
     return None
@@ -189,14 +198,44 @@ async def _load_narrative_context(user_id: int) -> str:
         return ""
 
 
+async def _journey_build_context(session_id: str, subject: str) -> str | None:
+    """Project the session's candidates into 知遇's build-mode context.
+
+    Returns None when there is no journey session or the read fails, so the
+    caller leaves the orchestrator in pure-chat mode rather than crashing the
+    reply path on a context-refresh hiccup.
+    """
+    if not session_id or _db_session_factory is None:
+        return None
+    try:
+        async with _db_session_factory() as db:
+            return await compose_journey_build_context(
+                db, session_id=session_id, subject=subject
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(
+            "moxiang_build_context_failed session_id=%s err=%s",
+            session_id,
+            type(exc).__name__,
+        )
+        return None
+
+
 async def _push_streamed_reply(
     ws: WebSocket,
     orchestrator: MoxiangMasterOrchestrator,
     user_text: str,
     *,
     request_id: str,
+    build_context: str | None = None,
 ) -> None:
-    """流式推送墨相师回复：ai_thinking → ai_content* → ai_reply。"""
+    """流式推送墨相师回复：ai_thinking → ai_content* → ai_reply。
+
+    ``build_context`` 非 None 时刷新建构模式上下文（缺失硬字段/进度/已确认摘要），
+    让知遇围绕尚未了解的部分提问；None 表示保持当前模式不变（纯聊不注入）。
+    """
+    if build_context is not None:
+        orchestrator.set_build_context(build_context)
     await _send_json(ws, {"type": "ai_thinking"})
     full_reply = ""
     try:
@@ -219,7 +258,7 @@ async def _push_streamed_reply(
             type(exc).__name__,
         )
         await _send_error(
-            ws, "AI_TEMPORARILY_UNAVAILABLE", "墨相师暂时无法回复"
+            ws, "AI_TEMPORARILY_UNAVAILABLE", f"{AI_ROLE_NAME}暂时无法回复"
         )
         return
     if full_reply:
@@ -240,30 +279,10 @@ async def _drain_partials(ws: WebSocket, asr_client: Any) -> None:
         )
 
 
-# profile_extract 任务的终态集合（AiTaskStatus 无 ``dead``；取消/被取代同样
-# 停止轮询——任务不会再推进，继续轮询只会空转 30s）。
-_EXTRACT_TERMINAL_STATUSES = frozenset(
+# 候选任务终态。每个任务均独立观察，后续消息绝不取消前一轮的结果推送。
+_CANDIDATE_TERMINAL_STATUSES = frozenset(
     {"succeeded", "failed", "cancelled", "superseded"}
 )
-
-
-async def _build_context_snapshot(
-    db: Any, user_id: int, session_id: str, subject: str
-) -> str:
-    """建构模式上下文快照（Task 4）：缺失硬字段 + 已确认摘要 + 进度。
-
-    缺失字段在路由侧先经 ``_missing_label`` 渲染成中文标签再交给
-    ``build_build_context``（其内部同源渲染兜底未知 key），确保提示词里
-    不出现英文 field_key。
-    """
-    snap = await load_master_progress_snapshot(db, session_id, user_id)
-    missing = [_missing_label(key) for key in snap.missing_hard]
-    return build_build_context(
-        missing,
-        snap.confirmed_summary,
-        snap.progress.percent,
-        subject=subject,
-    )
 
 
 async def _load_master_history(
@@ -291,127 +310,190 @@ async def _load_master_history(
     ]
 
 
-async def _push_progress_snapshot(
-    ws: WebSocket, user_id: int, session_id: str, subject: str
+async def _push_journey_progress(
+    ws: WebSocket, session_id: str, subject: str
 ) -> None:
-    """读会话已确认字段/条目并推 progress；读不到就静默跳过（不阻塞对话）。"""
+    """Project persisted candidates into the safe six-dimension wire payload."""
     if _db_session_factory is None:
         return
     try:
         async with _db_session_factory() as db:
-            snap = await load_master_progress_snapshot(db, session_id, user_id)
+            candidates = await list_session_candidates(
+                db, session_id=session_id, active_only=False
+            )
+        snapshot = calculate_journey_progress(candidates)
         await _send_json(
             ws,
             {
-                "type": "progress",
+                "type": "journey_progress",
                 "subject": subject,
-                "percent": snap.progress.percent,
-                "hard_done": snap.progress.hard_done,
-                "hard_total": snap.progress.hard_total,
-                "entry_score": snap.progress.entry_score,
-                "gate_met": snap.progress.gate_met,
+                "overall_percent": snapshot.overall_percent,
+                "dimensions": {
+                    key: {
+                        "percent": item.percent,
+                        "evidence_count": item.evidence_count,
+                    }
+                    for key, item in snapshot.dimensions.items()
+                },
             },
         )
     except Exception as exc:  # noqa: BLE001
         logger.debug(
-            "moxiang_progress_push_failed user_id=%s err=%s",
-            user_id,
+            "moxiang_journey_progress_push_failed session_id=%s err=%s",
+            session_id,
             type(exc).__name__,
         )
 
 
-async def _push_confirm_card(
-    ws: WebSocket, user_id: int, session_id: str, subject: str
+async def _maybe_push_build_invite(
+    ws: WebSocket, *, user_id: int, session_id: str, subject: str
 ) -> None:
-    """把活动草稿的 suggested 行推成 confirm_card（items 含 field_key/kind/
-    category/content + draft_id + expected_revision，前端可直接拿去调 REST
-    确认）；确认门槛达标时再推 publish_ready。读不到就静默跳过。"""
+    """Create/replay the one pending invite only after durable task success."""
     if _db_session_factory is None:
         return
     try:
         async with _db_session_factory() as db:
-            draft_id = await _load_active_draft_id_for_session(db, session_id)
-            if draft_id is None:
-                return
-            draft_row = await _load_draft_row(db, draft_id)
-            if draft_row is None:
-                return
-            rows = await _load_draft_field_rows(db, draft_id)
-            snap = await load_master_progress_snapshot(db, session_id, user_id)
-        items: list[dict[str, Any]] = []
-        for row in rows:
-            if str(row.get("confirmation_status") or "suggested") != "suggested":
-                continue
-            raw_value = row.get("value_json")
-            try:
-                value = (
-                    json.loads(raw_value)
-                    if isinstance(raw_value, str) and raw_value
-                    else None
-                )
-            except json.JSONDecodeError:
-                value = None
-            items.append(
-                {
-                    "field_key": str(row["field_key"]),
-                    "kind": str(row.get("field_kind") or "structured"),
-                    "category": row.get("category"),
-                    "content": row.get("content"),
-                    "display_value": row.get("display_value"),
-                    "value": value,
-                }
+            invite = await maybe_create_build_invite(
+                db, session_id=session_id, user_id=user_id, subject=subject
             )
-        if items:
-            await _send_json(
-                ws,
-                {
-                    "type": "confirm_card",
-                    "subject": subject,
-                    "card_id": f"c-{uuid.uuid4().hex}",
-                    "draft_id": str(draft_id),
-                    "expected_revision": int(
-                        draft_row.get("expected_revision") or 0
-                    ),
-                    "items": items,
-                },
-            )
-        if snap.progress.gate_met:
-            await _send_json(
-                ws,
-                {
-                    "type": "publish_ready",
-                    "subject": subject,
-                    "summary": (
-                        "你的个人画像已经可以成稿了"
-                        if subject == "personal"
-                        else "你的愿遇之相已经可以成稿了"
-                    ),
-                },
-            )
+            await db.commit()
+        if invite is None:
+            return
+        await _send_json(
+            ws,
+            {
+                "type": "build_invite",
+                "subject": invite.subject,
+                "invite_id": invite.invite_id,
+                "summary_items": list(invite.summary_items),
+                "effective_turn_count": invite.effective_turn_count,
+                "dimension_count": invite.dimension_count,
+                "candidate_count": invite.candidate_count,
+                "journey_stage": "building",
+            },
+        )
     except Exception as exc:  # noqa: BLE001
-        logger.debug(
-            "moxiang_confirm_card_push_failed user_id=%s err=%s",
-            user_id,
+        logger.warning(
+            "moxiang_invite_create_failed session_id=%s err=%s",
+            session_id,
             type(exc).__name__,
         )
 
 
-async def _wait_extract_and_push(
-    ws: WebSocket,
-    user_id: int,
-    session_id: str,
-    subject: str,
-    task_id: str,
+async def _push_confirm_card_for_draft(
+    ws: WebSocket, *, subject: str, draft_id: str
 ) -> None:
-    """轮询 profile_extract 任务终态（≤30s），终态后推 progress/confirm_card。
-
-    断线/新轮次由调用方 cancel，不产生幽灵任务；30s 未终态则本轮不推，
-    下一轮对话或重连时补推。
-    """
+    """Reuse the existing confirmation-card wire shape after invite acceptance."""
     if _db_session_factory is None:
         return
-    for _ in range(60):
-        await asyncio.sleep(0.5)
+    try:
+        async with _db_session_factory() as db:
+            draft_row = (
+                await db.execute(
+                    sql_text(
+                        "SELECT expected_revision FROM ai_profile_draft "
+                        "WHERE draft_id = :draft_id"
+                    ),
+                    {"draft_id": draft_id},
+                )
+            ).mappings().first()
+            rows = (
+                await db.execute(
+                    sql_text(
+                        "SELECT field_key, field_kind, category, content, display_value "
+                        "FROM ai_profile_draft_field WHERE draft_id = :draft_id "
+                        "AND confirmation_status = 'suggested' ORDER BY id ASC"
+                    ),
+                    {"draft_id": draft_id},
+                )
+            ).mappings().all()
+        if draft_row is None or not rows:
+            return
+        await _send_json(
+            ws,
+            {
+                "type": "confirm_card",
+                "subject": subject,
+                "card_id": f"c-{uuid.uuid4().hex}",
+                "draft_id": draft_id,
+                "expected_revision": int(draft_row.get("expected_revision") or 0),
+                "items": [
+                    {
+                        "field_key": str(row["field_key"]),
+                        "kind": str(row.get("field_kind") or "structured"),
+                        "category": row.get("category"),
+                        "content": row.get("content"),
+                        "display_value": row.get("display_value"),
+                    }
+                    for row in rows
+                ],
+            },
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "moxiang_confirm_card_push_failed draft_id=%s err=%s",
+            draft_id,
+            type(exc).__name__,
+        )
+
+
+async def _replay_pending_confirm_card(
+    ws: WebSocket, *, session_id: str, subject: str
+) -> None:
+    """WS 重连/切换主体时重放未确认完的确认卡。
+
+    确认卡此前只在接受邀请那一刻推送一次；用户中途退出再进，卡片即丢失，
+    草稿里的 suggested 字段无人可确认，旅程卡死在 building。这里复用
+    ``_push_confirm_card_for_draft``：无未完成草稿或草稿已全部确认时自动跳过。
+    """
+    if _db_session_factory is None or not session_id:
+        return
+    try:
+        async with _db_session_factory() as db:
+            row = (
+                await db.execute(
+                    sql_text(
+                        "SELECT draft_id FROM ai_profile_draft "
+                        "WHERE session_id = :session_id AND status = 'draft' "
+                        "ORDER BY updated_at DESC LIMIT 1"
+                    ),
+                    {"session_id": session_id},
+                )
+            ).mappings().first()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "moxiang_confirm_card_replay_lookup_failed session_id=%s err=%s",
+            session_id,
+            type(exc).__name__,
+        )
+        return
+    if row is None:
+        return
+    await _push_confirm_card_for_draft(
+        ws, subject=subject, draft_id=str(row["draft_id"])
+    )
+
+
+async def _wait_candidate_and_push(
+    ws: WebSocket, user_id: int, session_id: str, subject: str, task_id: str
+) -> None:
+    """Watch one durable candidate task without cancelling other turns."""
+    if _db_session_factory is None:
+        return
+    await _send_json(
+        ws,
+        {
+            "type": "extraction_status",
+            "subject": subject,
+            "task_id": task_id,
+            "status": "processing",
+        },
+    )
+    # 快慢两段轮询：快段 0.5s×30s 保实时性；慢段 2s×6min 兜住供应商重试
+    # （实测 dots 单次抽取可到 6 分钟）。窗口内任务未到终态则静默放弃，
+    # 前端保留"正在理解"占位，进度以重连后的 journey_ready 快照兜底。
+    for poll_delay in (0.5,) * 60 + (2.0,) * 180:
+        await asyncio.sleep(poll_delay)
         try:
             async with _db_session_factory() as db:
                 row = (
@@ -425,59 +507,72 @@ async def _wait_extract_and_push(
                 ).mappings().first()
         except Exception as exc:  # noqa: BLE001
             logger.debug(
-                "moxiang_extract_poll_failed task_id=%s err=%s",
+                "moxiang_candidate_poll_failed task_id=%s err=%s",
                 task_id,
                 type(exc).__name__,
             )
             return
         if row is None:
             return
-        if str(row["status"]) in _EXTRACT_TERMINAL_STATUSES:
+        if str(row["status"]) in _CANDIDATE_TERMINAL_STATUSES:
             break
     else:
         return
-    await _push_progress_snapshot(ws, user_id, session_id, subject)
-    await _push_confirm_card(ws, user_id, session_id, subject)
+    terminal_status = str(row["status"])
+    if terminal_status != "succeeded":
+        await _send_json(
+            ws,
+            {
+                "type": "extraction_status",
+                "subject": subject,
+                "task_id": task_id,
+                "status": "failed",
+            },
+        )
+        return
+    await _send_json(
+        ws,
+        {
+            "type": "extraction_status",
+            "subject": subject,
+            "task_id": task_id,
+            "status": "completed",
+        },
+    )
+    await _push_journey_progress(ws, session_id, subject)
+    await _maybe_push_build_invite(
+        ws, user_id=user_id, session_id=session_id, subject=subject
+    )
 
 
-async def _submit_build_turn(
+async def _submit_journey_candidate_turn(
     user_id: int, session_id: str, client_turn_id: str, text_content: str
 ) -> str:
-    """建构轮次：原文落库 + 入队 profile_extract；返回 task_id（回放为空串）。
-
-    异常不吞：会话 stale/授权缺失等沿既有 turn 错误路径上抛（外层统一
-    error 处理），避免静默吞掉导致状态漂移。
-    """
+    """Persist one final transcript and enqueue its dedicated candidate task."""
     if _db_session_factory is None:
         return ""
     async with _db_session_factory() as db:
-        submission = await submit_profile_turn(
+        submission = await submit_journey_turn(
             db,
-            session_id,
-            user_id,
-            client_turn_id,
-            text_content,
-            idempotency_key=uuid.uuid4().hex,
+            session_id=session_id,
+            owner_user_id=user_id,
+            client_turn_id=client_turn_id,
+            answer_text=text_content,
         )
         await db.commit()
     return str(submission.task_id or "")
 
 
-async def _finish_build_turn(
+async def _finish_journey_turn(
     ws: WebSocket,
     orchestrator: MoxiangMasterOrchestrator,
     user_id: int,
     session_id: str,
     subject: str,
     task_id: str,
-    poll_tasks: dict[str, asyncio.Task[None]],
+    poll_tasks: set[asyncio.Task[None]],
 ) -> None:
-    """墨相师回复落库（assistant turn）+ 抽取轮询接管；text_message 与
-    audio_end 共用。每个主体会话单独持有轮询任务，互不取消。
-
-    ``persist_master_assistant_reply`` 经 ``load_owned_active_session`` 护栏：
-    stale/paused 会话抛异常沿既有错误路径上抛，不静默吞掉导致状态漂移。
-    """
+    """Persist assistant reply, then independently watch the candidate task."""
     if not session_id:
         return
     reply_text = orchestrator._last_reply_text  # noqa: SLF001 — listen 分支同款私有读取
@@ -489,12 +584,11 @@ async def _finish_build_turn(
             await db.commit()
     if not task_id:
         return
-    old_task = poll_tasks.get(session_id)
-    if old_task is not None:
-        old_task.cancel()
-    poll_tasks[session_id] = asyncio.create_task(
-        _wait_extract_and_push(ws, user_id, session_id, subject, task_id)
+    watch_task = asyncio.create_task(
+        _wait_candidate_and_push(ws, user_id, session_id, subject, task_id)
     )
+    poll_tasks.add(watch_task)
+    watch_task.add_done_callback(poll_tasks.discard)
 
 
 @router.websocket("/moxiang-master")
@@ -542,13 +636,12 @@ async def moxiang_master_conversation(
     )
     asr_client: Any = None
     partial_task: asyncio.Task[None] | None = None
-    # 双画像建构状态：每个主体绑定独立 master 会话与抽取轮询任务；
-    # orchestrator 仍保留同一条连接级聊天时间线。
+    # 每个主体绑定独立的自然对话会话；回复上下文仍属于当前连接。
     sessions_by_subject: dict[str, str] = {}
     active_subject = ProfileSubject.PERSONAL.value
-    poll_tasks: dict[str, asyncio.Task[None]] = {}
-    build_mode_active = False
-    build_consent_version = "profile-text-v1"
+    poll_tasks: set[asyncio.Task[None]] = set()
+    journey_active = False
+    journey_consent_version = "profile-text-v1"
 
     try:
         while True:
@@ -567,140 +660,78 @@ async def moxiang_master_conversation(
             msg_type = message.get("type")
 
             if msg_type == "session_start":
-                # 读取用户画像上下文
+                requested_mode = str(message.get("mode", ""))
+                if requested_mode != _MOXIANG_JOURNEY_MODE:
+                    await _send_error(ws, "AI_INPUT_INVALID", "请使用最新墨相师旅程")
+                    continue
+                journey_error = _check_journey_feature()
+                if journey_error is not None:
+                    await _send_error(ws, journey_error, "墨相师连续旅程当前未启用")
+                    continue
+                requested_subject = str(message.get("subject") or "personal")
+                if requested_subject not in {
+                    ProfileSubject.PERSONAL.value,
+                    ProfileSubject.IDEAL_PARTNER.value,
+                }:
+                    await _send_error(ws, "AI_INPUT_INVALID", "画像主体非法")
+                    continue
+                if _db_session_factory is None:
+                    await _send_error(ws, "AI_TEMPORARILY_UNAVAILABLE", "旅程暂不可用")
+                    continue
                 narrative_ctx = await _load_narrative_context(user_id)
                 orchestrator.set_narrative_context(narrative_ctx)
-                requested_mode = str(message.get("mode", ""))
-                build_mode = requested_mode == _PROFILE_BUILD_MODE
-                requested_subject = str(message.get("subject") or "personal")
-                bound_session_id = ""
-                bound_session_new = False
-                if not build_mode:
-                    # 纯聊：不建会话、不推进度（行为与既有协议一致）。
-                    build_mode_active = False
-                    # A mode switch to pure chat must also detach every
-                    # portrait binding and stop replay workers from the prior
-                    # build session; otherwise a late card/progress push could
-                    # leak into the pure-chat timeline.
-                    sessions_by_subject.clear()
-                    active_subject = ProfileSubject.PERSONAL.value
-                    for poll_task in poll_tasks.values():
-                        poll_task.cancel()
-                    poll_tasks.clear()
-                    orchestrator.set_build_context("")
-                elif _db_session_factory is not None:
-                    # 建构模式：绑定（或复用）master 会话；fail-closed——
-                    # 授权缺失 AI_CONSENT_REQUIRED，DB/其他异常
-                    # AI_TEMPORARILY_UNAVAILABLE，且不得留下可用会话绑定。
-                    try:
-                        if requested_subject not in {
-                            ProfileSubject.PERSONAL.value,
-                            ProfileSubject.IDEAL_PARTNER.value,
-                        }:
-                            raise ValueError("subject 非法")
-                        requested_consent_version = str(
-                            message.get("consentVersion", "profile-text-v1")
+                consent_version = str(message.get("consentVersion", "profile-text-v1"))
+                try:
+                    async with _db_session_factory() as db:
+                        session = await create_master_session(
+                            db, user_id, ProfileSubject(requested_subject), consent_version
                         )
-                        async with _db_session_factory() as db:
-                            session = await create_master_session(
-                                db,
-                                user_id,
-                                ProfileSubject(requested_subject),
-                                requested_consent_version,
+                        stage_row = (
+                            await db.execute(
+                                sql_text(
+                                    "SELECT journey_stage FROM ai_profile_session "
+                                    "WHERE session_id = :session_id"
+                                ),
+                                {"session_id": session.session_id},
                             )
-                            await db.commit()
-                            bound_session_id = session.session_id
-                            bound_session_new = session.created
-                            build_ctx = await _build_context_snapshot(
-                                db,
-                                user_id,
-                                session.session_id,
-                                requested_subject,
-                            )
-                            history = await _load_master_history(
-                                db, session.session_id
-                            )
-                        sessions_by_subject[requested_subject] = bound_session_id
-                        active_subject = requested_subject
-                        build_consent_version = requested_consent_version
-                        build_mode_active = True
-                        orchestrator.set_build_context(build_ctx)
-                        orchestrator.hydrate_history(history)
-                    except Exception as exc:  # noqa: BLE001
-                        # 建构绑定失败后 fail-closed：不能继续沿用本连接此前
-                        # 成功绑定的画像会话；连接仍可作为纯聊继续使用。
-                        build_mode_active = False
-                        sessions_by_subject.clear()
-                        active_subject = ProfileSubject.PERSONAL.value
-                        orchestrator.set_build_context("")
-                        for poll_task in poll_tasks.values():
-                            poll_task.cancel()
-                        poll_tasks.clear()
-                        code = (
-                            "AI_CONSENT_REQUIRED"
-                            if isinstance(exc, AIConsentRequired)
-                            else (
-                                "AI_INPUT_INVALID"
-                                if isinstance(exc, ValueError)
-                                else "AI_TEMPORARILY_UNAVAILABLE"
-                            )
-                        )
-                        logger.warning(
-                            "moxiang_build_session_failed user_id=%s "
-                            "request_id=%s err=%s",
-                            user_id,
-                            request_id,
-                            type(exc).__name__,
-                        )
-                        await _send_error(
-                            ws, code, "画像建构通道暂不可用，可稍后重试"
-                        )
+                        ).mappings().first()
+                        await db.commit()
+                        history = await _load_master_history(db, session.session_id)
+                except Exception as exc:  # noqa: BLE001
+                    code = "AI_CONSENT_REQUIRED" if isinstance(exc, AIConsentRequired) else "AI_TEMPORARILY_UNAVAILABLE"
+                    await _send_error(ws, code, "墨相师旅程暂不可用，可稍后重试")
+                    continue
+                sessions_by_subject[requested_subject] = session.session_id
+                active_subject = requested_subject
+                journey_active = True
+                journey_consent_version = consent_version
+                orchestrator.hydrate_history(history)
                 await _send_json(
                     ws,
                     {
-                        "type": "session_ready",
-                        "session_id": bound_session_id,
+                        "type": "journey_ready",
+                        "session_id": session.session_id,
                         "subject": requested_subject,
-                        "resumed": bool(bound_session_id) and not bound_session_new,
-                        "new_session": bool(bound_session_id) and bound_session_new,
+                        "journey_stage": str(
+                            (stage_row or {}).get("journey_stage") or "chatting"
+                        ),
+                        "resumed": not session.created,
                     },
                 )
-                if bound_session_id:
-                    await _push_progress_snapshot(
-                        ws, user_id, bound_session_id, requested_subject
-                    )
-                    await _push_confirm_card(
-                        ws, user_id, bound_session_id, requested_subject
-                    )
-                # 仅真正新建的画像会话发送一次自然开场；重连/重复
-                # session_start 依靠持久化 turns 恢复上下文，不重复插入开场。
-                if not build_mode or not bound_session_id or bound_session_new:
+                await _push_journey_progress(ws, session.session_id, requested_subject)
+                if session.created:
                     await _send_json(
                         ws,
                         {
                             "type": "ai_reply",
                             "opening": True,
-                            "text": (
-                                opening_message_for_subject(requested_subject)
-                                if bound_session_id
-                                else OPENING_MESSAGE
-                            ),
+                            "text": opening_message_for_subject(requested_subject),
                         },
                     )
-                logger.info(
-                    "moxiang_session_start user_id=%s request_id=%s "
-                    "has_narrative=%s",
-                    user_id,
-                    request_id,
-                    bool(narrative_ctx),
-                )
-                if bound_session_id:
-                    logger.info(
-                        "moxiang_build_session_bound user_id=%s "
-                        "request_id=%s session_id=%s",
-                        user_id,
-                        request_id,
-                        bound_session_id,
+                else:
+                    # 重连恢复：把上次未确认完的卡片重新推回消息流。
+                    await _replay_pending_confirm_card(
+                        ws, session_id=session.session_id, subject=requested_subject
                     )
 
             elif msg_type == "subject_switch":
@@ -711,9 +742,9 @@ async def moxiang_master_conversation(
                 }:
                     await _send_error(ws, "AI_INPUT_INVALID", "画像主体非法")
                     continue
-                if not build_mode_active or _db_session_factory is None:
+                if not journey_active or _db_session_factory is None:
                     await _send_error(
-                        ws, "AI_INPUT_INVALID", "当前不是画像建构会话"
+                        ws, "AI_INPUT_INVALID", "当前不是墨相师旅程"
                     )
                     continue
                 try:
@@ -722,23 +753,25 @@ async def moxiang_master_conversation(
                             db,
                             user_id,
                             ProfileSubject(requested_subject),
-                            build_consent_version,
+                            journey_consent_version,
                         )
+                        stage_row = (
+                            await db.execute(
+                                sql_text(
+                                    "SELECT journey_stage FROM ai_profile_session "
+                                    "WHERE session_id = :session_id"
+                                ),
+                                {"session_id": session.session_id},
+                            )
+                        ).mappings().first()
                         await db.commit()
                         session_new = session.created
-                        build_ctx = await _build_context_snapshot(
-                            db,
-                            user_id,
-                            session.session_id,
-                            requested_subject,
-                        )
                         history = await _load_master_history(
                             db, session.session_id
                         )
                     # 只有目标会话和上下文均加载成功后才切换，失败时保持原主体。
                     sessions_by_subject[requested_subject] = session.session_id
                     active_subject = requested_subject
-                    orchestrator.set_build_context(build_ctx)
                     orchestrator.hydrate_history(history)
                 except Exception as exc:  # noqa: BLE001
                     code = (
@@ -753,19 +786,16 @@ async def moxiang_master_conversation(
                 await _send_json(
                     ws,
                     {
-                        "type": "subject_changed",
+                        "type": "journey_ready",
                         "subject": requested_subject,
                         "session_id": session.session_id,
                         "resumed": not session_new,
-                        "new_session": session_new,
+                        "journey_stage": str(
+                            (stage_row or {}).get("journey_stage") or "chatting"
+                        ),
                     },
                 )
-                await _push_progress_snapshot(
-                    ws, user_id, session.session_id, requested_subject
-                )
-                await _push_confirm_card(
-                    ws, user_id, session.session_id, requested_subject
-                )
+                await _push_journey_progress(ws, session.session_id, requested_subject)
                 if session_new:
                     await _send_json(
                         ws,
@@ -774,6 +804,10 @@ async def moxiang_master_conversation(
                             "opening": True,
                             "text": opening_message_for_subject(requested_subject),
                         },
+                    )
+                else:
+                    await _replay_pending_confirm_card(
+                        ws, session_id=session.session_id, subject=requested_subject
                     )
 
             elif msg_type == "text_message":
@@ -790,29 +824,39 @@ async def moxiang_master_conversation(
                         f"消息过长（上限 {_MAX_TEXT_LENGTH} 字）",
                     )
                     continue
-                # 建构模式：先落库原文并入队抽取（回复失败也不丢用户输入），
-                # 再流式回复；异常沿既有 turn 错误路径上抛，不吞。
                 turn_subject = active_subject
                 turn_session_id = (
                     sessions_by_subject.get(turn_subject, "")
-                    if build_mode_active
+                    if journey_active
                     else ""
                 )
                 task_id = ""
                 if turn_session_id and _db_session_factory is not None:
-                    task_id = await _submit_build_turn(
+                    task_id = await _submit_journey_candidate_turn(
                         user_id,
                         turn_session_id,
                         str(message.get("clientTurnId") or uuid.uuid4().hex),
                         text_content,
+                    )
+                    await _send_json(
+                        ws,
+                        {
+                            "type": "extraction_status",
+                            "subject": turn_subject,
+                            "task_id": task_id,
+                            "status": "queued",
+                        },
                     )
                 await _push_streamed_reply(
                     ws,
                     orchestrator,
                     text_content,
                     request_id=request_id,
+                    build_context=await _journey_build_context(
+                        turn_session_id, turn_subject
+                    ),
                 )
-                await _finish_build_turn(
+                await _finish_journey_turn(
                     ws,
                     orchestrator,
                     user_id,
@@ -821,6 +865,56 @@ async def moxiang_master_conversation(
                     task_id,
                     poll_tasks,
                 )
+
+            elif msg_type in {"build_invite_accept", "build_invite_snooze"}:
+                if not journey_active or _db_session_factory is None:
+                    await _send_error(ws, "AI_INPUT_INVALID", "当前没有可处理的整理邀请")
+                    continue
+                requested_subject = str(message.get("subject") or "")
+                invite_id = str(message.get("invite_id") or "")
+                if requested_subject not in {
+                    ProfileSubject.PERSONAL.value,
+                    ProfileSubject.IDEAL_PARTNER.value,
+                } or not invite_id:
+                    await _send_error(ws, "AI_INPUT_INVALID", "邀请参数非法")
+                    continue
+                resolution = "accepted" if msg_type == "build_invite_accept" else "snoozed"
+                try:
+                    async with _db_session_factory() as db:
+                        invite, draft_id = await resolve_journey_invite(
+                            db,
+                            invite_id=invite_id,
+                            user_id=user_id,
+                            resolution=resolution,
+                        )
+                        if invite.subject != requested_subject:
+                            raise ValueError("邀请主体不匹配")
+                        await db.commit()
+                except (AIInputError, ValueError) as exc:
+                    await _send_error(ws, "AI_INPUT_INVALID", str(exc))
+                    continue
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "moxiang_invite_resolve_failed invite_id=%s err=%s",
+                        invite_id,
+                        type(exc).__name__,
+                    )
+                    await _send_error(ws, "AI_TEMPORARILY_UNAVAILABLE", "整理邀请暂时无法处理")
+                    continue
+                await _send_json(
+                    ws,
+                    {
+                        "type": "build_invite_resolved",
+                        "subject": invite.subject,
+                        "invite_id": invite.invite_id,
+                        "resolution": resolution,
+                        "journey_stage": "building" if resolution == "accepted" else "chatting",
+                    },
+                )
+                if draft_id is not None:
+                    await _push_confirm_card_for_draft(
+                        ws, subject=invite.subject, draft_id=draft_id
+                    )
 
             elif msg_type == "audio_start":
                 if not voice_enabled:
@@ -906,12 +1000,11 @@ async def moxiang_master_conversation(
                         ws,
                         {"type": "final_transcript", "text": final_transcript},
                     )
-                # 建构模式：语音轮次与文字轮次同一链路（clientTurnId 由服务端
-                # 生成；source 语义由 submit 内部落库承担）。
+                # 只有最终转写进入候选任务；partial_transcript 从不落库。
                 turn_subject = active_subject
                 turn_session_id = (
                     sessions_by_subject.get(turn_subject, "")
-                    if build_mode_active
+                    if journey_active
                     else ""
                 )
                 task_id = ""
@@ -920,19 +1013,31 @@ async def moxiang_master_conversation(
                     and _db_session_factory is not None
                     and final_transcript.strip()
                 ):
-                    task_id = await _submit_build_turn(
+                    task_id = await _submit_journey_candidate_turn(
                         user_id,
                         turn_session_id,
                         uuid.uuid4().hex,
                         final_transcript,
+                    )
+                    await _send_json(
+                        ws,
+                        {
+                            "type": "extraction_status",
+                            "subject": turn_subject,
+                            "task_id": task_id,
+                            "status": "queued",
+                        },
                     )
                 await _push_streamed_reply(
                     ws,
                     orchestrator,
                     final_transcript,
                     request_id=request_id,
+                    build_context=await _journey_build_context(
+                        turn_session_id, turn_subject
+                    ),
                 )
-                await _finish_build_turn(
+                await _finish_journey_turn(
                     ws,
                     orchestrator,
                     user_id,
@@ -972,11 +1077,46 @@ async def moxiang_master_conversation(
                     )
                     continue
                 orchestrator.bump_generation()
+                turn_subject = active_subject
+                turn_session_id = (
+                    sessions_by_subject.get(turn_subject, "")
+                    if journey_active
+                    else ""
+                )
+                task_id = ""
+                if turn_session_id and _db_session_factory is not None:
+                    task_id = await _submit_journey_candidate_turn(
+                        user_id,
+                        turn_session_id,
+                        str(message.get("clientTurnId") or uuid.uuid4().hex),
+                        rev_text,
+                    )
+                    await _send_json(
+                        ws,
+                        {
+                            "type": "extraction_status",
+                            "subject": turn_subject,
+                            "task_id": task_id,
+                            "status": "queued",
+                        },
+                    )
                 await _push_streamed_reply(
                     ws,
                     orchestrator,
                     rev_text,
                     request_id=request_id,
+                    build_context=await _journey_build_context(
+                        turn_session_id, turn_subject
+                    ),
+                )
+                await _finish_journey_turn(
+                    ws,
+                    orchestrator,
+                    user_id,
+                    turn_session_id,
+                    turn_subject,
+                    task_id,
+                    poll_tasks,
                 )
 
             elif msg_type == "cancel":
@@ -1011,13 +1151,13 @@ async def moxiang_master_conversation(
             {
                 "type": "error",
                 "code": "AI_TEMPORARILY_UNAVAILABLE",
-                "message": "墨相师服务暂时不可用",
+                "message": f"{AI_ROLE_NAME}服务暂时不可用",
             },
         )
     finally:
         if partial_task is not None:
             partial_task.cancel()
-        for poll_task in poll_tasks.values():
+        for poll_task in tuple(poll_tasks):
             poll_task.cancel()
         if asr_client is not None:
             try:

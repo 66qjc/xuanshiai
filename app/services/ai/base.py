@@ -44,6 +44,9 @@ class StructuredExtractRequest:
     # update 会话专用：该维度已发布条目摘要（含 field_key），供 modify patch
     # 定位被改写条目；build 会话为 None。
     entry_digest: str | None = None
+    # master 会话专用：本会话已沉淀的活跃候选摘要，供抽取器跨轮去重；
+    # 其余会话为 None。
+    existing_digest: str | None = None
 
 
 class ExtractedField(BaseModel):

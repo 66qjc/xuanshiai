@@ -174,6 +174,143 @@ async def test_structured_extract_skips_non_allowlist_field(
     assert result.fields[0].field_key == "age"
 
 
+@pytest.mark.asyncio
+async def test_master_structured_extract_keeps_allowlisted_fields_and_six_dimension_patches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """墨相师 Provider 不能丢弃能进入确认-发布链的白名单字段。"""
+    json_content = (
+        '{"fields": ['
+        '  {"field_key": "city_code", "value": "330100", '
+        '   "source_quote": "我住杭州", "confidence": 0.95},'
+        '  {"field_key": "phone", "value": "13800000000", "confidence": 0.99}'
+        '], "patches": ['
+        '  {"action": "add", "category": "interests", '
+        '   "content": "周末喜欢看展", "source_quote": "周末喜欢看展", '
+        '   "confidence": 0.91}'
+        ']}'
+    )
+    settings = _settings_with_deepseek_key()
+    monkeypatch.setattr("app.services.ai.providers.settings", settings)
+    provider = DeepSeekAIProvider(client=_make_mock_client(json_content))
+
+    result = await provider.structured_extract(
+        StructuredExtractRequest(
+            subject="personal",
+            turn_texts=("我住杭州，周末喜欢看展。",),
+            consent_version="v1",
+            policy_revision="ai-policy-2026-08-07-v1",
+            session_kind="master",
+        )
+    )
+
+    assert [field.field_key for field in result.fields] == ["city_code"]
+    assert result.fields[0].value == "330100"
+    assert result.patches[0].category == "interests"
+    assert result.patches[0].content == "周末喜欢看展"
+
+
+@pytest.mark.asyncio
+async def test_master_structured_extract_skips_invalid_field_and_keeps_valid_patch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """单个脏字段不能阻断同批已经通过 schema 的六维候选。"""
+    json_content = (
+        '{"fields": ['
+        '  {"field_key": "age", "value": 17, "confidence": 0.99}'
+        '], "patches": ['
+        '  {"action": "add", "category": "interests", '
+        '   "content": "周末喜欢看展", "source_quote": "周末喜欢看展", '
+        '   "confidence": 0.91}'
+        ']}'
+    )
+    settings = _settings_with_deepseek_key()
+    monkeypatch.setattr("app.services.ai.providers.settings", settings)
+    provider = DeepSeekAIProvider(client=_make_mock_client(json_content))
+
+    result = await provider.structured_extract(
+        StructuredExtractRequest(
+            subject="personal",
+            turn_texts=("周末喜欢看展。",),
+            consent_version="v1",
+            policy_revision="ai-policy-2026-08-07-v1",
+            session_kind="master",
+        )
+    )
+
+    assert result.fields == ()
+    assert [patch.content for patch in result.patches] == ["周末喜欢看展"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("subject", "value"),
+    [
+        ("personal", "Hangzhou"),
+        ("ideal_partner", ["330100", "杭州市西湖区"]),
+    ],
+)
+async def test_master_structured_extract_drops_city_code_outside_six_digit_format(
+    monkeypatch: pytest.MonkeyPatch,
+    subject: str,
+    value: object,
+) -> None:
+    """城市只接受行政区划六码，不能让城市名或精确地址进入候选链。"""
+    json_content = (
+        '{"fields": ['
+        f'  {{"field_key": "city_code", "value": {value!r}, "confidence": 0.95}}'
+        ']}'
+    ).replace("'", '"')
+    settings = _settings_with_deepseek_key()
+    monkeypatch.setattr("app.services.ai.providers.settings", settings)
+    provider = DeepSeekAIProvider(client=_make_mock_client(json_content))
+
+    result = await provider.structured_extract(
+        StructuredExtractRequest(
+            subject=subject,
+            turn_texts=("我住在杭州。",),
+            consent_version="v1",
+            policy_revision="ai-policy-2026-08-07-v1",
+            session_kind="master",
+        )
+    )
+
+    assert result.fields == ()
+
+
+@pytest.mark.asyncio
+async def test_master_structured_extract_normalizes_alias_category(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#9：模型自由发挥的 category 先按同义词归一到 9 枚举，非法的仍丢弃。"""
+    json_content = (
+        '{"patches": ['
+        '  {"action": "add", "category": "relationship", '
+        '   "content": "不能接受欺骗", "source_quote": "不能接受欺骗", "confidence": 0.9},'
+        '  {"action": "add", "category": "兴趣", '
+        '   "content": "周末看展", "source_quote": "周末看展", "confidence": 0.88},'
+        '  {"action": "add", "category": "totally_made_up", '
+        '   "content": "杂类", "source_quote": "杂类", "confidence": 0.8}'
+        ']}'
+    )
+    settings = _settings_with_deepseek_key()
+    monkeypatch.setattr("app.services.ai.providers.settings", settings)
+    provider = DeepSeekAIProvider(client=_make_mock_client(json_content))
+
+    result = await provider.structured_extract(
+        StructuredExtractRequest(
+            subject="personal",
+            turn_texts=("不能接受欺骗，周末看展。",),
+            consent_version="v1",
+            policy_revision="ai-policy-2026-08-07-v1",
+            session_kind="master",
+        )
+    )
+
+    categories = [patch.category for patch in result.patches]
+    assert categories == ["values", "interests"]  # 归一两条，非法第三条被丢弃
+
+
 # ----------------------------------------------------------------------
 # parse_search_query
 # ----------------------------------------------------------------------

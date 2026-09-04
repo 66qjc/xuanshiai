@@ -14,15 +14,20 @@ VoiceGateway.synthesize 做 TTS。编排器只负责：消息组装 → stream_c
 from __future__ import annotations
 
 import logging
+import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, AsyncIterator
 
 from app.core.config import settings
+from app.services.ai.audit import GenerationAuditEvent, record_generation_audit
 from app.services.ai.base import AITaskContext
 from app.services.ai.gateway import AIGateway
-from app.services.ai.prompts.moxiang_master import build_master_prompt
+from app.services.ai.prompts.moxiang_master import (
+    MOXIANG_MASTER_PROMPT_VERSION,
+    build_master_prompt,
+)
 from app.services.ai.providers import get_provider
 from app.services.voice.base import SynthesizeRequest, SynthesizeResult
 from app.services.voice.gateway import VoiceGateway
@@ -115,12 +120,18 @@ class MoxiangMasterOrchestrator:
         self._last_reply_text = ""
         self._last_request_id = request_id
         gen = self._generation_id
+        started = time.monotonic()
         messages = build_master_prompt(
             user_text, self._history, self._narrative_context,
             build_context=self._build_context,
         )
+        error_code: str | None = None
         try:
             provider = get_provider(settings.ai_provider)
+            provider_name = settings.ai_provider
+            provider_model = getattr(provider, "_model", None) or getattr(
+                provider, "model", None
+            )
             full_reply = ""
             async for kind, text in provider.stream_chat(
                 messages, json_mode=False
@@ -141,6 +152,7 @@ class MoxiangMasterOrchestrator:
             if len(self._history) > _MAX_HISTORY_TURNS * 2:
                 self._history = self._history[-(_MAX_HISTORY_TURNS * 2):]
         except Exception as exc:
+            error_code = type(exc).__name__
             logger.warning(
                 "moxiang_master_reply_failed request_id=%s err=%s",
                 request_id,
@@ -151,6 +163,24 @@ class MoxiangMasterOrchestrator:
         finally:
             if self._generation_id == gen:
                 self.state = MasterState.IDLE
+            duration_ms = int((time.monotonic() - started) * 1000)
+            await record_generation_audit(
+                GenerationAuditEvent(
+                    request_id=request_id or uuid.uuid4().hex,
+                    task_id=None,
+                    scene="moxiang_master_chat",
+                    provider=provider_name,
+                    model=provider_model,
+                    prompt_version=MOXIANG_MASTER_PROMPT_VERSION,
+                    schema_version="moxiang-master-v1",
+                    policy_revision=settings.ai_retention_policy_version or "ai-policy-2026-08-07-v1",
+                    status="succeeded" if error_code is None else "failed",
+                    error_code=error_code,
+                    duration_ms=duration_ms,
+                    input_revision={"history": len(self._history)},
+                    display_eligible=True,
+                )
+            )
 
     async def synthesize_current(self) -> MasterTurnResult:
         """对 _last_reply_text 合成 TTS。无文本则返回空。"""

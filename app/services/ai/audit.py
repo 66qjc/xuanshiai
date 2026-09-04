@@ -272,10 +272,14 @@ async def record_generation_audit(event: GenerationAuditEvent) -> None:
 
 #: 指标至少覆盖：queue age、lease 回收、重试率、schema invalid、Provider
 #: 429/5xx、stale rate、fallback rate、撤回传播延迟、outbox 积压和清理积压。
+#: 批次3 #24 追加：task_retry（单次进入 retry_wait 计数）与
+#: task_retry_backlog（retry_wait 积压量，按 task_type 维度）。
 KNOWN_METRICS = frozenset({
     "queue_age",
     "lease_reclaimed",
     "retry_rate",
+    "task_retry",
+    "task_retry_backlog",
     "schema_invalid",
     "provider_429",
     "provider_5xx",
@@ -287,7 +291,9 @@ KNOWN_METRICS = frozenset({
 })
 
 #: 积压类指标超过阈值时打印本地告警（queue/backlog 告警语义）。
-_BACKLOG_METRICS = frozenset({"outbox_backlog", "purge_backlog"})
+_BACKLOG_METRICS = frozenset(
+    {"outbox_backlog", "purge_backlog", "task_retry_backlog"}
+)
 
 #: 单个指标序列保留的最大样本数。超过后丢弃最旧样本，保证注册表在
 #: 长生命周期进程内不会无界增长。

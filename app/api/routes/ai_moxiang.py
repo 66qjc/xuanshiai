@@ -26,7 +26,7 @@ from __future__ import annotations
 import re
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Path, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies import CurrentUser, get_current_user
@@ -34,15 +34,21 @@ from app.core.config import settings
 from app.core.logging import request_id_context
 from app.db.session import get_db
 from app.schemas.ai_common import AiErrorResponse
-from app.schemas.ai_moxiang import MoxiangStateResponse
+from app.schemas.ai_moxiang import (
+    MoxiangStateResponse,
+    MoxiangTurn,
+    MoxiangTurnsResponse,
+)
 from app.schemas.ai_profile import ProfileSubject
 from app.services.ai.flags import AiFeature, AiFeatureDisabledError, require_ai_feature
-from app.services.ai.moxiang_state import build_state_response
+from app.services.ai.moxiang_state import build_state_response, list_turns
 from app.services.ai.moxiang_state_db import MoxiangStateSqlRepository
 from app.services.ai.profile import (
     AIConsentRequired,
     AIInputError,
+    ProfileSessionNotFound,
     create_master_session,
+    load_owned_session,
 )
 
 router = APIRouter()
@@ -73,7 +79,7 @@ def _error_response(
 def _require_journey_feature() -> None:
     """Phase 2 P1-C 沿用 ``ai_moxiang_journey_enabled`` 开关(契约 v1.1 §10)。
 
-    默认关闭:关闭时返回 503,前端显示"暂不可用";旧 ``profile_build`` 不受影响。
+    默认关闭:关闭时返回 503,前端显示"暂不可用"；客户端不得回退旧协议。
     """
     if not bool(getattr(settings, "ai_moxiang_journey_enabled", False)):
         raise _error_response(
@@ -104,6 +110,71 @@ async def get_moxiang_state(
     """
     repo = MoxiangStateSqlRepository(db)
     return await build_state_response(user_id=current_user, repo=repo)
+
+
+@router.get(
+    "/profile-sessions/{session_id}/turns",
+    response_model=MoxiangTurnsResponse,
+    status_code=status.HTTP_200_OK,
+    summary="分页读取本人的墨相师会话历史",
+)
+async def get_session_turns(
+    session_id: str = Path(..., min_length=1, max_length=64, pattern=r"^[a-z0-9_]+$"),
+    before_turn_no: int | None = Query(default=None, ge=1),
+    limit: int = Query(default=50, ge=1, le=100),
+    current_user: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> MoxiangTurnsResponse:
+    """返回最新一页历史并隐藏外部用户会话是否存在。"""
+    try:
+        session = await load_owned_session(db, session_id, current_user.id)
+    except ProfileSessionNotFound as exc:
+        raise _error_response(exc.code, exc.message, exc.status_code) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise _error_response(
+            "AI_TEMPORARILY_UNAVAILABLE",
+            "会话历史暂时无法读取,请稍后再试",
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            retryable=True,
+        ) from exc
+
+    repo = MoxiangStateSqlRepository(db)
+    try:
+        rows, next_before_turn_no = await list_turns(
+            session_id=session_id,
+            before_turn_no=before_turn_no,
+            limit=limit,
+            repo=repo,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise _error_response(
+            "AI_TEMPORARILY_UNAVAILABLE",
+            "会话历史暂时无法读取,请稍后再试",
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            retryable=True,
+        ) from exc
+
+    turns: list[MoxiangTurn] = []
+    for row in rows:
+        created_at = row.get("created_at")
+        if created_at is not None and hasattr(created_at, "isoformat"):
+            created_at = created_at.isoformat()
+        turns.append(
+            MoxiangTurn(
+                turn_id=str(row["turn_id"]),
+                turn_no=int(row["turn_no"]),
+                role=str(row["role"]),
+                answer_text=str(row["answer_text"]),
+                client_turn_id=str(row["client_turn_id"]),
+                created_at=str(created_at) if created_at is not None else None,
+            )
+        )
+    return MoxiangTurnsResponse(
+        session_id=session_id,
+        subject=session.subject.value,
+        turns=tuple(turns),
+        next_before_turn_no=next_before_turn_no,
+    )
 
 
 @router.post("/moxiang/journey/start")

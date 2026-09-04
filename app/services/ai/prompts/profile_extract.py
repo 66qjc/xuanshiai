@@ -18,7 +18,13 @@ _PERSONAL_FIELD_GUIDE = {
     "marriage_status": "枚举，取值 single / divorced / widowed",
     "education_level": "整数，学历等级 1-8。中文映射：1=初中及以下，2=高中/中专，3=大专，4=本科，5=硕士，6=博士",
     "height_cm": "整数，身高厘米数，范围 100-250",
-    "income_band": "整数，收入档位 0 及以上。中文映射：0=无收入，1=一档/第一档，2=二档/第二档，3=三档，以此类推。区间表述如“一档到二档”取较低值 1",
+    # 产品口径（PRODUCT.md 收入档位）：以个人月收入为准，区间左闭右开。
+    "income_band": (
+        "整数，收入档位 0-6。按个人月收入划分：0=无收入/暂不固定，"
+        "1=5千以下，2=5千-1万，3=1万-2万，4=2万-3万5，5=3万5-5万，6=5万以上。"
+        "边界值归较高档（左闭右开）：“月入两万”“月薪2w”归 4 档，“一万五”归 3 档；"
+        "区间表述如“一万到两万”取较低档 3"
+    ),
     "occupation_group": "枚举，取值 technology / education / healthcare / finance / public_service / other",
     "interest_tags": "字符串数组，兴趣标签，如 [\"旅行\", \"看展\"]",
     "lifestyle_tags": "字符串数组，生活方式标签，如 [\"户外\"]",
@@ -189,23 +195,36 @@ _UPDATE_JSON_FORMAT_INSTRUCTION = (
 
 # 设计 Task 6：墨相师对话建构（master 会话）的对话抽取 prompt。与 update 的
 # 澄清式契约不同：澄清追问由对话中的墨相师承担，抽取器**禁止**输出
-# clarifying_question；对话里没有可固化内容时允许 0 条 patch（空数组是合法
-# 结果，不硬凑）。faithfulness 硬约束与 update 相同。
+# clarifying_question；对话里没有可固化内容时允许 0 条 field / patch（空数组
+# 是合法结果，不硬凑）。``fields`` 让用户明确陈述的白名单事实能进入后续的
+# 确认—发布链；``patches`` 继续承载六维自由条目。faithfulness 硬约束与 update
+# 相同。
 _MASTER_SYSTEM_HEADER = (
-    "你是一个画像建构助手，正在陪用户自然对话，并从中沉淀画像条目候选。"
-    "你的任务只有一个：把用户已经表达清晰的内容固化为条目。规则：\n"
+    "你是一个画像建构助手，正在陪用户自然对话，并从中沉淀可确认字段和画像条目候选。"
+    "你的任务只有一个：把用户已经表达清晰的内容固化为字段或条目。规则：\n"
     "  - 只能基于用户陈述内容归纳，禁止编造、引申用户没有表达过的偏好或细节；\n"
-    "  - 对话里没有可固化内容时，patches 输出空数组——这是正常结果，"
+    "  - 对话里没有可固化内容时，fields 和 patches 输出空数组——这是正常结果，"
     "不要硬凑、不要输出用户没有表达过的内容；\n"
+    "  - 覆盖优先：先逐句扫描用户本轮原话，把每个有原文支撑的最小独立事实列出来，"
+    "再逐项决定是否输出；不要只抓一句话里最显眼的一个事实。\n"
+    "  - 拆分规则：一条 patch 只表达一个事实；同一句可以输出多条 patch。若一句话同时"
+    "包含社交风格、情绪表达、生活习惯或长期期待，分别沉淀，不要因已经命中一个维度"
+    "而遗漏其余事实。\n"
     "  - personal（我的墨相）只描述用户自己的事实、性格、恋爱观、关系边界"
     "和生活方式；ideal_partner（愿遇之相）只描述用户明确表达的择偶偏好、"
     "理想人格和期待的相处方式，两个主体不得互相改写；\n"
     "  - 用户对现实中具体对象的观察（例如‘他很温柔’）不是用户偏好，必须"
     "输出空 patches；不得给第三方建立画像，也不得把第三方特征当成已确认偏好；\n"
+    "  - 从具体关系经历中总结出的自我模式可以抽取，但 content 只能写用户明确说出的"
+    "自身认识或相处模式，不能写第三方的人格。例如用户由一段经历明确总结‘职业相同"
+    "不等于合拍，我更在意性格互动’，可低置信沉淀亲密模式。\n"
     "  - 只有用户明确确认并表达‘我希望’‘我看重’‘我会被……吸引’等偏好时，"
     "才允许为愿遇之相生成 patch；含混表达仍输出空 patches，追问由墨相师负责；\n"
     "  - 禁止输出 clarifying_question（澄清追问由对话中的墨相师承担，"
     "你不负责提问），该字段必须为 null；\n"
+    "  - fields 只收集下方字段表中被用户明确陈述的事实；字段表外、手机号、"
+    "身份证、精确地址等敏感信息绝不输出；每项必须有 field_key、value、"
+    "source_quote 和 confidence；\n"
     "  - 每条 patch 含 action（add=新增/modify=改写既有条目）、category、"
     "content（1 到 200 字）、replaces_field_key（仅 modify 需要，指向被改写"
     "条目的 field_key）；\n"
@@ -213,17 +232,50 @@ _MASTER_SYSTEM_HEADER = (
     "appearance（外形特征）/ personality（性格特征）/ values（价值观）/ "
     "interests（兴趣爱好）/ routine（作息习惯）/ diet（饮食习惯）/ "
     "life_plan（生活规划）。\n"
+    "  - 六维归属：每条 patch 会被系统归入六个维度之一——性格与社交、亲密模式、"
+    "生活方式、情绪表达、关系边界、未来期待。先按下列语义优先级选 category，再写"
+    "content，不要被同一句里的通用词带偏：\n"
+    "    · 情绪表达优先归入 emotional_expression：讲表达爱意或感受、倾听和安慰时用"
+    "personality，并在 content 保留「表达/倾听/安慰/情绪」等语义。例如「不擅长"
+    "甜言蜜语但会用行动表达」「先倾听、后给建议」；\n"
+    "    · 长期关系愿景优先归入 future_expectations：出现三五年、十年后、安定生活、"
+    "婚姻里成为队友、理想日常等长期画面时用 life_plan；即使同时提到沟通、城市或"
+    "生活方式，也不要改归 values 或 routine；\n"
+    "    · 个人空间、粘人程度、忠诚底线和不可接受事项优先归入关系边界：用 values，"
+    "content 写清「个人空间/边界/底线」，不要自行补入「亲密/陪伴」等相处词；\n"
+    "    · 讲沟通方式、冲突处理、陪伴与亲密相处，用 values 并带「沟通/冲突/陪伴/"
+    "亲密」等词，归入亲密模式；讲底线与原则（如「不能接受欺骗」）用 values 但不带"
+    "相处词，归入关系边界；\n"
+    "    · 作息、饮食、兴趣、消费与日常用 routine/diet/interests/occupation，归入"
+    "生活方式；人生与关系规划用 life_plan，归入未来期待；\n"
+    "    · 性格本身与社交风格（内向/外向/幽默）用 personality/basics/appearance "
+    "且不带情绪词，归入性格与社交。\n"
+    "  - 置信度 confidence 按陈述清晰度给值：用户直接明确陈述给 0.9 以上；清晰但"
+    "需轻度归纳给 0.75-0.9；有直接原文支撑但需要轻度归纳时给 0.5-0.75，不要仅因"
+    "不是正式结论就丢弃；没有原文支撑或把握不足 0.5 就不要输出。\n"
+    "  - 去重：同一事实只沉淀一次，但同一主题不等于重复。若下方给出「本会话已沉淀"
+    "的候选」，只跳过语义相同的事实；新的时间跨度、行为方式、限制条件、纠正信息或"
+    "新增维度都属于新证据，应单独输出。\n"
 )
 
 _MASTER_JSON_FORMAT_INSTRUCTION = (
     "请以 JSON 格式输出，根对象形如：\n"
     "{\n"
     "  \"clarifying_question\": null,\n"
+    "  \"fields\": [],\n"
     "  \"patches\": []\n"
     "}\n"
     "或\n"
     "{\n"
     "  \"clarifying_question\": null,\n"
+    "  \"fields\": [\n"
+    "    {\n"
+    "      \"field_key\": \"city_code\",\n"
+    "      \"value\": \"330100\",\n"
+    "      \"source_quote\": \"我住在杭州\",\n"
+    "      \"confidence\": 0.95\n"
+    "    }\n"
+    "  ],\n"
     "  \"patches\": [\n"
     "    {\n"
     "      \"action\": \"add\",\n"
@@ -241,15 +293,22 @@ def build_profile_master_extract_prompt(
     subject: str,
     turn_texts: tuple[str, ...],
     entry_digest: str | None = None,
+    existing_digest: str | None = None,
 ) -> str:
     """构造 master 会话对话抽取 prompt（设计 Task 6）。
 
     ``turn_texts`` 是本会话按时间顺序的用户陈述；``entry_digest`` 是该维度
-    已发布条目摘要，供 modify patch 定位被改写条目，可为 None。契约：允许
-    返回 0 条 patch，禁止返回澄清问题——澄清由墨相师对话承担。
+    已发布条目摘要，供 modify patch 定位被改写条目，可为 None。
+    ``existing_digest`` 是本会话已沉淀的活跃候选摘要（防跨轮重复抽取），
+    可为 None。契约：允许返回 0 条 fields / patches，禁止返回澄清问题——
+    澄清由墨相师对话承担。
     """
     is_personal = subject == ProfileSubject.PERSONAL.value
     subject_label = "个人画像" if is_personal else "理想型画像"
+    field_guide = _PERSONAL_FIELD_GUIDE if is_personal else _IDEAL_PARTNER_FIELD_GUIDE
+    field_lines = "\n".join(
+        f"  - {key}：{description}" for key, description in field_guide.items()
+    )
     dialogue_block = "\n\n".join(
         f"【第 {idx + 1} 句】\n{text}" for idx, text in enumerate(turn_texts) if text
     )
@@ -261,10 +320,17 @@ def build_profile_master_extract_prompt(
             f"\n该维度当前已发布的条目（modify 时 replaces_field_key 从中选取）：\n"
             f"{entry_digest}\n"
         )
+    existing_block = ""
+    if existing_digest:
+        existing_block = (
+            "\n本会话已沉淀的候选（不要重复输出语义相同的内容，除非用户带来新细节）：\n"
+            f"{existing_digest}\n"
+        )
     return (
         f"{_MASTER_SYSTEM_HEADER}\n\n"
         f"建构目标：{subject_label}。\n"
-        f"{digest_block}\n"
+        f"可固化的白名单字段及其值格式：\n{field_lines}\n\n"
+        f"{digest_block}{existing_block}\n"
         f"{_MASTER_JSON_FORMAT_INSTRUCTION}\n\n"
         f"以下是用户在本会话中的陈述：\n{dialogue_block}"
     )

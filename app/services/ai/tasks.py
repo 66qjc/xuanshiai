@@ -31,6 +31,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.schemas.ai_common import AiTaskStatus
+from app.services.ai.audit import emit_ai_metric
 from app.services.ai.flags import AiFeature, AiFeatureDisabledError, require_ai_feature
 from app.services.revisions import RevisionVector
 
@@ -93,6 +94,7 @@ _SAFE_ERROR_MESSAGES: dict[str, str] = {
     "AI_QUOTA_EXCEEDED": "AI 服务请求频率过高，请稍后重试",
     "AI_TEMPORARILY_UNAVAILABLE": "AI 服务暂时不可用",
     "AI_CONSENT_REQUIRED": "AI 授权不可用，任务无法继续",
+    "AI_LEGACY_MOXIANG_RETIRED": "旧墨相师确认式抽取已下线",
     "RESULT_STALE": "输入或策略版本已变化",
 }
 _DEFAULT_SAFE_ERROR_MESSAGE = "AI 服务调用失败"
@@ -327,6 +329,7 @@ def _revisions_changed(stored: dict[str, Any] | None, current: Any) -> bool:
 
 _TASK_FEATURES = {
     "profile_extract": AiFeature.PROFILE,
+    "moxiang_candidate_extract": AiFeature.PROFILE,
     "profile_projection": AiFeature.PROFILE,
     "search_parse": AiFeature.SEARCH,
     "search_execute": AiFeature.SEARCH,
@@ -864,6 +867,24 @@ async def fail_task(
             )
             updated = await _get_by_id(db, task_id)
             assert updated is not None
+            # 批次3 #24：retry_wait 可观测性——每次进入重试都输出结构化
+            # warning（含第几次/上限/退避秒数），并计入 task_retry 指标；
+            # 「任务卡重试一天」从此在日志与指标两侧都看得见。
+            logger.warning(
+                "ai_task_retry_wait task_id=%s task_type=%s attempt=%d/%d "
+                "error_code=%s backoff_seconds=%d",
+                task_id,
+                task.task_type,
+                next_attempt,
+                task.max_attempts,
+                error_code,
+                backoff,
+            )
+            emit_ai_metric(
+                "task_retry",
+                1,
+                {"task_type": task.task_type, "error_code": error_code},
+            )
             return updated
         # 重试次数耗尽 → 仅 running 可进入终态 failed。
         return await _fail_terminal(db, task, error_code)

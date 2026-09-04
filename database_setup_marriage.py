@@ -1914,7 +1914,7 @@ class DatabaseManager:
                     `moderation_reason` varchar(255) DEFAULT NULL,
                     `moderated_by` bigint unsigned DEFAULT NULL,
                     `moderated_at` datetime DEFAULT NULL,
-                    `type` tinyint DEFAULT '1' COMMENT '1文本 3语音',
+                    `type` tinyint DEFAULT '1' COMMENT '1文本 2图片 3语音',
                     `media_url` varchar(500) DEFAULT NULL,
                     `voice_duration_sec` int DEFAULT NULL,
                     `reply_id` bigint unsigned DEFAULT NULL COMMENT '关联首次 paper_plane_reply',
@@ -1923,6 +1923,31 @@ class DatabaseManager:
                     KEY `idx_conversation` (`conversation_id`),
                     KEY `idx_from_user` (`from_user_id`)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='纸飞机匿名会话消息'
+            """,
+
+            # ============================================
+            # 27d. 纸飞机联系方式交换申请
+            # ============================================
+            'paper_plane_contact_exchange': """
+                CREATE TABLE IF NOT EXISTS `paper_plane_contact_exchange` (
+                    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+                    `conversation_id` bigint unsigned NOT NULL,
+                    `kind` varchar(16) NOT NULL COMMENT 'wechat|phone',
+                    `requester_user_id` bigint unsigned NOT NULL,
+                    `target_user_id` bigint unsigned NOT NULL,
+                    `status` varchar(16) NOT NULL DEFAULT 'PENDING' COMMENT 'PENDING/APPROVED/REJECTED/REVOKED',
+                    `requester_consented_at` datetime DEFAULT NULL,
+                    `target_consented_at` datetime DEFAULT NULL,
+                    `responded_at` datetime DEFAULT NULL,
+                    `idempotency_key` varchar(128) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+                    `response_idempotency_key` varchar(128) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL,
+                    `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    PRIMARY KEY (`id`),
+                    UNIQUE KEY `uk_paper_plane_exchange_request_key` (`requester_user_id`,`idempotency_key`),
+                    KEY `idx_paper_plane_exchange_conversation` (`conversation_id`,`kind`,`requester_user_id`,`status`),
+                    KEY `idx_paper_plane_exchange_target` (`target_user_id`,`status`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='纸飞机双方联系方式交换申请（只存同意状态）'
             """,
 
             # ============================================

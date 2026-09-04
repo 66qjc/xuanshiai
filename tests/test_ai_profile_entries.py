@@ -19,6 +19,7 @@ from app.schemas.ai_profile import (
     ProfileDraftFieldPatchRequest,
     ProfileFieldPatchAction,
     ProfileSubject,
+    normalize_entry_category,
 )
 from app.services.ai.base import ExtractedEntry
 from app.services.ai.profile import (
@@ -54,6 +55,24 @@ def test_validate_entry_content_boundaries() -> None:
         validate_entry_content("   ")
     with pytest.raises(AIInputError):
         validate_entry_content(123)
+
+
+def test_normalize_entry_category_maps_aliases_and_keeps_enum() -> None:
+    """#9：同义词归一到 9 枚举；已是枚举原样（大小写归一）；未知原样返回交校验拒绝。"""
+    assert normalize_entry_category("relationship") == "values"
+    assert normalize_entry_category("兴趣") == "interests"
+    assert normalize_entry_category("lifestyle") == "routine"
+    assert normalize_entry_category("career") == "occupation"
+    assert normalize_entry_category("未来") == "life_plan"
+    assert normalize_entry_category("VALUES") == "values"
+    assert normalize_entry_category("  diet ") == "diet"
+    # 无法归一的词原样返回，由 ExtractedEntry/ExtractedPatch 的校验兜底拒绝。
+    assert normalize_entry_category("totally_made_up") == "totally_made_up"
+    assert normalize_entry_category(None) == ""
+    # 归一结果永远落在枚举内或原样，不会凭空造出第七类。
+    for raw in ("relationship", "兴趣", "totally_made_up"):
+        normalized = normalize_entry_category(raw)
+        assert normalized in PROFILE_ENTRY_CATEGORIES or normalized == raw.strip().lower()
 
 
 def test_extracted_entry_schema_contract() -> None:

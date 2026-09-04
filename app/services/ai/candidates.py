@@ -28,6 +28,9 @@ from collections.abc import Iterable
 from typing import Any, Protocol
 
 from app.db.ai_schema import PROFILE_DIMENSION_SET
+from app.schemas.ai_common import AI_FIELD_ALLOWLIST
+from app.schemas.ai_profile import PROFILE_ENTRY_CATEGORIES, ProfileSubject
+from app.services.ai.base import StructuredExtractResult
 from app.schemas.ai_moxiang import (
     HIGH_CONFIDENCE_THRESHOLD,
     CandidateRecord,
@@ -73,7 +76,12 @@ def compute_candidate_content_hash(
     return hashlib.sha256(blob).hexdigest()
 
 
-def bucket_for_dimension(field_kind: str, field_key: str | None, category: str | None) -> str:
+def bucket_for_dimension(
+    field_kind: str,
+    field_key: str | None,
+    category: str | None,
+    content: str | None = None,
+) -> str:
     """把抽取结果按六维固定词表分桶（Contract v1.1 §1.3）。
 
     ``structured`` 用 ``field_key`` 映射；``entry`` 用 ``category`` 映射。
@@ -107,6 +115,21 @@ def bucket_for_dimension(field_kind: str, field_key: str | None, category: str |
             "life_plan": "future_expectations",
         }
         candidate = mapping.get(category, "lifestyle")
+        # The entry taxonomy is intentionally compact.  Split the two
+        # relationship-heavy categories by the meaning present in the user's
+        # evidence so all six product dimensions remain observable without
+        # inventing a seventh storage category.
+        evidence = content or ""
+        if category == "personality" and any(
+            cue in evidence for cue in ("情绪", "表达", "倾听", "安慰")
+        ):
+            candidate = "emotional_expression"
+        elif category == "personality":
+            candidate = "personality_social"
+        elif category == "values" and any(
+            cue in evidence for cue in ("沟通", "冲突", "陪伴", "亲密")
+        ):
+            candidate = "intimacy_pattern"
     else:
         candidate = "lifestyle"
     # 兜底：所有候选维度必须在 PROFILE_DIMENSION_SET（Contract v1.1 §1.3
@@ -167,8 +190,9 @@ def _is_third_party_observation(text: str) -> bool:
     return not any(cue in stripped for cue in _PREFERENCE_CUES)
 
 
-# 极简本地抽取器：本文件不调用 LLM。P1-C 接入真实 provider 时只替换本函数，
-# 仍由 ``extract_master_candidates`` 做主体边界守护 + content_hash 折叠。
+# 极简本地抽取器只保留给纯函数回归测试与离线诊断。生产旅程由
+# ``journey.extract_journey_candidates`` 经统一 AIGateway 调用 master prompt；
+# 它不会把这套关键词规则作为候选池主来源。
 _DEFAULT_STRUCTURED_KEYS: tuple[str, ...] = (
     "interest_tags",
     "lifestyle_tags",
@@ -187,8 +211,7 @@ def _heuristic_structured_candidates(
 ) -> tuple[dict[str, Any], ...]:
     """离线回退抽取：仅当真实 provider 不可用时使用（Contract v1.1 §2.4）。
 
-    真实 LLM 接入由 P1-C 完成。本地启发式只识别极少量强 cue：
-    兴趣关键词 / 生活方式关键词 / 关系目标关键词。无强 cue 返回空元组。
+    本地启发式只识别有限强 cue，用于离线回归；无强 cue 返回空元组。
     """
     blobs = [t for t in turn_texts if t]
     if not blobs:
@@ -197,18 +220,30 @@ def _heuristic_structured_candidates(
     interest_hits: set[str] = set()
     lifestyle_hits: set[str] = set()
     goal_hit: str | None = None
+    personality_hit: str | None = None
+    intimacy_hit: str | None = None
     emotion_hit: str | None = None
+    boundary_hit: str | None = None
+    future_hit: str | None = None
     for text in blobs:
+        if any(w in text for w in ("性格", "内向", "外向", "慢热", "安静", "热情")):
+            personality_hit = text[:200]
+        if any(w in text for w in ("沟通", "冲突", "陪伴", "亲密", "分歧")):
+            intimacy_hit = text[:200]
+        if any(w in text for w in ("边界", "隐私", "查手机", "独处", "尊重")):
+            boundary_hit = text[:200]
+        if any(w in text for w in ("情绪", "表达", "倾听", "安慰")):
+            emotion_hit = text[:200]
+        if any(w in text for w in ("未来", "共同生活", "结婚", "长期", "规划")):
+            future_hit = text[:200]
         if any(w in text for w in ("喜欢旅行", "喜欢看展", "喜欢阅读", "喜欢运动")):
             interest_hits.add("旅行")
             interest_hits.add("看展")
-        if any(w in text for w in ("周末喜欢去公园", "早睡早起", "户外")):
+        if any(w in text for w in ("周末喜欢去公园", "早睡早起", "户外", "作息", "饮食")):
             lifestyle_hits.add("户外")
         if "希望长期稳定" in text or "以结婚为目的" in text:
             goal_hit = "marriage"
-        if subject == "ideal_partner" and (
-            "希望对方情绪稳定" in text or "希望对方会倾听" in text
-        ):
+        if subject == "ideal_partner" and emotion_hit is not None:
             emotion_hit = "希望对方情绪稳定，会倾听"
     if interest_hits:
         fields.append(
@@ -238,6 +273,46 @@ def _heuristic_structured_candidates(
                 "value": goal_hit,
                 "confidence": 0.9,
                 "source_quote": " / ".join(blobs)[:200],
+            }
+        )
+    if personality_hit and subject == "personal":
+        fields.append(
+            {
+                "field_kind": "entry",
+                "category": "personality",
+                "content": personality_hit,
+                "confidence": 0.82,
+                "source_quote": personality_hit,
+            }
+        )
+    if intimacy_hit:
+        fields.append(
+            {
+                "field_kind": "entry",
+                "category": "values",
+                "content": intimacy_hit,
+                "confidence": 0.82,
+                "source_quote": intimacy_hit,
+            }
+        )
+    if boundary_hit:
+        fields.append(
+            {
+                "field_kind": "entry",
+                "category": "values",
+                "content": boundary_hit,
+                "confidence": 0.84,
+                "source_quote": boundary_hit,
+            }
+        )
+    if future_hit and not goal_hit:
+        fields.append(
+            {
+                "field_kind": "entry",
+                "category": "life_plan",
+                "content": future_hit,
+                "confidence": 0.82,
+                "source_quote": future_hit,
             }
         )
     if emotion_hit:
@@ -273,9 +348,8 @@ def extract_master_candidates(
     3. 跨主体**不**互相改写——同一句不会既落入 personal 又落入 ideal_partner。
     4. 全部输入都是第三方纯观察时返回空元组，不写空 patch。
 
-    本函数**不**调用 LLM（真实 provider 由 P1-C 注入），离线回退用
-    ``_heuristic_structured_candidates`` 维持集成测试的最小覆盖；线上
-    P1-C 接入后由 provider 直接产出 ``ExtractedField`` 列表。
+    本函数**不**调用 LLM，仅作离线回归工具。线上候选由
+    ``candidates_from_master_result`` 消费 AIGateway 的 typed Provider 输出。
     """
     if subject not in ("personal", "ideal_partner"):
         raise ValueError(f"subject must be personal or ideal_partner, got {subject!r}")
@@ -306,7 +380,7 @@ def extract_master_candidates(
         value = item.get("value")
         content = item.get("content")
         confidence = float(item.get("confidence") or 0.0)
-        profile_dimension = bucket_for_dimension(field_kind, field_key, category)
+        profile_dimension = bucket_for_dimension(field_kind, field_key, category, content)
         if profile_dimension not in PROFILE_DIMENSION_SET:
             # 防御性兜底：默认 lifestyle（最弱假设）。
             profile_dimension = "lifestyle"
@@ -340,6 +414,123 @@ def extract_master_candidates(
                 status="active",
                 content_hash=content_hash,
             )
+        )
+    return tuple(candidates)
+
+
+def candidates_from_master_result(
+    *,
+    subject: str,
+    result: StructuredExtractResult,
+    consent_version: str,
+    policy_revision: str,
+    source_turn_id: str,
+) -> tuple[CandidateRecord, ...]:
+    """Map a typed moxiang Provider result into private, six-dimension evidence.
+
+    The conversation prompt returns ``patches``.  The shared mock/provider
+    contract can additionally return ``fields`` or ``entries``; accepting all
+    three typed shapes keeps the journey deterministic in testing while the
+    worker still rejects malformed subjects, categories and schema versions.
+    The server, not the provider, owns provenance, so every candidate is tied
+    to the persisted turn being processed.
+    """
+    expected_subject = ProfileSubject(subject)
+    if result.clarifying_question:
+        raise ValueError("moxiang candidate extractor must not emit a question")
+
+    candidates: list[CandidateRecord] = []
+    seen_hashes: set[str] = set()
+
+    def append_candidate(
+        *,
+        field_kind: str,
+        field_key: str | None,
+        category: str | None,
+        content: str | None,
+        value: Any,
+        confidence: Any,
+        item_subject: Any,
+        source_span: Any,
+    ) -> None:
+        if item_subject is not expected_subject:
+            raise ValueError("provider subject does not match journey subject")
+        if field_kind == "structured":
+            if field_key not in AI_FIELD_ALLOWLIST:
+                raise ValueError("provider field is not in the allowlist")
+        elif field_kind == "entry":
+            if category not in PROFILE_ENTRY_CATEGORIES or not (content or "").strip():
+                raise ValueError("provider entry is invalid")
+            content = content.strip()
+        else:
+            raise ValueError("provider candidate kind is invalid")
+        if isinstance(confidence, bool) or not 0.0 <= float(confidence) <= 1.0:
+            raise ValueError("provider confidence is outside the allowed range")
+        if source_span is not None and not isinstance(source_span, str):
+            raise ValueError("provider source span must be text")
+        profile_dimension = bucket_for_dimension(
+            field_kind, field_key, category, content
+        )
+        content_hash = compute_candidate_content_hash(
+            subject, field_kind, field_key, category, value, content
+        )
+        if content_hash in seen_hashes:
+            return
+        seen_hashes.add(content_hash)
+        candidates.append(
+            CandidateRecord(
+                candidate_id=f"candidate-{content_hash[:24]}",
+                session_id="",
+                user_id=0,
+                subject=subject,
+                profile_dimension=profile_dimension,
+                field_kind=field_kind,
+                field_key=field_key,
+                category=category,
+                content=content,
+                value=value,
+                confidence=float(confidence),
+                source_turn_ids=(source_turn_id,),
+                source_span=source_span,
+                consent_version=consent_version,
+                policy_revision=policy_revision,
+                status="active",
+                content_hash=content_hash,
+            )
+        )
+
+    for field in result.fields:
+        append_candidate(
+            field_kind="structured",
+            field_key=field.field_key,
+            category=None,
+            content=None,
+            value=field.value,
+            confidence=field.confidence,
+            item_subject=field.subject,
+            source_span=field.source_span or field.source_quote,
+        )
+    for entry in result.entries:
+        append_candidate(
+            field_kind="entry",
+            field_key=None,
+            category=entry.category,
+            content=entry.content,
+            value=None,
+            confidence=entry.confidence,
+            item_subject=entry.subject,
+            source_span=entry.source_span or entry.source_quote,
+        )
+    for patch in result.patches:
+        append_candidate(
+            field_kind="entry",
+            field_key=None,
+            category=patch.category,
+            content=patch.content,
+            value=None,
+            confidence=patch.confidence,
+            item_subject=patch.subject,
+            source_span=patch.source_span or patch.source_quote,
         )
     return tuple(candidates)
 

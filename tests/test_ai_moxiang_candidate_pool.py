@@ -25,6 +25,9 @@ session. Integration coverage of the persistence path lives in
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CANDIDATES_FILE = REPO_ROOT / "app" / "services" / "ai" / "candidates.py"
@@ -114,6 +117,181 @@ def test_extract_master_candidates_subject_boundary_personal() -> None:
     )
     assert all(c.subject == "personal" for c in candidates)
     assert all(c.profile_dimension in {"personality_social", "lifestyle"} for c in candidates)
+
+
+def test_extract_master_candidates_covers_all_six_dimensions_from_free_chat() -> None:
+    """自由对话候选必须能够落到固定六维，而不是只识别少数关键词。"""
+    from app.db.ai_schema import PROFILE_DIMENSIONS
+    from app.services.ai.candidates import extract_master_candidates
+
+    candidates = extract_master_candidates(
+        subject="personal",
+        turn_texts=(
+            "我性格比较外向，也很慢热。",
+            "我希望关系里遇到分歧先沟通，平时需要有稳定陪伴。",
+            "我不喜欢被查手机，希望彼此尊重边界。",
+            "我情绪低落时会直接表达，也希望对方先倾听。",
+            "我周末喜欢去公园和看展，平时早睡早起。",
+            "我想认真交往，未来以结婚和共同生活为目标。",
+        ),
+        consent_version="profile-text-v1",
+        policy_revision="ai-policy-2026-08-07-v1",
+    )
+    assert {candidate.profile_dimension for candidate in candidates} == set(PROFILE_DIMENSIONS)
+
+
+def test_provider_master_result_becomes_six_dimension_candidates() -> None:
+    """真实 Provider 的 master 输出必须保留为六维候选，而非退回关键词猜测。"""
+    from app.schemas.ai_profile import ProfileSubject
+    from app.services.ai.base import ExtractedPatch, StructuredExtractResult
+    from app.services.ai.candidates import candidates_from_master_result
+
+    result = StructuredExtractResult(
+        patches=(
+            ExtractedPatch(
+                action="add", category="personality", content="外向但慢热",
+                subject=ProfileSubject.PERSONAL, source_quote="我外向但慢热", confidence=0.9,
+            ),
+            ExtractedPatch(
+                action="add", category="values", content="遇到分歧会先沟通",
+                subject=ProfileSubject.PERSONAL, source_quote="遇到分歧会先沟通", confidence=0.9,
+            ),
+            ExtractedPatch(
+                action="add", category="values", content="尊重彼此隐私和边界",
+                subject=ProfileSubject.PERSONAL, source_quote="尊重彼此隐私和边界", confidence=0.9,
+            ),
+            ExtractedPatch(
+                action="add", category="personality", content="情绪低落时会直接表达",
+                subject=ProfileSubject.PERSONAL, source_quote="情绪低落时会直接表达", confidence=0.9,
+            ),
+            ExtractedPatch(
+                action="add", category="routine", content="周末看展，平时早睡早起",
+                subject=ProfileSubject.PERSONAL, source_quote="周末看展，平时早睡早起", confidence=0.9,
+            ),
+            ExtractedPatch(
+                action="add", category="life_plan", content="期待长期共同生活",
+                subject=ProfileSubject.PERSONAL, source_quote="期待长期共同生活", confidence=0.9,
+            ),
+        )
+    )
+
+    candidates = candidates_from_master_result(
+        subject="personal",
+        result=result,
+        consent_version="profile-text-v1",
+        policy_revision="ai-policy-2026-08-07-v1",
+        source_turn_id="turn-provider-1",
+    )
+
+    assert {candidate.profile_dimension for candidate in candidates} == {
+        "personality_social", "intimacy_pattern", "relationship_boundaries",
+        "emotional_expression", "lifestyle", "future_expectations",
+    }
+    assert all(candidate.source_turn_ids == ("turn-provider-1",) for candidate in candidates)
+    assert all(candidate.subject == "personal" for candidate in candidates)
+
+
+@pytest.mark.asyncio
+async def test_journey_worker_calls_master_gateway_before_persisting_candidates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """每个已持久化对话 turn 必须经墨相师 Provider，再进入候选池。"""
+    from app.schemas.ai_profile import ProfileSubject
+    from app.services.ai.base import ExtractedPatch, StructuredExtractResult
+    from app.services.ai.gateway import InvokeOutcome
+    from app.services.ai.profile import ProfileTurn
+    from app.services.revisions import RevisionVector
+    from app.services.ai import journey
+
+    captured: dict[str, object] = {"candidates": []}
+
+    class Gateway:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        async def structured_extract(self, context: object, request: object) -> InvokeOutcome:
+            captured["context"] = context
+            captured["request"] = request
+            return InvokeOutcome(
+                result=StructuredExtractResult(
+                    patches=(
+                        ExtractedPatch(
+                            action="add", category="values", content="遇到冲突先沟通",
+                            subject=ProfileSubject.PERSONAL,
+                            source_quote="遇到冲突先沟通", confidence=0.91,
+                        ),
+                    )
+                )
+            )
+
+    session = SimpleNamespace(
+        session_id="session-1", subject=ProfileSubject.PERSONAL,
+        consent_version="profile-text-v1", policy_revision="ai-policy-2026-08-07-v1",
+        revision_vector=RevisionVector(profile=2),
+    )
+    turn = ProfileTurn(
+        turn_id="turn-1", session_id="session-1", client_turn_id="client-1",
+        user_id=7, turn_no=1, answer_text="遇到冲突我会先沟通", status="saved", created_at=None,
+    )
+    task = SimpleNamespace(
+        task_id="task-1", owner_user_id=7,
+        payload_summary={"session_id": "session-1", "turn_id": "turn-1", "client_turn_id": "client-1"},
+        source_revision_json={"profile": 2, "preference": 0, "privacy": 0, "relationship": 0, "policy": 0},
+    )
+
+    async def fake_upsert(_db: object, candidate: object, *, source_turn_id: str) -> None:
+        captured["candidates"].append((candidate, source_turn_id))  # type: ignore[union-attr]
+
+    async def fake_cap(_db: object, session_id: str) -> int:
+        captured["cap_session"] = session_id
+        return 0
+
+    async def fake_session(*_args: object, **_kwargs: object) -> object:
+        return session
+
+    async def fake_turn(*_args: object, **_kwargs: object) -> object:
+        return turn
+
+    async def fake_list_candidates(*_args: object, **_kwargs: object) -> tuple:
+        return ()
+
+    monkeypatch.setattr(journey, "AIGateway", Gateway)
+    monkeypatch.setattr(journey, "load_owned_active_session", fake_session)
+    monkeypatch.setattr(journey, "find_turn_by_client_id", fake_turn)
+    monkeypatch.setattr(journey, "list_session_candidates", fake_list_candidates)
+    monkeypatch.setattr(journey, "_upsert_candidate", fake_upsert)
+    monkeypatch.setattr(journey, "_enforce_entry_dimension_cap", fake_cap)
+
+    result = await journey.extract_journey_candidates(object(), task, "worker-1")
+
+    assert result == ("moxiang-candidate:task-1", session.revision_vector)
+    # #12：每轮 upsert 后必须执行单维度 entry 上限裁剪。
+    assert captured["cap_session"] == "session-1"
+    assert captured["request"].session_kind == "master"  # type: ignore[union-attr]
+    assert captured["request"].turn_texts == ("遇到冲突我会先沟通",)  # type: ignore[union-attr]
+    # No prior candidates -> dedup digest is None (not an empty string).
+    assert captured["request"].existing_digest is None  # type: ignore[union-attr]
+    candidate, source_turn_id = captured["candidates"][0]  # type: ignore[index]
+    assert candidate.profile_dimension == "intimacy_pattern"
+    assert source_turn_id == "turn-1"
+
+
+def test_existing_candidates_digest_formats_structured_and_entry() -> None:
+    """#11 dedup digest renders structured ``field_key = value`` and entry ``category：content`` with dimension labels."""
+    from app.services.ai.journey import _existing_candidates_digest
+
+    structured = SimpleNamespace(
+        profile_dimension="personality_social", field_kind="structured",
+        field_key="age", value=28, category=None, content=None,
+    )
+    entry = SimpleNamespace(
+        profile_dimension="intimacy_pattern", field_kind="entry",
+        field_key=None, value=None, category="values",
+        content="遇到冲突我会先冷静再沟通",
+    )
+    digest = _existing_candidates_digest((structured, entry))
+    assert "[性格与社交] age = 28" in digest
+    assert "[亲密模式] values：遇到冲突我会先冷静再沟通" in digest
 
 
 def test_extract_master_candidates_subject_boundary_ideal_partner() -> None:

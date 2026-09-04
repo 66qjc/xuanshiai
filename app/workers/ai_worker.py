@@ -40,6 +40,7 @@ from app.db.session import session_factory
 from app.schemas.ai_common import AiTaskStatus
 from app.services.ai.audit import emit_ai_metric
 from app.services.ai.profile import extract_profile_turn
+from app.services.ai.journey import extract_journey_candidates
 from app.services.ai.tasks import (
     AiTaskRecord,
     claim_tasks,
@@ -57,6 +58,7 @@ logger = logging.getLogger(__name__)
 # register_business_handlers() 显式注册。key = ai_task.task_type。
 TASK_HANDLERS: dict[str, Callable[..., Awaitable[Any]]] = {
     "profile_extract": extract_profile_turn,
+    "moxiang_candidate_extract": extract_journey_candidates,
 }
 
 
@@ -392,6 +394,42 @@ async def _run_round(worker_id: str, batch_size: int) -> tuple[int, int, int]:
     if reaped:
         logger.info("ai_worker_reaped count=%d", len(reaped))
         emit_ai_metric("lease_reclaimed", len(reaped), {"worker_id": worker_id})
+
+    # 批次3 #24：retry_wait 积压仪表。每轮按 task_type 统计重试积压并计入
+    # task_retry_backlog（超过 ai_metrics_backlog_warn_threshold 时由
+    # emit_ai_metric 统一打告警）；重试耗尽仍滞留 retry_wait 的行
+    # （leased 阶段失败只能回 retry_wait）单独点名，覆盖「卡重试一天」盲区。
+    from sqlalchemy import text as _sa_text
+    try:
+        async with session_factory() as gauge_db:
+            backlog_rows = (
+                await gauge_db.execute(
+                    _sa_text(
+                        "SELECT task_type, COUNT(*) AS n FROM ai_task "
+                        "WHERE status = 'retry_wait' GROUP BY task_type"
+                    )
+                )
+            ).mappings().all()
+            stuck = int(
+                await gauge_db.scalar(
+                    _sa_text(
+                        "SELECT COUNT(*) FROM ai_task "
+                        "WHERE status = 'retry_wait' "
+                        "AND attempt_count >= max_attempts"
+                    )
+                )
+                or 0
+            )
+        for row in backlog_rows:
+            emit_ai_metric(
+                "task_retry_backlog",
+                float(row["n"]),
+                {"task_type": str(row["task_type"])},
+            )
+        if stuck:
+            logger.warning("ai_task_retry_exhausted_stuck count=%d", stuck)
+    except Exception:
+        logger.exception("ai_worker_retry_backlog_gauge_failed")
 
     claimed_count = 0
     completed = 0

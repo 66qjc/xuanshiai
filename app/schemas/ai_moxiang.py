@@ -39,7 +39,7 @@ CANDIDATE_STATUSES: tuple[str, ...] = ("active", "promoted", "dismissed", "expir
 SUMMARY_CONTENT_MAX_LENGTH = 80
 
 # 高置信度候选门槛（Contract v1.1 §3.1 邀请触发的候选数量条件）。
-HIGH_CONFIDENCE_THRESHOLD = 0.7
+HIGH_CONFIDENCE_THRESHOLD = 0.75
 
 
 @dataclass(frozen=True)
@@ -108,10 +108,8 @@ class SubjectSummary(BaseModel):
     """``MoxiangStateResponse`` 内每个主体的简要投影。
 
     完整字段集对齐 Contract v1.1 §6.1：会话 ID、旅程阶段、最后话题时间、
-    三类百分比、六维明细、邀请/卡片/发布状态。P1-C 的 service 层会
-    填充 ``overall_percent / confidence_percent / confirmation_percent`` 与
-    ``dimensions``；P1-B 的 invite 计数（``auto_invite_count`` 等）由仓储
-    协议补齐。
+    六维理解进度、邀请/卡片/发布状态。service 层只填充候选理解度
+    ``overall_percent`` 与 ``dimensions``；它们不表示确认或发布进度。
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -122,15 +120,12 @@ class SubjectSummary(BaseModel):
     last_turn_at: str | None = None
     last_topic_excerpt: str = ""
     overall_percent: float = Field(default=0.0, ge=0.0, le=100.0)
-    confidence_percent: float = Field(default=0.0, ge=0.0, le=100.0)
-    confirmation_percent: float = Field(default=0.0, ge=0.0, le=100.0)
     dimensions: dict[str, dict[str, float | int]] = Field(
         default_factory=lambda: {
-            dim: {"percent": 0.0, "confirmed_count": 0}
+            dim: {"percent": 0.0, "evidence_count": 0}
             for dim in PROFILE_DIMENSIONS
         }
     )
-    hard_gate_met: bool = False
     pending_build_invite_id: str | None = None
     pending_confirm_card: bool = False
     published_revision_id: int | None = None
@@ -181,6 +176,7 @@ class MoxiangTurn(BaseModel):
     turn_no: int = Field(..., ge=1)
     role: str = Field(..., pattern="^(user|assistant)$")
     answer_text: str = Field(..., min_length=1, max_length=2000)
+    client_turn_id: str
     created_at: str | None = None
 
 

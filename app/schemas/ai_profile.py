@@ -63,6 +63,59 @@ PROFILE_ENTRY_CATEGORY_LABELS: Mapping[str, str] = MappingProxyType(
 # entry 单条正文上限：服务层校验 + DB VARCHAR(200) 双保险。
 PROFILE_ENTRY_CONTENT_MAX_LENGTH = 200
 
+# 批次3 #9：模型自由发挥的 category 先按同义词表归一到 9 枚举，再交给
+# Pydantic 校验。只收录语义明确的同义/翻译写法，模糊或跨维的词不猜——
+# 归一失败仍走原有的整条丢弃路径，保证冻结枚举不被稀释。
+_ENTRY_CATEGORY_ALIASES: Mapping[str, str] = MappingProxyType(
+    {
+        # values：三观、感情观、底线类表述。
+        "三观": "values", "感情观": "values", "恋爱观": "values",
+        "价值观": "values", "底线": "values", "关系边界": "values",
+        "relationship": "values", "relationship_values": "values",
+        "boundary": "values", "boundaries": "values", "belief": "values",
+        "beliefs": "values",
+        # interests：兴趣与爱好。
+        "兴趣": "interests", "爱好": "interests", "兴趣爱好": "interests",
+        "hobby": "interests", "hobbies": "interests", "interest": "interests",
+        # routine：作息与日常习惯（生活方式的落点）。
+        "作息": "routine", "习惯": "routine", "作息习惯": "routine",
+        "生活方式": "routine", "lifestyle": "routine",
+        "habit": "routine", "habits": "routine", "daily": "routine",
+        # occupation：工作与职业。
+        "工作": "occupation", "职业": "occupation", "工作状态": "occupation",
+        "career": "occupation", "work": "occupation", "job": "occupation",
+        # life_plan：未来与人生规划。
+        "规划": "life_plan", "未来": "life_plan", "人生规划": "life_plan",
+        "生活规划": "life_plan", "future": "life_plan", "plan": "life_plan",
+        "plans": "life_plan", "future_plan": "life_plan",
+        # personality：性格与情绪表达。
+        "性格": "personality", "情绪": "personality", "性格特征": "personality",
+        "emotion": "personality", "emotions": "personality",
+        "personality_trait": "personality", "character": "personality",
+        # basics：基本资料。
+        "基本信息": "basics", "基本情况": "basics", "资料": "basics",
+        "basic": "basics", "info": "basics", "basic_info": "basics",
+        # appearance：外形。
+        "外貌": "appearance", "外形": "appearance", "形象": "appearance",
+        "look": "appearance", "looks": "appearance",
+        # diet：饮食。
+        "饮食": "diet", "饮食习惯": "diet", "food": "diet", "eating": "diet",
+    }
+)
+
+
+def normalize_entry_category(raw: object) -> str:
+    """把 provider 输出的 category 归一到 9 枚举；无法归一时原样返回。
+
+    返回原样（含空串）时由 ``ExtractedEntry`` / ``ExtractedPatch`` 的
+    Pydantic 校验兜底拒绝，调用方负责丢弃并留痕。
+    """
+    key = str(raw or "").strip()
+    lowered = key.lower()
+    if lowered in PROFILE_ENTRY_CATEGORIES:
+        return lowered
+    return _ENTRY_CATEGORY_ALIASES.get(lowered, key)
+
 
 class NumericPreferenceRange(BaseModel):
     """One-sided or two-sided numeric preference, always serialized as min/max."""
@@ -131,8 +184,15 @@ _RANGE_LIMITS: Mapping[str, tuple[int, int | None]] = MappingProxyType(
         "age": (18, 100),
         "education_level": (1, 8),
         "height_cm": (100, 250),
+        # 理想型 income_band 是金额区间（如「至少一万」→ min=10000），与个人
+        # 档位 0-6 不同口径；range 分支不设档位上限，档位上界见 _INTEGER_LIMITS。
         "income_band": (0, None),
     }
+)
+# personal 整数档位上界：收入档 0-6（PRODUCT.md 2026-09-03），与抽取 prompt
+# 同界，防止模型漂移输出 99 这类档位外值入库后前端只能裸码展示。
+_INTEGER_LIMITS: Mapping[str, tuple[int, int | None]] = MappingProxyType(
+    {"income_band": (0, 6)}
 )
 
 
@@ -170,6 +230,11 @@ def normalize_profile_extracted_value(
         values = _TAG_ADAPTER.validate_python(value)
         if not values or len(set(values)) != len(values):
             raise ValueError("tag or enum collection must be non-empty and unique")
+        if field_key == "city_code" and any(
+            len(item) != 6 or not item.isascii() or not item.isdecimal()
+            for item in values
+        ):
+            raise ValueError("city_code values must be six-digit administrative codes")
         if field_key in PROFILE_ENUM_DICTIONARY:
             allowed = PROFILE_ENUM_DICTIONARY[field_key]
             if not set(values).issubset(allowed):
@@ -184,7 +249,9 @@ def normalize_profile_extracted_value(
 
     if kind == "integer":
         integer = _INTEGER_ADAPTER.validate_python(value)
-        floor, ceiling = _RANGE_LIMITS.get(field_key, (0, None))
+        floor, ceiling = _INTEGER_LIMITS.get(
+            field_key, _RANGE_LIMITS.get(field_key, (0, None))
+        )
         if integer < floor or (ceiling is not None and integer > ceiling):
             raise ValueError("integer value is outside the allowed bounds")
         return integer
@@ -192,6 +259,10 @@ def normalize_profile_extracted_value(
     text_value = _STRING_ADAPTER.validate_python(value)
     if not text_value:
         raise ValueError("string value must not be empty")
+    if field_key == "city_code" and (
+        len(text_value) != 6 or not text_value.isascii() or not text_value.isdecimal()
+    ):
+        raise ValueError("city_code must be a six-digit administrative code")
     return text_value
 
 
