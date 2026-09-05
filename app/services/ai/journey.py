@@ -31,7 +31,10 @@ from app.services.ai.journey_progress import (
     JourneyDimensionProgress,
     calculate_journey_progress,
 )
-from app.services.ai.prompts.moxiang_master import build_build_context
+from app.services.ai.prompts.moxiang_master import (
+    build_build_context,
+    steering_hook_lines,
+)
 from app.services.ai.profile import (
     AIConsentRequired,
     AIInputError,
@@ -420,6 +423,14 @@ async def compose_journey_build_context(
         f"- {_DIMENSION_LABELS.get(dim, dim)}：{_dimension_status(progress.dimensions[dim])}"
         for dim in PROFILE_DIMENSIONS
     ]
+    # 隐含式引导（层1）：空白维度配「接话茬钩子」，知遇才知道从哪个
+    # 生活场景自然带出未聊透的面向，而不是只看到维度名干着急。
+    blank_dimensions = [
+        dim
+        for dim in PROFILE_DIMENSIONS
+        if progress.dimensions[dim].evidence_count < 2
+    ]
+    steering_hooks = steering_hook_lines(blank_dimensions, subject=subject)
     missing_hard: list[str] = []
     if subject == "personal":
         present = {
@@ -435,6 +446,7 @@ async def compose_journey_build_context(
         percent,
         subject=subject,
         dimension_lines=dimension_lines,
+        steering_hooks=steering_hooks,
     )
 
 

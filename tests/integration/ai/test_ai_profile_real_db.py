@@ -18,7 +18,7 @@ from app.services.ai.profile import (
     publish_profile_draft,
     request_narrative_regenerate,
 )
-from app.services.ai.tasks import TaskError, get_task
+from app.services.ai.tasks import TaskError, enqueue_task, get_task
 
 USER_ID = 9_876_543_211
 NARRATIVE_USER = 9_988_700_001
@@ -205,6 +205,200 @@ async def test_real_publish_pins_revision_consent_and_projection(
     assert projection_gate["status"] == "active"
     assert projection_gate["source_revision"] == submission.revision.revision_id
     assert projection_gate["projection_id"] is not None
+
+    await _clean_user(real_db_session)
+
+
+@pytest.mark.asyncio
+async def test_real_projection_skips_entry_only_ideal_partner(
+    real_db_session: AsyncSession,
+) -> None:
+    """纯旅程愿遇之相（只有 entry_* 叙事字段）投影按设计内跳过。
+
+    2026-09-05 决策：entry_* 全部不在结构化白名单内属旅程产出的正常形态，
+    该 kind 记 ``skipped(no_fields)`` 并让任务 succeeded，其余 kind 不受影响；
+    不再走 3 次重试后 failed（旧表现是 worker 把 ProjectionBuildError 覆盖成
+    可重试的 AI_TEMPORARILY_UNAVAILABLE）。
+    """
+    await _clean_user(real_db_session)
+    granted_at = datetime.now(UTC).replace(tzinfo=None, microsecond=0)
+    consent = {
+        "scope": "profile_text_extract",
+        "version": "profile-text-v1",
+        "policy_revision": "ai-policy-2026-08-07-v1",
+        "granted_at": granted_at.isoformat(),
+    }
+    await real_db_session.execute(
+        text(
+            "INSERT INTO ai_consent_grant "
+            "(user_id, scope, version, policy_revision, granted_at) "
+            "VALUES (:user_id, 'profile_text_extract', 'profile-text-v1', "
+            "'ai-policy-2026-08-07-v1', :granted_at)"
+        ),
+        {"user_id": USER_ID, "granted_at": granted_at},
+    )
+    # 对齐真实发布后的五维版本状态（build_feature_projection 以它为准）。
+    await real_db_session.execute(
+        text(
+            "INSERT INTO user_revision_state "
+            "(user_id, profile_revision, preference_revision, privacy_revision, "
+            " relationship_revision, policy_revision) "
+            "VALUES (:user_id, 10, 1, 24, 0, 0)"
+        ),
+        {"user_id": USER_ID},
+    )
+    # 个人像已有发布（保证 personal 两种 kind 正常构建），愿遇之相发布只含 entry。
+    source_revision = {
+        "profile": 10, "preference": 1, "privacy": 24,
+        "relationship": 0, "policy": 0,
+    }
+    for subject, revision_no in (("personal", 1), ("ideal_partner", 1)):
+        await real_db_session.execute(
+            text(
+                "INSERT INTO ai_profile_revision "
+                "(user_id, subject, revision_no, draft_id, source_revision_json, "
+                " policy_revision, published_by, published_at, created_at) "
+                "VALUES (:user_id, :subject, :revision_no, :draft_id, "
+                " :source_revision_json, 'ai-policy-2026-08-07-v1', :user_id, "
+                " :published_at, :published_at)"
+            ),
+            {
+                "user_id": USER_ID,
+                "subject": subject,
+                "revision_no": revision_no,
+                "draft_id": f"skip-{subject}",
+                "source_revision_json": json.dumps(source_revision, ensure_ascii=False),
+                "published_at": granted_at,
+            },
+        )
+    revision_id = int(
+        (
+            await real_db_session.execute(
+                text(
+                    "SELECT id FROM ai_profile_revision "
+                    "WHERE user_id = :user_id AND subject = 'ideal_partner' "
+                    "ORDER BY id DESC LIMIT 1"
+                ),
+                {"user_id": USER_ID},
+            )
+        ).scalar_one()
+    )
+    personal_revision_id = int(
+        (
+            await real_db_session.execute(
+                text(
+                    "SELECT id FROM ai_profile_revision "
+                    "WHERE user_id = :user_id AND subject = 'personal' "
+                    "ORDER BY id DESC LIMIT 1"
+                ),
+                {"user_id": USER_ID},
+            )
+        ).scalar_one()
+    )
+    # personal 至少要有一个白名单字段，保证那两种 kind 照常构建。
+    await real_db_session.execute(
+        text(
+            "INSERT INTO ai_profile_revision_field "
+            "(revision_id, field_key, subject, value_json, display_value, "
+            " field_kind, category, content, confidence, "
+            " schema_version, content_hash) "
+            "VALUES (:revision_id, 'city_code', 'personal', '\"330100\"', '杭州', "
+            " 'structured', '', '现居杭州', 0.95, "
+            " 'profile-extract-v1', :content_hash)"
+        ),
+        {"revision_id": personal_revision_id, "content_hash": "00" + "c" * 62},
+    )
+    for index, (field_key, category, content) in enumerate(
+        [
+            ("entry_personality_social_a1", "personality_social", "希望她情绪稳定"),
+            ("entry_lifestyle_b2", "lifestyle", "作息规律，喜欢户外"),
+            ("entry_intimacy_pattern_c3", "intimacy_pattern", "中等黏度"),
+        ]
+    ):
+        await real_db_session.execute(
+            text(
+                "INSERT INTO ai_profile_revision_field "
+                "(revision_id, field_key, subject, value_json, display_value, "
+                " field_kind, category, content, confidence, "
+                " schema_version, content_hash) "
+                "VALUES (:revision_id, :field_key, 'ideal_partner', :value_json, "
+                " :content, 'entry', :category, :content, 0.9, "
+                " 'profile-extract-v1', :content_hash)"
+            ),
+            {
+                "revision_id": revision_id,
+                "field_key": field_key,
+                "value_json": json.dumps({"text": content}, ensure_ascii=False),
+                "category": category,
+                "content": content,
+                "content_hash": f"{index:02d}" + "b" * 62,
+            },
+        )
+    # 修正 personal 字段的 content_hash 为合法 64 位十六进制。
+    await real_db_session.execute(
+        text(
+            "UPDATE ai_profile_revision_field SET content_hash = :h "
+            "WHERE field_key = 'city_code' AND revision_id = :revision_id"
+        ),
+        {"h": "00" + "c" * 62, "revision_id": personal_revision_id},
+    )
+    await real_db_session.commit()
+
+    task = await enqueue_task(
+        real_db_session,
+        USER_ID,
+        "profile_projection",
+        idempotency_key="skip-ideal-entry-only",
+        request_hash="skip-ideal-entry-only",
+        revisions=source_revision,
+        consent=consent,
+    )
+    await real_db_session.execute(
+        text(
+            "UPDATE ai_task SET payload_summary = :payload WHERE task_id = :task_id"
+        ),
+        {
+            "payload": json.dumps(
+                {
+                    "published_revision_id": revision_id,
+                    "revision_id": revision_id,
+                    "draft_id": "skip-ideal_partner",
+                    "subject": "ideal_partner",
+                    "user_id": USER_ID,
+                    "projection_target": "user_partner_preference",
+                    "source_revision": source_revision,
+                    "consent_snapshot": consent,
+                },
+                ensure_ascii=False,
+            ),
+            "task_id": task.task_id,
+        },
+    )
+    await real_db_session.commit()
+    stored = await get_task(real_db_session, task.task_id)
+    assert stored is not None
+
+    result_ref = await profile_projection_handler(
+        real_db_session, stored, "integration-worker"
+    )
+    assert result_ref is not None
+    assert "ideal_partner_preference:skipped(no_fields)" in result_ref[0]
+    await real_db_session.commit()
+
+    kinds = (
+        await real_db_session.execute(
+            text(
+                "SELECT projection_kind, status FROM ai_feature_projection "
+                "WHERE subject_user_id = :user_id"
+            ),
+            {"user_id": USER_ID},
+        )
+    ).all()
+    # 个人像两种照常构建；愿遇之相不落投影、也不把任务打成 failed。
+    assert {row.projection_kind for row in kinds} == {
+        "personal_searchable",
+        "personal_compatibility",
+    }
 
     await _clean_user(real_db_session)
 

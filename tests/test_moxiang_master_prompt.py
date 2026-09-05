@@ -137,19 +137,25 @@ def test_opening_messages_are_subject_specific() -> None:
 
 def test_opening_personalizes_by_time_and_rotates_variants() -> None:
     """#1：问候语按时段变化；不同 variant 给出不同首个话题。"""
+    from app.services.ai.prompts import moxiang_master
+
     assert _greeting_for_hour(7) == "早上好"
     assert _greeting_for_hour(15) == "下午好"
     assert _greeting_for_hour(20) == "晚上好"
     assert _greeting_for_hour(1) == "夜深了"
     morning = datetime(2026, 9, 3, 7, 30)
+    pool_size = len(moxiang_master._PERSONAL_OPENING_QUESTIONS)
     variants = [
         opening_message_for_subject("personal", now=morning, variant=i)
-        for i in range(3)
+        for i in range(pool_size)
     ]
-    assert len(set(variants)) == 3
+    assert len(set(variants)) == pool_size
     assert all(v.startswith("早上好，我是知遇。") for v in variants)
     # variant 越界按套数取模，不抛错。
-    assert opening_message_for_subject("personal", now=morning, variant=3) == variants[0]
+    assert (
+        opening_message_for_subject("personal", now=morning, variant=pool_size)
+        == variants[0]
+    )
     # 默认（variant=None）随机轮换，但结构不变。
     default = opening_message_for_subject("personal")
     assert "我是知遇。" in default
@@ -216,6 +222,126 @@ def test_build_context_without_dimension_lines_has_no_progress_section() -> None
     """不传 dimension_lines 时保持旧行为，不出现六维段。"""
     ctx = build_build_context(["age"], "", 0.0)
     assert "六维建构进度" not in ctx
+
+
+def test_build_context_injects_steering_hooks_for_blank_dimensions() -> None:
+    """层1隐含式引导：空白维度钩子注入后，知遇知道从哪个场景切入。"""
+    from app.services.ai.prompts.moxiang_master import steering_hook_lines
+
+    hooks = steering_hook_lines(["intimacy_pattern", "future_expectations"])
+    assert len(hooks) == 2
+    assert all(hook.startswith("- ") for hook in hooks)
+    ctx = build_build_context(
+        [], "", 25.0,
+        dimension_lines=["- 亲密模式：空白"],
+        steering_hooks=hooks,
+    )
+    assert "可以自然延伸的方向" in ctx
+    assert hooks[0] in ctx
+    assert "一次最多一个" in ctx
+    assert "不要向用户提" in ctx
+
+
+def test_steering_hook_lines_skip_unknown_and_blank() -> None:
+    """未知维度 key 原样跳过；空列表不产生钩子段。"""
+    from app.services.ai.prompts.moxiang_master import steering_hook_lines
+
+    assert steering_hook_lines([]) == []
+    assert steering_hook_lines(["not_a_dimension"]) == []
+
+
+def test_steering_hooks_match_the_portrait_subject() -> None:
+    """愿遇之相的钩子问 TA 的期待（有「希望/对方」），不漏自我话题进偏好阶段。"""
+    from app.services.ai.prompts.moxiang_master import steering_hook_lines
+
+    personal = steering_hook_lines(["intimacy_pattern"], subject="personal")
+    ideal = steering_hook_lines(["intimacy_pattern"], subject="ideal_partner")
+    assert personal and ideal
+    assert personal != ideal
+    for _ in range(6):
+        assert any(cue in hook for hook in steering_hook_lines(["intimacy_pattern"], subject="ideal_partner") for cue in ("希望", "对方", "期待"))
+
+
+def test_system_header_has_topic_rotation_and_sensitive_entry_rules() -> None:
+    """规则13：话题轮换 + 敏感面向用行为场景切入，不暴露维度词。"""
+    for cue in ("话题要在", "二选一的小情境", "向用户提及维度名称"):
+        assert cue in _SYSTEM_HEADER
+
+
+def test_system_header_has_self_disclosure_pacing_rule() -> None:
+    """规则14：开场轻起手，敏感面向后置。"""
+    for cue in ("自我披露节奏", "轻松、日常、正向", "不要第一句就往深处问"):
+        assert cue in _SYSTEM_HEADER
+
+
+def test_personal_opening_pool_covers_light_dimension_entries() -> None:
+    """开场白池 4 套轮换，全部是低压力场景化入口（调研：场景题优于抽象题）。"""
+    from app.services.ai.prompts import moxiang_master
+
+    pool = moxiang_master._PERSONAL_OPENING_QUESTIONS
+    assert len(pool) >= 4
+    assert all("？" in q for q in pool)
+    # 不出现术语化提问——开场不暴露维度/画像/进度。
+    for banned in ("维度", "画像", "进度", "亲密模式", "关系边界"):
+        assert banned not in "".join(pool)
+
+
+def test_ideal_partner_opening_avoids_condition_checklist_framing() -> None:
+    """愿遇之相开场不问条件清单，问相处的瞬间（行为化措辞）。"""
+    from app.services.ai.prompts import moxiang_master
+
+    for opening in moxiang_master._IDEAL_PARTNER_OPENINGS:
+        assert "相处" in opening
+        assert "不用列条件清单" in opening
+
+
+def test_extract_prompt_requires_implicit_clue_collection() -> None:
+    """抽取 prompt 必须提醒内隐线索（情绪/边界/期待藏在生活叙述里）。"""
+    prompt = build_profile_master_extract_prompt(
+        subject="personal",
+        turn_texts=("我周末喜欢自己待着。",),
+    )
+    assert "内隐线索必收" in prompt
+    assert "情绪表达、亲密模式、关系边界、未来期待" in prompt
+
+
+def test_extract_prompt_cue_words_cover_colloquial_speech() -> None:
+    """六维归属线索词必须覆盖口语表达（调研：用户用社恐/嘴硬心软/报备等词）。"""
+    prompt = build_profile_master_extract_prompt(
+        subject="personal",
+        turn_texts=("我是那种嘴硬心软的人。",),
+    )
+    # 每个维度的口语线索词
+    for cue in (
+        "嘴硬心软",  # 情绪表达
+        "奔着结婚",  # 未来期待
+        "报备",      # 关系边界
+        "冷处理",    # 亲密模式
+        "宅家",      # 生活方式
+        "社恐",      # 性格与社交
+        "口语词校准",
+    ):
+        assert cue in prompt
+
+
+def test_category_whitelist_shared_and_colloquial() -> None:
+    """category 白名单三处共用同一常量，且带口语线索词。"""
+    from app.services.ai.prompts import profile_extract
+
+    shared = profile_extract._CATEGORY_WHITELIST
+    assert shared in profile_extract._ENTRY_GUIDE
+    assert shared in profile_extract._UPDATE_SYSTEM_HEADER
+    assert shared in profile_extract._MASTER_SYSTEM_HEADER
+    for cue in ("社恐", "慢热", "夜猫子", "点外卖", "考公考编"):
+        assert cue in shared
+
+
+def test_update_prompt_accepts_colloquial_preference_markers() -> None:
+    """愿遇之相偏好确认词组要收口语变体（我喜欢/吃这一套/找对象就得找）。"""
+    from app.services.ai.prompts.profile_extract import _UPDATE_SYSTEM_HEADER
+
+    for cue in ("我喜欢", "我吃这一套", "找对象就得找"):
+        assert cue in _UPDATE_SYSTEM_HEADER
 
 
 def test_journey_dimension_status_rendering() -> None:

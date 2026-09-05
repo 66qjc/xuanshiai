@@ -109,7 +109,7 @@ async def get_moxiang_state(
     ``consent_granted=false``,绝不抛错。
     """
     repo = MoxiangStateSqlRepository(db)
-    return await build_state_response(user_id=current_user, repo=repo)
+    return await build_state_response(user_id=current_user.id, repo=repo)
 
 
 @router.get(
@@ -210,7 +210,7 @@ async def start_journey(
         )
 
     repo = MoxiangStateSqlRepository(db)
-    state = await build_state_response(user_id=current_user, repo=repo)
+    state = await build_state_response(user_id=current_user.id, repo=repo)
     if not state.can_start_ideal_partner:
         raise _error_response(
             "AI_INPUT_INVALID",
@@ -221,7 +221,7 @@ async def start_journey(
     try:
         session = await create_master_session(
             db,
-            owner_user_id=current_user,
+            owner_user_id=current_user.id,
             subject=ProfileSubject.IDEAL_PARTNER,
             consent_version="profile-text-v1",
         )
@@ -274,7 +274,7 @@ async def get_moxiang_archive(
         )
 
         repo = SqlArchiveRepository(db)
-        archive = await build_archive(user_id=current_user, repo=repo)
+        archive = await build_archive(user_id=current_user.id, repo=repo)
     except Exception as exc:  # noqa: BLE001
         raise _error_response(
             "AI_TEMPORARILY_UNAVAILABLE",

@@ -4390,9 +4390,11 @@ async def profile_projection_handler(
     ``build_feature_projection``（revision_vector=None 使投影以任务执行时的
     最新五维版本向量为准，保证投影 valid）：本次发布主体的 kind 钉住
     ``published_revision_id``，其他主体的 kind 取该主体最新已发布 revision，
-    尚无已发布 revision 的主体跳过。``ProjectionBuildError``（无 allowlist
-    字段/无授权等）按 Task 6 语义不可重试地失败为 ``RESULT_STALE``，绝不落
-    空投影。返回 ``(result_ref, revisions)``，revisions 取任务入队时的
+    尚无已发布 revision 的主体跳过。某 kind 的确认字段全部不在结构化白名单
+    内（典型：纯旅程愿遇之相只有 entry_* 叙事字段）同样按设计内跳过，
+    result_ref 记为 ``{kind}:skipped(no_fields)``。其余 ``ProjectionBuildError``
+    （向量过期/授权撤回等）按 Task 6 语义不可重试地失败为 ``RESULT_STALE``，
+    绝不落空投影。返回 ``(result_ref, revisions)``，revisions 取任务入队时的
     source_revision 使 ``complete_task`` 版本复核不误 supersede。
     """
     payload = task.payload_summary or {}
@@ -4444,14 +4446,24 @@ async def profile_projection_handler(
             ) is None:
                 # 该主体尚无已发布 revision；本次发布不负责从空主体建投影。
                 continue
-            projection = await build_feature_projection(
-                db,
-                user_id_int,
-                kind,
-                revision_vector=None,
-                published_revision_id=pinned_revision_id,
-                consent_snapshot=consent_snapshot,
-            )
+            try:
+                projection = await build_feature_projection(
+                    db,
+                    user_id_int,
+                    kind,
+                    revision_vector=None,
+                    published_revision_id=pinned_revision_id,
+                    consent_snapshot=consent_snapshot,
+                )
+            except ProjectionBuildError as exc:
+                # 旅程画像只产出 entry_* 叙事字段，全部不在结构化白名单内时
+                # （典型：纯旅程愿遇之相），投影按设计内跳过而不是失败重试；
+                # 其余 ProjectionBuildError（向量过期/授权失效）仍走终态失败。
+                if "no allowlisted confirmed fields" in str(exc):
+                    built.append(f"{kind.value}:skipped(no_fields)")
+                    built_pairs.append((kind.value, None))
+                    continue
+                raise
             built.append(
                 f"{kind.value}:{projection.id if projection.id is not None else 'ok'}"
             )

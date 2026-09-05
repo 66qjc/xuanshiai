@@ -1,0 +1,27 @@
+{
+  "name": "10turn-smoke",
+  "subject": "personal",
+  "description": "合成冒烟 transcript：10 轮用户发言覆盖六维语义，含 ambiguous 与 off_topic 各一，供 transcript.load 冒烟与评分器离线单测使用。无真实用户数据。",
+  "turns": [
+    {"role": "assistant", "text": "晚上好，我是知遇。先聊点轻松的——最近有没有哪一天，你完全没按原计划过？"},
+    {"role": "user", "text": "上周六本来想加班的，结果临时跟朋友去爬山了，累但挺开心。", "category": "lifestyle", "expect_dimensions": ["lifestyle"]},
+    {"role": "assistant", "text": "听起来是很尽兴的一天。朋友眼里你是个什么样的人？"},
+    {"role": "user", "text": "他们都说我是社恐，但其实熟了以后很话痨。", "category": "personality_social", "expect_dimensions": ["personality_social"]},
+    {"role": "assistant", "text": "慢热但走心。心情不好的时候，你想找人说说还是自己安静会儿？"},
+    {"role": "user", "text": "看情况吧，有时候也不知道自己想怎么样。", "category": "ambiguous", "expect_dimensions": []},
+    {"role": "assistant", "text": "没关系，慢慢来。你平时下班后一般怎么打发时间？"},
+    {"role": "user", "text": "最近在追一部剧，周末会给自己做饭，比点外卖舒服。", "category": "lifestyle", "expect_dimensions": ["lifestyle"]},
+    {"role": "assistant", "text": "会做饭加分。你希望以后的另一半怎么陪你？"},
+    {"role": "user", "text": "对了，你觉得最近哪个球队强？我昨晚看了场球。", "category": "off_topic", "expect_dimensions": []},
+    {"role": "assistant", "text": "球赛我不太懂，咱们回到相处这件事——遇到分歧你想当下讲开还是先冷静？"},
+    {"role": "user", "text": "我一般先冷处理，气消了再讲清楚，冷战最伤人。", "category": "intimacy_pattern", "expect_dimensions": ["intimacy_pattern"]},
+    {"role": "assistant", "text": "冷静但不冷暴力，这个分寸挺成熟。你在意对方报备吗？"},
+    {"role": "user", "text": "不用事事报备，但晚上不回家要说一声，翻手机那种我不行。", "category": "relationship_boundaries", "expect_dimensions": ["relationship_boundaries"]},
+    {"role": "assistant", "text": "边界清晰。你以后想定居在什么样的地方？"},
+    {"role": "user", "text": "想安定下来，最好在这个城市买房，把爸妈接过来近一点。", "category": "future_expectations", "expect_dimensions": ["future_expectations"]},
+    {"role": "assistant", "text": "很踏实的画面。你平时怎么表达在意一个人？"},
+    {"role": "user", "text": "我嘴硬心软，不太会说好听的，但会默默把事办了。", "category": "emotional_expression", "expect_dimensions": ["emotional_expression"]},
+    {"role": "assistant", "text": "行动派的表达。最后问问——工作忙起来是什么节奏？"},
+    {"role": "user", "text": "做开发的，忙起来天天加班，但收入还算对得起辛苦。", "category": "occupation", "expect_dimensions": ["lifestyle"]}
+  ]
+}

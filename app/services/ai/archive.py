@@ -40,6 +40,8 @@ from typing import Any, Awaitable, Protocol
 from sqlalchemy import text as sql_text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.services.ai.consents import CONSENT_VERSIONS
+
 
 _ARCHIVE_SUBJECTS: tuple[str, ...] = ("personal", "ideal_partner")
 _HISTORY_LIMIT = 20
@@ -319,7 +321,7 @@ async def build_subject_archive(
     subject: str,
     repo: ArchiveRepository,
     consent_scope: str = "profile_text_extract",
-    consent_version: str = "v1",
+    consent_version: str = CONSENT_VERSIONS["profile_text_extract"],
 ) -> SubjectArchive:
     """装配单个主体的归档信息。"""
     consent_active = await _resolve(
@@ -398,7 +400,7 @@ async def build_archive(
     user_id: int,
     repo: ArchiveRepository,
     consent_scope: str = "profile_text_extract",
-    consent_version: str = "v1",
+    consent_version: str = CONSENT_VERSIONS["profile_text_extract"],
 ) -> ArchiveResponse:
     """装配双主体归档。"""
     personal = await build_subject_archive(
